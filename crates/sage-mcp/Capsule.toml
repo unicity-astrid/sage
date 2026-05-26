@@ -1,0 +1,33 @@
+[package]
+name = "sage-mcp"
+version = "0.1.0"
+description = "MCP server bridging Astrid capsule tools to Claude via MCP wire protocol"
+authors = [
+    "Joshua J. Bouw <dev@joshuajbouw.com>",
+    "Unicity Labs <info@unicity-labs.com>",
+]
+astrid-version = ">=0.7.0"
+
+[[component]]
+id = "sage-mcp"
+file = "sage_mcp.wasm"
+type = "executable"
+capabilities = { kv = true }
+
+[capabilities]
+kv = true
+
+# sage-mcp picks up tool-call requests from `sage` (claude -p emitted
+# a tool call), dispatches them via tool.v1 bus protocol, and returns
+# results. It also describes the tool surface Claude sees by querying
+# the tool registry and reshaping into MCP tool descriptors.
+[subscribe]
+"sage.v1.tool.call.*" = { handler = "handle_tool_call" }
+"sage.v1.tools.describe" = { handler = "describe_tools" }
+"tool.v1.response.describe.*" = { handler = "collect_tool_descriptors" }
+
+[publish]
+"sage.v1.tool.result.*" = {}
+"sage.v1.tools.list" = {}
+"tool.v1.request.describe" = { wit = "@unicity-astrid/wit/tool/describe-request" }
+"tool.v1.request.execute" = { wit = "@unicity-astrid/wit/tool/execute-request" }

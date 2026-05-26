@@ -1,0 +1,40 @@
+[package]
+name = "sage"
+version = "0.1.0"
+description = "Claude headless (claude -p) agent runner"
+authors = [
+    "Joshua J. Bouw <dev@joshuajbouw.com>",
+    "Unicity Labs <info@unicity-labs.com>",
+]
+astrid-version = ">=0.7.0"
+
+[[component]]
+id = "sage"
+file = "sage.wasm"
+type = "executable"
+capabilities = { host_process = true, kv = true }
+
+[capabilities]
+host_process = true
+kv = true
+
+# Topics are pre-RFC placeholders; the agent-provider contract
+# (rfc:agent-provider.v1) will lock these once drafted.
+[subscribe]
+# Per-principal spawn request: provision a long-lived `claude -p`
+# subprocess and return a session handle.
+"sage.v1.request.spawn" = { handler = "handle_spawn" }
+# Send a user message into an existing session's stream-json stdin.
+"sage.v1.request.send.*" = { handler = "handle_send" }
+# Tool-call result coming back from sage-mcp, routed into the
+# correct session's stdin.
+"sage.v1.tool.result.*" = { handler = "handle_tool_result" }
+
+[publish]
+# Streamed events from a `claude -p` subprocess (text deltas, tool
+# calls, usage, done, errors). One topic per session.
+"sage.v1.event.*" = {}
+# Tool-call request emitted when Claude wants to call an MCP tool;
+# sage-mcp picks these up, executes via capsule IPC, replies on
+# `sage.v1.tool.result.<call-id>`.
+"sage.v1.tool.call.*" = {}

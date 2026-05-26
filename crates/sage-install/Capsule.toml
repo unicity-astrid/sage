@@ -1,0 +1,33 @@
+[package]
+name = "sage-install"
+version = "0.1.0"
+description = "Per-principal Claude provisioner (HOME-isolated .claude/ and OAuth)"
+authors = [
+    "Joshua J. Bouw <dev@joshuajbouw.com>",
+    "Unicity Labs <info@unicity-labs.com>",
+]
+astrid-version = ">=0.7.0"
+
+[[component]]
+id = "sage-install"
+file = "sage_install.wasm"
+type = "executable"
+capabilities = { fs = ["~/.astrid/principals/**"], host_process = true, kv = true }
+
+[capabilities]
+fs = ["~/.astrid/principals/**"]
+host_process = true
+kv = true
+
+[subscribe]
+# Run the per-principal install: create ~/.astrid/principals/<p>/.claude/,
+# write settings.local.json (hooks + MCP server entry pointing at
+# sage-mcp), then run an interactive `HOME=... claude /login` so the
+# user can authenticate with their Anthropic account.
+"sage.v1.install.run" = { handler = "handle_install" }
+# Re-link an existing principal (re-run /login or refresh config).
+"sage.v1.install.relink" = { handler = "handle_relink" }
+
+[publish]
+"sage.v1.install.status" = {}
+"sage.v1.install.complete" = {}
