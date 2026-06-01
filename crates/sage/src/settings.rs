@@ -17,24 +17,43 @@
 //!    namespace (distinct from sage's), so the new config travels
 //!    in-payload (see S2/S4 — `RelinkRequest` carries an optional
 //!    `config` field for cross-namespace propagation).
-//! 3. `sage.v1.settings.changed` — emitted synchronously after the
-//!    relink trigger publish. The current slice does NOT block on the
-//!    matching `sage.v1.install.complete` reply; an asynchronous
-//!    wait-for-relink-complete pattern can be added if a consumer needs
-//!    hard ordering. Flagged for follow-up in the S8 doc.
+//! 3. Bounded wait (≤ 5 s) for the matching `sage.v1.install.complete`
+//!    envelope before publishing `settings.changed`. The subscription is
+//!    opened BEFORE the relink publish to avoid race-loss against a
+//!    synchronous interceptor turn (mirrors `ensure_install` ordering
+//!    in `lib.rs`). On `Success`/`Failure` we proceed to step 4; on
+//!    timeout we publish anyway (fail-open — the on-disk relink may
+//!    still complete and downstream consumers can refetch) and emit an
+//!    audit warning. Failure also emits an audit entry before
+//!    publishing `settings.changed`. The deadline is operator-facing
+//!    (vs `ensure_install`'s 30 s spawn budget) so a short ceiling
+//!    matters more than wait-it-out completeness. Correlation is by
+//!    `principal_id` alone — a concurrent fresh install for the same
+//!    principal is rare and either path leaves the KV record consistent,
+//!    so the ambiguity is documented and accepted.
+//! 4. `sage.v1.settings.changed` — emitted after the bounded wait
+//!    terminates (any outcome).
 //!
 //! TODO(astrid-rfcs#TBD): mirror to a shared cross-capsule audit topic
 //! once a convention lands; kernel-side `astrid.v1.audit.entry` is
 //! admin-action-shaped and not the right home.
 
 use astrid_sdk::prelude::*;
+use std::time::Duration;
 
 use crate::config;
-use crate::{SettingsSetRequest, validate_id};
+use crate::{InstallEnvelope, SettingsSetRequest, classify_install_complete, validate_id};
 
 const AUDIT_TOPIC: &str = "sage.v1.audit.settings_changed";
 const RELINK_TOPIC: &str = "sage.v1.install.relink";
 const CHANGED_TOPIC: &str = "sage.v1.settings.changed";
+const INSTALL_COMPLETE_TOPIC: &str = "sage.v1.install.complete";
+/// Bounded wait budget for the `sage.v1.install.complete` echo after
+/// publishing `sage.v1.install.relink`. Kept tight (5 s) because the
+/// `settings.changed` propagation latency is operator-perceptible —
+/// contrast with `ensure_install`'s 30 s spawn budget, which the
+/// operator never sees directly.
+const RELINK_COMPLETE_DEADLINE: Duration = Duration::from_secs(5);
 
 /// Apply a `SettingsSetRequest` end-to-end. Never propagates errors:
 /// internal failures publish an `error` field on the audit topic and
@@ -56,8 +75,51 @@ pub(crate) fn apply(req: SettingsSetRequest) -> Result<(), SysError> {
         return Ok(());
     }
 
-    // Load existing config (or default) and capture for audit.
-    let previous = config::load_or_default();
+    // Load existing config with schema-version classification so a
+    // future-schema record on disk (e.g. left behind by a newer sage
+    // binary that the operator has just downgraded from) is NOT
+    // silently flattened into our default and overwritten on save —
+    // that would invert the fail-secure intent ITEM 3 / handle_spawn's
+    // Unknown arm enforces on the spawn path. Mirrors that arm here so
+    // the other write path agrees on the rejection contract.
+    let previous = match config::load_status() {
+        config::LoadOutcome::Current(cfg) => cfg,
+        config::LoadOutcome::NeedsMigration {
+            patched,
+            previous_version,
+        } => {
+            // Audit the auto-migration so the relink-driven save below
+            // is traceable. Mirrors handle_spawn's schema_migrated
+            // event shape for cross-handler consistency.
+            let _ = ipc::publish_json(
+                "sage.v1.audit.schema_migrated",
+                &serde_json::json!({
+                    "principal_id": req.principal_id,
+                    "previous_version": previous_version,
+                    "current": config::SCHEMA_VERSION,
+                }),
+            );
+            patched
+        }
+        config::LoadOutcome::Unknown(got) => {
+            // Strictly-newer record. Refuse to overwrite operator-
+            // persisted settings on a binary downgrade. Mirrors the
+            // structured rejection in `handle_spawn`'s Unknown arm
+            // (lib.rs) — fail-secure-loud rather than silently
+            // demoting to default.
+            let _ = ipc::publish_json(
+                AUDIT_TOPIC,
+                &serde_json::json!({
+                    "principal_id": req.principal_id,
+                    "error": format!(
+                        "schema_version_unsupported: got {got}, supported {}",
+                        config::SCHEMA_VERSION
+                    ),
+                }),
+            );
+            return Ok(());
+        }
+    };
 
     // Apply partial patch: absent Option fields preserve the current
     // value; present fields overwrite.
@@ -111,7 +173,32 @@ pub(crate) fn apply(req: SettingsSetRequest) -> Result<(), SysError> {
         }),
     );
 
-    // (2) sage.v1.install.relink: trigger sage-install's rewrite. The
+    // (2a) Subscribe to sage.v1.install.complete BEFORE publishing the
+    // relink. sage-install runs as a synchronous interceptor under the
+    // publishing kernel turn and may drain through `publish_complete`
+    // before control returns here; subscribing after the publish would
+    // race-lose. Same ordering as `ensure_install` in `lib.rs`.
+    //
+    // If the subscribe itself fails (kernel out of subscription slots,
+    // capability missing, etc.) we fall back to the legacy fire-and-
+    // forget path with an audit warning rather than hard-erroring out
+    // of settings.set — consumers may still observe the on-disk write
+    // and the relink trigger itself was best-effort already.
+    let install_sub = match ipc::subscribe(INSTALL_COMPLETE_TOPIC) {
+        Ok(sub) => Some(sub),
+        Err(e) => {
+            let _ = ipc::publish_json(
+                AUDIT_TOPIC,
+                &serde_json::json!({
+                    "principal_id": req.principal_id,
+                    "error": format!("relink_subscribe_failed: {e}"),
+                }),
+            );
+            None
+        }
+    };
+
+    // (2b) sage.v1.install.relink: trigger sage-install's rewrite. The
     // merged config is threaded into the payload so sage-install (in a
     // different KV namespace) does not need to read sage's KV.
     let _ = ipc::publish_json(
@@ -122,10 +209,83 @@ pub(crate) fn apply(req: SettingsSetRequest) -> Result<(), SysError> {
         }),
     );
 
-    // (3) sage.v1.settings.changed. Synchronous w.r.t. the relink
-    // trigger publish — NOT awaiting the relink-complete reply.
-    // Hard-ordering consumers should drive their own
-    // `sage.v1.install.complete` subscription.
+    // (2c) Bounded wait for sage-install to ack the relink. Reuses the
+    // crate-internal `classify_install_complete` classifier so the
+    // success / failure / skip branching stays in lockstep with
+    // `ensure_install`. Correlation is by `principal_id` alone — see
+    // module doc-comment for the accepted ambiguity vs a concurrent
+    // fresh install for the same principal.
+    if let Some(sub) = install_sub {
+        let mut remaining_ms =
+            u64::try_from(RELINK_COMPLETE_DEADLINE.as_millis()).unwrap_or(5_000);
+        let mut outcome: Option<InstallEnvelope> = None;
+        while remaining_ms > 0 && outcome.is_none() {
+            let step = remaining_ms.min(2_000);
+            if let Ok(result) = sub.recv(step) {
+                for msg in result.messages {
+                    match classify_install_complete(&msg.payload, &req.principal_id) {
+                        InstallEnvelope::Skip => {}
+                        env => {
+                            outcome = Some(env);
+                            break;
+                        }
+                    }
+                }
+            }
+            remaining_ms = remaining_ms.saturating_sub(step);
+        }
+
+        match outcome {
+            Some(InstallEnvelope::Success(_)) => {
+                // Happy path — sage-install finished the rewrite before
+                // we publish settings.changed.
+            }
+            Some(InstallEnvelope::Failure(reason)) => {
+                // sage-install hit a hard failure. Surface it on the
+                // audit topic so the operator sees the real reason, but
+                // still publish settings.changed — the canonical KV
+                // record is already written and downstream consumers
+                // may want to know the value changed even if the on-
+                // disk projection didn't.
+                let _ = ipc::publish_json(
+                    AUDIT_TOPIC,
+                    &serde_json::json!({
+                        "principal_id": req.principal_id,
+                        "error": format!("relink_failed: {reason}"),
+                    }),
+                );
+            }
+            Some(InstallEnvelope::Skip) => {
+                // Loop only stores Skip when no other variant was seen
+                // — unreachable in practice because the inner match
+                // filters Skip out. Treated as timeout for safety.
+                let _ = ipc::publish_json(
+                    AUDIT_TOPIC,
+                    &serde_json::json!({
+                        "principal_id": req.principal_id,
+                        "error": "relink_timeout",
+                    }),
+                );
+            }
+            None => {
+                // Deadline elapsed with no matching envelope. Fail-open:
+                // publish settings.changed anyway; the on-disk relink
+                // may still complete asynchronously and consumers can
+                // refetch the KV record.
+                let _ = ipc::publish_json(
+                    AUDIT_TOPIC,
+                    &serde_json::json!({
+                        "principal_id": req.principal_id,
+                        "error": "relink_timeout",
+                    }),
+                );
+            }
+        }
+    }
+
+    // (3) sage.v1.settings.changed. Emitted after the bounded wait
+    // terminates (success, failure, or timeout); the audit topic above
+    // captures the wait outcome separately for operators.
     let _ = ipc::publish_json(
         CHANGED_TOPIC,
         &serde_json::json!({

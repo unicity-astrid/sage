@@ -77,11 +77,12 @@ mod tooling;
 
 use codec::{Outbound, encode};
 // The `handle_spawn` interceptor consumes `AuthMode`,
-// `InteractionMode`, and `load_or_default` to branch the spawn pipeline
-// on the per-principal config. `PrincipalConfig` and `save` remain
-// plumbing for the install hook and `handle_settings_set` interceptor
-// in the following slices.
-use config::{AuthMode, InteractionMode, load_or_default as load_principal_config};
+// `InteractionMode`, and `load_status` (re-exported under the legacy
+// `load_principal_config_status` alias) to branch the spawn pipeline on
+// the per-principal config — including the schema_version migration /
+// rejection split. `PrincipalConfig` and `save` remain plumbing for the
+// install hook and `handle_settings_set` interceptor.
+use config::{AuthMode, InteractionMode, LoadOutcome, load_status as load_principal_config_status};
 use state::{
     MAX_SESSIONS_PER_PRINCIPAL, RuntimeSession, SessionRecord, Sessions, save_record,
 };
@@ -251,11 +252,97 @@ impl Sage {
 
         // Load the per-principal config BEFORE the session-cap check so
         // a Repl-mode principal doesn't burn a session slot just to be
-        // rejected. Falls back fail-secure to the default
-        // {Headless, ApiKey, schema_version=1} on a missing / malformed
-        // record — preserves current behaviour for any principal that
-        // hasn't run sage's `#[astrid::install]` hook yet.
-        let cfg = load_principal_config();
+        // rejected.
+        //
+        // Schema-version split (see `config::LoadOutcome`):
+        //   * Current  — use the record verbatim. Common path.
+        //   * NeedsMigration — known-older record; auto-migrate forward
+        //     by publishing `sage.v1.audit.schema_migrated` + a relink
+        //     with the patched config, then proceed with the patched
+        //     cfg as the effective config. Safe because known-older
+        //     → newer fields are filled fail-secure (Headless/ApiKey)
+        //     and the operator's persisted modes are preserved.
+        //   * Unknown — strictly-newer record this binary doesn't
+        //     understand. Reject the spawn with a structured event
+        //     rather than silently demoting to default (a binary
+        //     downgrade must NOT overwrite operator-persisted
+        //     settings).
+        //
+        // Missing / malformed records still fall back fail-secure to
+        // the default `{Headless, ApiKey, schema_version=1}` via the
+        // `Current` arm of `load_status` — preserves current behaviour
+        // for any principal that hasn't run sage's `#[astrid::install]`
+        // hook yet.
+        let cfg = match load_principal_config_status() {
+            LoadOutcome::Current(cfg) => cfg,
+            LoadOutcome::NeedsMigration {
+                patched,
+                previous_version,
+            } => {
+                // Audit the auto-migration before persisting so a crash
+                // mid-relink still leaves a forensic trail.
+                let _ = ipc::publish_json(
+                    "sage.v1.audit.schema_migrated",
+                    &serde_json::json!({
+                        "principal_id": req.principal_id,
+                        "previous_version": previous_version,
+                        "current": config::SCHEMA_VERSION,
+                    }),
+                );
+                // Persist the patched record to sage's own KV namespace
+                // BEFORE publishing the relink. sage and sage-install live
+                // in separate per-capsule KV namespaces (the canonical
+                // record sage reads on the next handle_spawn lives at
+                // `sage.principal.config` here, while sage-install only
+                // rewrites its own `.claude/` artifacts and its own
+                // install-complete marker). Without this `save`, every
+                // subsequent spawn would re-detect the old schema_version
+                // and re-trigger a relink — the migration would never
+                // terminate. Best-effort: a KV write failure must not
+                // abort the spawn (the patched config is valid in-memory
+                // for this turn), but it MUST be logged so the next
+                // spawn's repeat-migration is diagnosable.
+                if let Err(e) = config::save(&patched) {
+                    log::warn(format!(
+                        "sage: failed to persist migrated principal config \
+                         for {}: {e:?}; the next spawn will re-trigger \
+                         migration",
+                        req.principal_id
+                    ));
+                }
+                // Publish a relink so sage-install rewrites the on-disk
+                // `.claude/` artifacts in its own per-capsule namespace.
+                // We do NOT block on the relink-complete reply here: the
+                // patched config is already valid for this spawn (the
+                // fields needed by the spawn pipeline are populated), and
+                // the save above is what the next handle_spawn observes.
+                let _ = ipc::publish_json(
+                    "sage.v1.install.relink",
+                    &serde_json::json!({
+                        "principal_id": req.principal_id,
+                        "config": patched,
+                    }),
+                );
+                patched
+            }
+            LoadOutcome::Unknown(got) => {
+                // Strictly-newer schema. Refuse to spawn. Mirrors the
+                // structured rejection envelope used by `principal_limit`
+                // and `interaction_mode_is_repl` below — fail-secure-
+                // loud rather than silently downgrading.
+                let _ = ipc::publish_json(
+                    "sage.v1.event.session_rejected",
+                    &serde_json::json!({
+                        "principal_id": req.principal_id,
+                        "reason": "schema_version_unsupported",
+                        "got": got,
+                        "expected": config::SCHEMA_VERSION,
+                        "hint": "upgrade sage or run --force install to rewrite the config",
+                    }),
+                );
+                return Ok(());
+            }
+        };
 
         // Repl mode short-circuit. No spawn, no identity fetch, no env
         // read — the user drives `claude` directly inside the principal

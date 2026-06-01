@@ -195,10 +195,20 @@ impl SageInstall {
         let raw_id = req.principal_id.clone();
         // Resolve the config once at the handler boundary so success and
         // error envelopes both echo the same shape back to sage; absent
-        // (older sage envelopes) defaults to `{Headless, ApiKey, v1}`
-        // per the back-compat fallback in `run_install`.
-        let resolved_cfg = req.config.unwrap_or_default();
-        match run_install(&req) {
+        // (older sage envelopes) defaults to `{Headless, ApiKey, v1}`.
+        // This single resolution is then threaded into `run_install`
+        // (via `cfg` parameter) — no inner re-read — so the echoed value
+        // cannot drift from what the writers actually used.
+        let resolved_cfg = match req.config {
+            Some(cfg) => cfg,
+            None => {
+                log::info(
+                    "sage-install: no config on InstallRequest, defaulting to {headless, api_key}",
+                );
+                PrincipalConfig::default()
+            }
+        };
+        match run_install(&req, resolved_cfg) {
             Ok(home) => {
                 publish_complete(&InstallComplete {
                     principal_id: req.principal_id,
@@ -237,10 +247,19 @@ impl SageInstall {
     pub fn handle_relink(&self, req: RelinkRequest) -> Result<(), SysError> {
         let raw_id = req.principal_id.clone();
         // Resolve once at the handler boundary — symmetrical with
-        // `handle_install` so success envelopes can echo the shape sage
-        // applied.
-        let resolved_cfg = req.config.unwrap_or_default();
-        match run_relink(&req) {
+        // `handle_install`. Threaded into `run_relink` as a parameter so
+        // the writer and the echo see the same value with no inner
+        // re-read.
+        let resolved_cfg = match req.config {
+            Some(cfg) => cfg,
+            None => {
+                log::info(
+                    "sage-install: no config on RelinkRequest, defaulting to {headless, api_key}",
+                );
+                PrincipalConfig::default()
+            }
+        };
+        match run_relink(&req, resolved_cfg) {
             Ok(home) => {
                 // Audit the operator's settings rewrite on relink. Sage
                 // publishes its own `sage.v1.audit.settings_changed`
@@ -288,13 +307,14 @@ impl SageInstall {
 /// Full install pipeline. On `Err`, the caller publishes the failure
 /// event and we deliberately do NOT write the KV completion marker —
 /// the next run retries cleanly.
-fn run_install(req: &InstallRequest) -> Result<String, SysError> {
+///
+/// `cfg` is resolved once by [`SageInstall::handle_install`] at the
+/// handler boundary and threaded in by value (PrincipalConfig is `Copy`),
+/// so the writer here and the success-echo envelope cannot disagree
+/// about the shape that landed on disk.
+fn run_install(req: &InstallRequest, cfg: PrincipalConfig) -> Result<String, SysError> {
     let sanitized = sanitize_principal_id(&req.principal_id)?;
     let home = principal_home();
-    let cfg = req.config.unwrap_or_else(|| {
-        log::info("sage-install: no config on InstallRequest, defaulting to {headless, api_key}");
-        PrincipalConfig::default()
-    });
 
     publish_status(&sanitized, "begin", "starting install");
 
@@ -374,13 +394,13 @@ fn run_install(req: &InstallRequest) -> Result<String, SysError> {
 }
 
 /// Relink pipeline — re-writes only the two config files.
-fn run_relink(req: &RelinkRequest) -> Result<String, SysError> {
+///
+/// `cfg` is resolved once by [`SageInstall::handle_relink`] at the
+/// handler boundary and threaded in by value — symmetric with
+/// [`run_install`].
+fn run_relink(req: &RelinkRequest, cfg: PrincipalConfig) -> Result<String, SysError> {
     let sanitized = sanitize_principal_id(&req.principal_id)?;
     let home = principal_home();
-    let cfg = req.config.unwrap_or_else(|| {
-        log::info("sage-install: no config on RelinkRequest, defaulting to {headless, api_key}");
-        PrincipalConfig::default()
-    });
 
     publish_status(&sanitized, "relink_begin", "rewriting configs");
 

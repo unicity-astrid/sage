@@ -70,15 +70,29 @@ pub enum AuthMode {
 /// hook on first run, by `handle_settings_set` thereafter. Read by
 /// `handle_spawn` at the top of the spawn pipeline. Crate-private so
 /// the canonical record never leaks across the capsule boundary.
+///
+/// Wire shape is intentionally mirrored byte-for-byte with the
+/// `sage-install` crate's [`PrincipalConfig`] copy: all three fields
+/// carry `#[serde(default)]` so an empty `{}` envelope round-trips on
+/// both ends. The canonical fully-populated payload is asserted by the
+/// `WIRE_FORMAT_V1` test constant in both crates — keep the two
+/// literals identical when bumping the schema.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct PrincipalConfig {
     /// Interaction mode (see [`InteractionMode`]).
+    #[serde(default)]
     pub(crate) interaction_mode: InteractionMode,
     /// Auth mode (see [`AuthMode`]).
+    #[serde(default)]
     pub(crate) auth_mode: AuthMode,
     /// Schema version. Always [`SCHEMA_VERSION`] for records written by
     /// this version of sage.
+    #[serde(default = "default_schema_version")]
     pub(crate) schema_version: u32,
+}
+
+fn default_schema_version() -> u32 {
+    SCHEMA_VERSION
 }
 
 impl Default for PrincipalConfig {
@@ -100,10 +114,16 @@ impl PrincipalConfig {
     /// in-depth gate against forged payloads (the serde enum alphabet
     /// already rejects unknown variants; this checks the numeric field
     /// since serde happily accepts any u32 there).
+    ///
+    /// Rejects strictly-future schema versions (a payload from a newer
+    /// sage that this binary cannot understand) while admitting
+    /// equal-or-older records so the caller can drive forward migration.
+    /// Matches `sage-install::PrincipalConfig::validate`'s `>` check so
+    /// the two crates agree on which records are accepted.
     pub(crate) fn validate(&self) -> Result<(), SysError> {
-        if self.schema_version != SCHEMA_VERSION {
+        if self.schema_version > SCHEMA_VERSION {
             return Err(SysError::ApiError(format!(
-                "unsupported schema_version: got {}, expected {}",
+                "unsupported schema_version: got {}, supported {}",
                 self.schema_version, SCHEMA_VERSION
             )));
         }
@@ -111,28 +131,156 @@ impl PrincipalConfig {
     }
 }
 
-/// Load the current config from KV, or return [`PrincipalConfig::default`]
-/// when the key is missing or the payload fails to deserialize. Fail-
-/// secure on parse error so a corrupted record cannot crash the spawn
-/// path — the default {Headless, ApiKey, schema_version=1} is the
-/// safest fallback.
-pub(crate) fn load_or_default() -> PrincipalConfig {
+/// Outcome of loading a principal config record from KV. Lets callers
+/// distinguish three cases the prior [`load_or_default`] collapsed into
+/// "use default":
+///
+/// * [`Current`] — record present and at the current schema version. The
+///   common path; the caller uses the config verbatim.
+/// * [`NeedsMigration`] — record present at a known-older schema
+///   version. The struct has been patched into the current shape by
+///   filling new fields from [`PrincipalConfig::default`]; callers that
+///   want to persist the migration (e.g. [`handle_spawn`]) should
+///   re-publish the patched config via `sage.v1.install.relink` and
+///   emit `sage.v1.audit.schema_migrated`. Lenient callers (e.g. the
+///   respawn sweep in `shutdown.rs`) may use the patched config
+///   directly without persisting — orphaning an in-flight identity-
+///   refresh session because of a schema bump is worse than running it
+///   on a migrated record.
+/// * [`Unknown`] — record present at a strictly-newer schema version
+///   this binary doesn't understand. Carries the raw version number for
+///   the caller's error envelope. The fail-secure choice here is
+///   spawn-rejection rather than silently demoting to default, which
+///   would overwrite operator-persisted settings on a binary downgrade.
+///
+/// Today [`SCHEMA_VERSION`] is `1`, so neither the `NeedsMigration` nor
+/// `Unknown` branch is hot in production — the structure exists so the
+/// next schema bump is painless.
+///
+/// [`Current`]: LoadOutcome::Current
+/// [`NeedsMigration`]: LoadOutcome::NeedsMigration
+/// [`Unknown`]: LoadOutcome::Unknown
+/// [`handle_spawn`]: crate::Sage::handle_spawn
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum LoadOutcome {
+    /// Record at the current [`SCHEMA_VERSION`]; use as-is.
+    Current(PrincipalConfig),
+    /// Record at a known-older schema; the carried config has been
+    /// patched to the current shape using defaults for any new fields.
+    /// The raw `previous_version` is preserved so the caller can emit a
+    /// structured audit event before persisting via relink.
+    NeedsMigration {
+        /// Patched config in the current schema shape.
+        patched: PrincipalConfig,
+        /// Schema version observed on disk.
+        previous_version: u32,
+    },
+    /// Record at an unknown (strictly-newer) schema version. Carries
+    /// the observed version so the caller can surface it to the
+    /// operator.
+    Unknown(u32),
+}
+
+/// Load the current config from KV with schema-version classification.
+///
+/// Branching rules:
+///
+/// * Missing record / parse / host error → [`LoadOutcome::Current`] with
+///   [`PrincipalConfig::default`]. Fail-secure: a corrupted or absent
+///   KV row cannot crash the spawn path, and the safer-default surface
+///   (`{Headless, ApiKey}`) keeps the principal restricted until an
+///   operator runs the install hook again.
+/// * `schema_version == SCHEMA_VERSION` → [`LoadOutcome::Current`].
+/// * `schema_version < SCHEMA_VERSION` → [`LoadOutcome::NeedsMigration`].
+///   The carried struct has been re-shaped into the current schema (any
+///   genuinely new fields would be filled from `PrincipalConfig::default`
+///   here — today the struct is unchanged across versions, so this is
+///   forward-looking machinery).
+/// * `schema_version > SCHEMA_VERSION` → [`LoadOutcome::Unknown`]. Do
+///   NOT silently default; the caller must decide whether to reject the
+///   spawn (the safe choice in [`handle_spawn`]) or fall back to
+///   default (the documented choice in `shutdown.rs::respawn_one` via
+///   [`load_or_default`], where orphaning the session is worse than
+///   running it on defaults).
+///
+/// [`handle_spawn`]: crate::Sage::handle_spawn
+pub(crate) fn load_status() -> LoadOutcome {
     match kv::get_json_opt::<PrincipalConfig>(KV_KEY) {
-        Ok(Some(cfg)) => {
-            if cfg.validate().is_ok() {
-                cfg
-            } else {
-                log::warn(format!(
-                    "sage: principal config schema_version {} unsupported; using default",
-                    cfg.schema_version
-                ));
-                PrincipalConfig::default()
-            }
-        }
-        Ok(None) => PrincipalConfig::default(),
+        Ok(Some(cfg)) => classify(cfg),
+        Ok(None) => LoadOutcome::Current(PrincipalConfig::default()),
         Err(e) => {
             log::warn(format!(
                 "sage: failed to load principal config: {e:?}; using default"
+            ));
+            LoadOutcome::Current(PrincipalConfig::default())
+        }
+    }
+}
+
+/// Pure classifier — split out of [`load_status`] so the version-branching
+/// is unit-testable on the host without a KV round-trip. The migration
+/// arm is a copy-with-current-version today (no fields changed across
+/// schema versions yet); when the schema next bumps, this is the seam
+/// to fill any new fields with fail-secure defaults derived from the
+/// old record.
+fn classify(cfg: PrincipalConfig) -> LoadOutcome {
+    use std::cmp::Ordering;
+    match cfg.schema_version.cmp(&SCHEMA_VERSION) {
+        Ordering::Equal => LoadOutcome::Current(cfg),
+        Ordering::Less => {
+            let previous_version = cfg.schema_version;
+            // Migration seam. When SCHEMA_VERSION next bumps, replace
+            // the spread below with a per-version match that fills any
+            // new fields from `PrincipalConfig::default` (fail-secure
+            // defaults).
+            let patched = PrincipalConfig {
+                schema_version: SCHEMA_VERSION,
+                ..cfg
+            };
+            LoadOutcome::NeedsMigration {
+                patched,
+                previous_version,
+            }
+        }
+        Ordering::Greater => LoadOutcome::Unknown(cfg.schema_version),
+    }
+}
+
+/// Lenient wrapper retained for callers that cannot fail loudly on a
+/// schema mismatch — specifically `shutdown::respawn_one`, where
+/// orphaning an in-flight identity-refresh session because of a schema
+/// downgrade would be worse than running it on the migrated or default
+/// config. Maps:
+///
+/// * [`LoadOutcome::Current`] → the carried config
+/// * [`LoadOutcome::NeedsMigration`] → the patched config (silent — does
+///   NOT publish a relink; the supervisor-path caller is expected to log
+///   the asymmetry and proceed)
+/// * [`LoadOutcome::Unknown`] → [`PrincipalConfig::default`] + warn
+///
+/// Interceptors that CAN fail loudly (notably [`handle_spawn`]) should
+/// call [`load_status`] directly and branch on the outcome so unknown-
+/// future records reject the spawn rather than silently downgrading the
+/// operator-persisted settings.
+///
+/// [`handle_spawn`]: crate::Sage::handle_spawn
+pub(crate) fn load_or_default() -> PrincipalConfig {
+    match load_status() {
+        LoadOutcome::Current(cfg) => cfg,
+        LoadOutcome::NeedsMigration {
+            patched,
+            previous_version,
+        } => {
+            log::warn(format!(
+                "sage: principal config schema_version {previous_version} is older than \
+                 current {SCHEMA_VERSION}; using migrated record without persistence"
+            ));
+            patched
+        }
+        LoadOutcome::Unknown(v) => {
+            log::warn(format!(
+                "sage: principal config schema_version {v} is newer than supported \
+                 {SCHEMA_VERSION}; using default"
             ));
             PrincipalConfig::default()
         }
@@ -182,11 +330,15 @@ mod tests {
     }
 
     #[test]
-    fn validate_rejects_unknown_schema_version() {
+    fn validate_rejects_future_schema_version() {
+        // `validate()` uses `>` (matching sage-install) so a strictly
+        // newer record fails loudly. Equal-or-older is admitted so the
+        // load path can drive forward migration without smashing the
+        // operator's persisted record.
         let cfg = PrincipalConfig {
             interaction_mode: InteractionMode::Headless,
             auth_mode: AuthMode::ApiKey,
-            schema_version: 99,
+            schema_version: u32::MAX,
         };
         assert!(cfg.validate().is_err());
     }
@@ -282,8 +434,168 @@ mod tests {
         // fail-secure path is actually reached.
         let parsed: Result<PrincipalConfig, _> = serde_json::from_str("not json at all");
         assert!(parsed.is_err());
-        let parsed: Result<PrincipalConfig, _> = serde_json::from_str("{}");
-        assert!(parsed.is_err());
+    }
+
+    #[test]
+    fn empty_object_deserializes_to_default() {
+        // `{}` must round-trip to the default record — every field
+        // carries `#[serde(default)]` so older / partial envelopes
+        // produced before all three fields shipped still parse. Mirrors
+        // sage-install's `deserialise_accepts_missing_fields_via_defaults`
+        // so the two crates accept the same wire shape.
+        let cfg: PrincipalConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(cfg, PrincipalConfig::default());
+    }
+
+    /// Canonical fully-populated wire payload for schema_version=1. The
+    /// `sage-install` crate's test module declares an identical literal
+    /// — keep the two strings byte-for-byte equal. Bump alongside
+    /// `SCHEMA_VERSION` when the wire shape changes.
+    const WIRE_FORMAT_V1: &str =
+        r#"{"interaction_mode":"headless","auth_mode":"api_key","schema_version":1}"#;
+
+    #[test]
+    fn default_serializes_to_wire_format_v1() {
+        // Locks the canonical serialize output for the default record.
+        // Field-order matters: serde emits struct fields in declaration
+        // order, so the literal must follow the source order
+        // (interaction_mode, auth_mode, schema_version).
+        let json = serde_json::to_string(&PrincipalConfig::default()).unwrap();
+        assert_eq!(json, WIRE_FORMAT_V1);
+    }
+
+    #[test]
+    fn wire_format_v1_round_trips_to_default() {
+        // Reciprocal: the canonical literal deserializes to the default
+        // record. Combined with `default_serializes_to_wire_format_v1`,
+        // this pins the contract on both sides — any drift in field
+        // names, ordering, or enum variants breaks one of the two.
+        let cfg: PrincipalConfig = serde_json::from_str(WIRE_FORMAT_V1).unwrap();
+        assert_eq!(cfg, PrincipalConfig::default());
+    }
+
+    // ---- LoadOutcome / classify tests ---------------------------------
+    //
+    // `classify` is the pure half of `load_status` (the IO half is the
+    // `kv::get_json_opt` call). Testing the classifier directly here lets
+    // us exercise the three schema-version branches without standing up
+    // the host KV.
+
+    #[test]
+    fn classify_current_returns_current() {
+        // Equal schema_version → Current(cfg).
+        let cfg = PrincipalConfig::default();
+        assert_eq!(classify(cfg.clone()), LoadOutcome::Current(cfg));
+    }
+
+    #[test]
+    fn classify_older_returns_needs_migration() {
+        // Strictly-older schema_version → NeedsMigration with the
+        // version bumped to current. `previous_version` carries the raw
+        // observed value so the caller can audit the migration.
+        //
+        // We construct an artificially-older record by setting
+        // schema_version=0 manually. SCHEMA_VERSION is 1 today so this
+        // is the only available "older" value; the test exists so the
+        // branch is exercised once the schema bumps.
+        let older = PrincipalConfig {
+            interaction_mode: InteractionMode::Repl,
+            auth_mode: AuthMode::Subscription,
+            schema_version: 0,
+        };
+        match classify(older) {
+            LoadOutcome::NeedsMigration {
+                patched,
+                previous_version,
+            } => {
+                assert_eq!(previous_version, 0);
+                assert_eq!(patched.schema_version, SCHEMA_VERSION);
+                // Carries the operator-persisted choices forward — the
+                // migration does NOT smash them with defaults.
+                assert_eq!(patched.interaction_mode, InteractionMode::Repl);
+                assert_eq!(patched.auth_mode, AuthMode::Subscription);
+            }
+            other => panic!("expected NeedsMigration, got {other:?}"),
+        }
+    }
+
+    // Round-trip the `patched` config from a NeedsMigration outcome
+    // through the same JSON shape `save` writes (via `kv::set_json` →
+    // `serde_json::to_vec`) and back through `classify` (the pure half
+    // of `load_status`). Asserts the result is `Current(patched)` —
+    // i.e. once `handle_spawn`'s NeedsMigration arm calls
+    // `config::save(&patched)`, the next spawn's `load_status` lands
+    // on `Current` and does NOT re-trigger migration. Locks in the
+    // termination property: without the `save`, this test would still
+    // pass at the classifier level, but the live system would loop
+    // forever (the missing `save` is the bug; this test guards the
+    // serialize/classify contract those two host calls rely on).
+    #[test]
+    fn migration_save_then_classify_terminates_at_current() {
+        let older = PrincipalConfig {
+            interaction_mode: InteractionMode::Repl,
+            auth_mode: AuthMode::Subscription,
+            schema_version: 0,
+        };
+        let patched = match classify(older) {
+            LoadOutcome::NeedsMigration { patched, .. } => patched,
+            other => panic!("expected NeedsMigration, got {other:?}"),
+        };
+        // Mirror `save`'s wire path exactly: serde_json::to_vec is what
+        // `kv::set_json` does under the hood.
+        let bytes = serde_json::to_vec(&patched).unwrap();
+        // Mirror `load_status`'s wire path: deserialize the bytes a
+        // hypothetical `kv::get_json_opt` would return, then run the
+        // same classifier the live load path runs.
+        let reloaded: PrincipalConfig = serde_json::from_slice(&bytes).unwrap();
+        match classify(reloaded) {
+            LoadOutcome::Current(cfg) => assert_eq!(cfg, patched),
+            other => panic!(
+                "expected Current(patched) after save+reload (migration must \
+                 terminate), got {other:?}"
+            ),
+        }
+    }
+
+    #[test]
+    fn classify_newer_returns_unknown() {
+        // Strictly-newer schema_version → Unknown(v). The caller (i.e.
+        // handle_spawn) is expected to reject the spawn rather than
+        // silently demote to default — a binary downgrade would
+        // otherwise overwrite an operator's schema_version=2 record
+        // with our schema_version=1 default.
+        let newer = PrincipalConfig {
+            interaction_mode: InteractionMode::Headless,
+            auth_mode: AuthMode::ApiKey,
+            schema_version: u32::MAX,
+        };
+        assert_eq!(classify(newer), LoadOutcome::Unknown(u32::MAX));
+    }
+
+    // settings::apply (the runtime write path) reads `previous` via the
+    // same classifier and MUST reject — not flatten-to-default — when
+    // the on-disk record is at a strictly-newer schema. This pins the
+    // contract: a synthetic future-schema `previous` carrying an
+    // operator-persisted AuthMode::Subscription must classify as
+    // `Unknown`, NOT as a borrowable `Current` whose values
+    // settings::apply could merge against. Guards against a regression
+    // where settings::apply falls back to `load_or_default` and
+    // overwrites the persisted subscription with the default ApiKey on
+    // binary downgrade.
+    #[test]
+    fn settings_apply_rejects_future_schema_rather_than_overwriting() {
+        let persisted_future = PrincipalConfig {
+            interaction_mode: InteractionMode::Repl,
+            auth_mode: AuthMode::Subscription,
+            schema_version: u32::MAX,
+        };
+        match classify(persisted_future) {
+            LoadOutcome::Unknown(v) => assert_eq!(v, u32::MAX),
+            other => panic!(
+                "future-schema record must classify Unknown so settings::apply \
+                 rejects rather than overwriting persisted modes, got {other:?}"
+            ),
+        }
     }
 
     // Serde shape for the IPC request payload: both fields optional.

@@ -138,4 +138,26 @@ mod tests {
     fn validate_accepts_current_schema_version() {
         assert!(PrincipalConfig::default().validate().is_ok());
     }
+
+    /// Canonical fully-populated wire payload for schema_version=1. The
+    /// sibling `sage` crate's test module declares an identical literal
+    /// — keep the two strings byte-for-byte equal. Bump alongside
+    /// [`PrincipalConfig::SCHEMA_VERSION`] when the wire shape changes.
+    /// Avoiding a shared crate by design (two consumers only); the
+    /// reciprocal serialize/deserialize tests in both crates pin the
+    /// contract.
+    const WIRE_FORMAT_V1: &str =
+        r#"{"interaction_mode":"headless","auth_mode":"api_key","schema_version":1}"#;
+
+    #[test]
+    fn default_serializes_to_wire_format_v1() {
+        let json = serde_json::to_string(&PrincipalConfig::default()).unwrap();
+        assert_eq!(json, WIRE_FORMAT_V1);
+    }
+
+    #[test]
+    fn wire_format_v1_round_trips_to_default() {
+        let cfg: PrincipalConfig = serde_json::from_str(WIRE_FORMAT_V1).unwrap();
+        assert_eq!(cfg, PrincipalConfig::default());
+    }
 }
