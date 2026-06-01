@@ -83,7 +83,7 @@ impl SageMcp {
     /// failure path (unknown prefix, invalid name, subscribe / publish
     /// error, 50 s drain timeout) writes back an `isError:true`
     /// envelope so the sage-side `pending_tool_calls` slot retires
-    /// cleanly. See [`execute`] for the wire-shape and timeout details.
+    /// cleanly. See `execute` for the wire-shape and timeout details.
     #[astrid::interceptor("handle_tool_call")]
     pub fn handle_tool_call(&self, payload: serde_json::Value) -> Result<(), SysError> {
         execute::handle_tool_call(payload)

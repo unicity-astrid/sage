@@ -24,14 +24,30 @@ kv = []
 fs_read = ["home://"]
 fs_write = ["home://.claude/"]
 
-# Per-principal Anthropic API key. The kernel elicits this once at
-# install time (typed as `secret`, stored via SecretStore), and injects
-# it as the capsule's runtime `api_key` config — read back at spawn
-# time with `astrid_sdk::env::var("api_key")` and forwarded to
-# `claude -p` as `ANTHROPIC_API_KEY`. Mirrors the onboarding shape used
-# by capsule-anthropic / capsule-openai.
+# Per-principal sage configuration. Three orthogonal knobs are
+# elicited at install time and stored by the kernel (typed values land
+# in the per-principal env JSON; secrets land in SecretStore). All
+# three are read back with `astrid_sdk::env::var(...)` — the
+# `#[astrid::install]` hook on the sage crate validates and persists
+# them into a structured `PrincipalConfig` under
+# `kv://sage.principal.config`.
+#
+# * `interaction_mode` — "headless" (Astrid spawns `claude -p` and
+#   restricts tools to `mcp__sage__*`) or "repl" (the operator drives
+#   `claude` directly inside the principal folder; sage refuses to
+#   spawn and only audits via the placeholder hook bridge).
+# * `auth_mode` — "api_key" (read the `api_key` secret and forward as
+#   `ANTHROPIC_API_KEY`) or "subscription" (delegate to `claude /login`
+#   inside the principal folder; sage never sets the env var and omits
+#   the `apiKeyHelper` pin).
+# * `api_key` — kernel walks every `[env]` key unconditionally (no
+#   `when=` semantics today), so the secret is always offered. Empty
+#   values are not persisted, so subscription-mode operators leave it
+#   blank.
 [env]
-api_key = { type = "secret", request = "Enter your Anthropic API key for `claude -p` spawn", placeholder = "sk-ant-..." }
+interaction_mode = { type = "select", enum_values = ["headless", "repl"], default = "headless", request = "Interaction mode: 'headless' (Astrid drives claude -p) or 'repl' (you run claude directly)" }
+auth_mode = { type = "select", enum_values = ["api_key", "subscription"], default = "api_key", request = "Auth mode: 'api_key' or 'subscription' (see README: macOS Keychain is HOME-blind)" }
+api_key = { type = "secret", request = "Anthropic API key (leave blank for subscription mode)", placeholder = "sk-ant-..." }
 
 # Topics are pre-RFC placeholders; the agent-provider contract
 # (rfc:agent-provider.v1) will lock these once drafted.
@@ -45,6 +61,11 @@ api_key = { type = "secret", request = "Enter your Anthropic API key for `claude
 # Per-principal spawn request: provision a long-lived `claude -p`
 # subprocess and return a session handle.
 "sage.v1.request.spawn" = { handler = "handle_spawn" }
+# Update the per-principal settings (interaction_mode / auth_mode).
+# Sage owns `kv://sage.principal.config` (canonical source of truth) and
+# re-emits `sage.v1.install.relink` so sage-install rewrites the on-disk
+# `.claude/settings.local.json` + `.mcp.json` with the new shape.
+"sage.v1.request.settings.set" = { handler = "handle_settings_set" }
 # Send a user message into an existing session's stream-json stdin.
 "sage.v1.request.send.*" = { handler = "handle_send" }
 # Tool-call result coming back from sage-mcp, routed into the
@@ -83,5 +104,15 @@ api_key = { type = "secret", request = "Enter your Anthropic API key for `claude
 # marker is in KV. sage-install consumes it and replies on
 # `sage.v1.install.complete`.
 "sage.v1.install.run" = {}
+# Re-link an existing principal after the operator changes
+# interaction_mode / auth_mode via `sage.v1.request.settings.set`.
+# sage-install subscribes to this topic and rewrites
+# `.claude/settings.local.json` + `.mcp.json` with the new shape.
+"sage.v1.install.relink" = {}
+# Settings-changed broadcast emitted after sage-install confirms the
+# on-disk rewrite. Carries the new `PrincipalConfig` so subscribers
+# (dashboards, audit sinks) can mirror the operator's choice without
+# re-reading sage's KV.
+"sage.v1.settings.changed" = {}
 # Per-session identity-prompt build request to spark.
 "spark.v1.request.build" = {}

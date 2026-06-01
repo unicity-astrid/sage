@@ -22,17 +22,17 @@
 //!
 //! * `handle_spawn` — provision a `claude -p` subprocess, fetch identity
 //!   from spark with fallback, write the system-prompt file, spawn with
-//!   the hardened argv set, persist the [`state::SessionRecord`].
+//!   the hardened argv set, persist the `state::SessionRecord`.
 //! * `handle_send` — encode a user-turn stream-json envelope and write
 //!   it to the session's stdin in one call.
-//! * `#[astrid::run]` — supervisor tick at [`TICK_PERIOD`] cadence
-//!   driving [`supervisor::tick`]: drain stdout, decode stream-json,
-//!   publish `sage.v1.event.<sid>.*` for text / init / tool_use /
+//! * `#[astrid::run]` — supervisor tick at `supervisor::TICK_INTERVAL`
+//!   cadence driving `supervisor::tick`: drain stdout, decode stream-
+//!   json, publish `sage.v1.event.<sid>.*` for text / init / tool_use /
 //!   result, detect crash / buffer-overflow / capsule-reload, emit
 //!   `sage.v1.tool.call.<call_id>` for each tool dispatch.
 //!
 //! `handle_tool_result` write-back, 60 s deadline enforcement, and
-//! approval routing live in [`tooling`] (shipped in S7's slice).
+//! approval routing live in `tooling` (shipped in S7's slice).
 
 use astrid_sdk::prelude::*;
 use serde::Deserialize;
@@ -50,7 +50,25 @@ use uuid::Uuid;
 // errors handled by the supervisor in a follow-up slice.
 #[allow(dead_code)]
 mod codec;
+// `config` is purely additive plumbing in this slice — the
+// `PrincipalConfig` type and KV helpers (`load_or_default`, `save`)
+// exist so the install hook (`#[astrid::install]`) and the
+// `handle_settings_set` IPC interceptor in upcoming slices can wire to
+// a single canonical record. No call site exercises it yet, so allow
+// dead_code at the module boundary to keep the slice buildable without
+// loosening warnings crate-wide.
+#[allow(dead_code)]
+mod config;
 mod identity;
+// `#[astrid::install]` body — split out of `lib.rs` to keep that file
+// under the 1000-line CI gate.
+mod install;
+// `handle_settings_set` business logic — split out of `lib.rs` to keep
+// that file under the 1000-line CI gate. The interceptor wiring lands
+// in a later slice; until then the module's items are dead at the
+// crate boundary.
+#[allow(dead_code)]
+mod settings;
 mod shutdown;
 mod spawn;
 mod state;
@@ -58,6 +76,12 @@ mod supervisor;
 mod tooling;
 
 use codec::{Outbound, encode};
+// The `handle_spawn` interceptor consumes `AuthMode`,
+// `InteractionMode`, and `load_or_default` to branch the spawn pipeline
+// on the per-principal config. `PrincipalConfig` and `save` remain
+// plumbing for the install hook and `handle_settings_set` interceptor
+// in the following slices.
+use config::{AuthMode, InteractionMode, load_or_default as load_principal_config};
 use state::{
     MAX_SESSIONS_PER_PRINCIPAL, RuntimeSession, SessionRecord, Sessions, save_record,
 };
@@ -122,13 +146,13 @@ pub(crate) fn validate_id(field: &str, id: &str) -> Result<(), SysError> {
 
 /// Sage agent runner — capsule singleton.
 ///
-/// Holds the live [`Sessions`] registry directly. The `#[capsule]`
+/// Holds the live `Sessions` registry directly. The `#[capsule]`
 /// macro stores a single `OnceLock<Sage>` and gives every handler the
 /// same `&self` for the duration of one capsule incarnation. That
 /// satisfies the requirement to share `Process` resource handles
 /// across IPC dispatches (KV-backed state would not — `Process` is a
 /// component-model `resource` and is not serializable). Durable
-/// metadata still rides in KV per-session via [`state::SessionRecord`];
+/// metadata still rides in KV per-session via `state::SessionRecord`;
 /// the runtime map is rebuilt on reload by the supervisor's first-tick
 /// recovery sweep.
 ///
@@ -136,10 +160,10 @@ pub(crate) fn validate_id(field: &str, id: &str) -> Result<(), SysError> {
 /// `call_id` (UUIDv4). The supervisor publishes
 /// `sage.v1.audit.tool_call{call_id,tool_name,session_id}` on every
 /// dispatch; the run-loop drains that subscription into this map so
-/// [`tooling::enforce_deadlines`] can surface the real `tool_name` in
+/// `tooling::enforce_deadlines` can surface the real `tool_name` in
 /// `sage.v1.event.<sid>.tool_timeout` instead of `"unknown"`. Entries
 /// are removed on tool-result write-back or on deadline expiry; the
-/// map is hard-capped at [`tooling::MAX_TOOL_CALL_META`] entries to bound
+/// map is hard-capped at `tooling::MAX_TOOL_CALL_META` entries to bound
 /// memory under upstream-bug pathological cases.
 #[derive(Default)]
 pub struct Sage {
@@ -186,6 +210,29 @@ pub struct SendRequest {
     pub text: String,
 }
 
+/// `sage.v1.request.settings.set` payload.
+///
+/// Partial-update semantics: both [`interaction_mode`] and [`auth_mode`]
+/// are `Option<...>`. Absent fields preserve the current persisted
+/// value; present fields overwrite it. The merged record is validated
+/// before persistence as a defence-in-depth gate against forged IPC
+/// input (the serde enum alphabet already rejects unknown variants).
+///
+/// [`interaction_mode`]: Self::interaction_mode
+/// [`auth_mode`]: Self::auth_mode
+#[derive(Debug, Deserialize)]
+pub struct SettingsSetRequest {
+    /// Principal whose config we're mutating. Validated via
+    /// `validate_id` before reaching KV.
+    pub principal_id: String,
+    /// New interaction mode. When `None` the persisted value is kept.
+    #[serde(default)]
+    pub interaction_mode: Option<config::InteractionMode>,
+    /// New auth mode. When `None` the persisted value is kept.
+    #[serde(default)]
+    pub auth_mode: Option<config::AuthMode>,
+}
+
 #[capsule]
 impl Sage {
     /// Spawn a new `claude -p` subprocess for a principal session.
@@ -200,6 +247,33 @@ impl Sage {
         validate_id("principal_id", &req.principal_id)?;
         if let Some(sid) = &req.session_id {
             validate_id("session_id", sid)?;
+        }
+
+        // Load the per-principal config BEFORE the session-cap check so
+        // a Repl-mode principal doesn't burn a session slot just to be
+        // rejected. Falls back fail-secure to the default
+        // {Headless, ApiKey, schema_version=1} on a missing / malformed
+        // record — preserves current behaviour for any principal that
+        // hasn't run sage's `#[astrid::install]` hook yet.
+        let cfg = load_principal_config();
+
+        // Repl mode short-circuit. No spawn, no identity fetch, no env
+        // read — the user drives `claude` directly inside the principal
+        // folder and sage just publishes a structured rejection so the
+        // CLI / uplink can hint at the right next step. Note we omit
+        // `session_id` from the payload: in repl mode no session is
+        // minted, so reflecting the (possibly caller-provided) id would
+        // imply a binding that doesn't exist.
+        if cfg.interaction_mode == InteractionMode::Repl {
+            let _ = ipc::publish_json(
+                "sage.v1.event.session_rejected",
+                &serde_json::json!({
+                    "principal_id": req.principal_id,
+                    "reason": "interaction_mode_is_repl",
+                    "hint": "user drives `claude` directly in principal folder",
+                }),
+            );
+            return Ok(());
         }
 
         // Per-principal session cap.
@@ -237,7 +311,7 @@ impl Sage {
         // filesystem path in `HOME` / cwd rather than the `home://`
         // VFS scheme string — which would silently break per-principal
         // isolation if the subprocess fell back to ambient `$HOME`.
-        let resolved_home = match ensure_install(&principal_id) {
+        let resolved_home = match ensure_install(&principal_id, &cfg) {
             EnsureInstall::Ok(home) => home,
             EnsureInstall::Failed(reason) => {
                 publish_spawn_error(
@@ -249,16 +323,26 @@ impl Sage {
             }
         };
 
-        // Read API key from the capsule's runtime config. The kernel
-        // elicited `api_key` from `[env]` (type = "secret") at install
-        // time and persists it via the SecretStore; here it surfaces as
-        // a plain `env::var` read — the host injects the cleartext into
-        // the wasm guest's config, never logged.
-        let api_key = env::var("api_key").unwrap_or_default();
-        if api_key.is_empty() {
-            publish_spawn_error(&session_id, &principal_id, "api_key_missing");
-            return Ok(());
-        }
+        // Auth mode branch. In ApiKey mode the kernel-elicited secret
+        // is required; an empty value aborts the spawn (the current
+        // behaviour). In Subscription mode we SKIP the env::var read
+        // entirely so the cleartext never lands in this stack frame and
+        // a blank-on-purpose secret doesn't trigger `api_key_missing`.
+        // The subscription path then threads `None` into SpawnInputs
+        // and `spawn::spawn_claude` omits the `.env("ANTHROPIC_API_KEY")`
+        // call so Claude falls back to its keychain OAuth path written
+        // by `claude /login`.
+        let api_key: Option<String> = match cfg.auth_mode {
+            AuthMode::ApiKey => {
+                let key = env::var("api_key").unwrap_or_default();
+                if key.is_empty() {
+                    publish_spawn_error(&session_id, &principal_id, "api_key_missing");
+                    return Ok(());
+                }
+                Some(key)
+            }
+            AuthMode::Subscription => None,
+        };
 
         // Fetch identity prompt from spark with a 5 s budget. Falls
         // back to a hard-coded minimal prompt + audit on timeout.
@@ -298,12 +382,20 @@ impl Sage {
             .and_then(|m| u64::try_from(m).ok())
             .unwrap_or(0);
 
+        // `api_key` is `Some(...)` in api_key auth mode and would be `None`
+        // in subscription mode once the dual-auth-mode runtime branch
+        // lands. Today the empty-key short-circuit above guarantees we
+        // reach this site with a non-empty `api_key`, so we always thread
+        // `Some(...)`. The `Option<&str>` argument shape is retained at
+        // the spawn boundary so the subscription path can land without
+        // churning the call sites again. See `SpawnInputs::api_key`'s
+        // doc-comment for the audit-stability invariant.
         let spawned = match spawn::spawn_claude(&spawn::SpawnInputs {
             principal_id: &principal_id,
             session_id: &session_id,
             home_path: &home_path,
             identity_path: &identity_path,
-            api_key: &api_key,
+            api_key: api_key.as_deref(),
         }) {
             Ok(s) => s,
             Err(e) => {
@@ -334,6 +426,28 @@ impl Sage {
             );
         })?;
 
+        // TODO(astrid-rfcs#TBD): mirror to a shared cross-capsule audit
+        // topic once a convention lands; the kernel-side
+        // `astrid.v1.audit.entry` is admin-action-shaped and not the
+        // right home for capsule-emitted attribution. Sage stays on
+        // `sage.v1.audit.*` exclusively today — see README "Known
+        // deficiencies" for the open RFC-class gap.
+        //
+        // `auth_mode` and `interaction_mode` are emitted in their
+        // canonical snake_case wire form (matching the [env] select
+        // enum_values) so downstream consumers can attribute the spawn
+        // to a mode tuple without re-deriving it from the config KV.
+        // `flags_hash` is intentionally stable across auth modes (see
+        // [`spawn::SpawnInputs::api_key`]); the auth attribution comes
+        // from this field, not the argv fingerprint.
+        let auth_mode_str = match cfg.auth_mode {
+            AuthMode::ApiKey => "api_key",
+            AuthMode::Subscription => "subscription",
+        };
+        let interaction_mode_str = match cfg.interaction_mode {
+            InteractionMode::Headless => "headless",
+            InteractionMode::Repl => "repl",
+        };
         let _ = ipc::publish_json(
             "sage.v1.audit.spawn",
             &serde_json::json!({
@@ -341,6 +455,8 @@ impl Sage {
                 "session_id": session_id,
                 "pid": spawned.os_pid,
                 "flags_hash": spawned.flags_hash,
+                "auth_mode": auth_mode_str,
+                "interaction_mode": interaction_mode_str,
             }),
         );
         let _ = ipc::publish_json(
@@ -362,6 +478,17 @@ impl Sage {
         Ok(())
     }
 
+    /// Per-principal install hook: persist the operator's interaction
+    /// + auth choices into sage's KV namespace and emit
+    /// `sage.v1.audit.install_choices`. Implementation lives in
+    /// `install::run`; see that module's doc-comment for the
+    /// `[env]` read contract, failure mode, idempotency semantics,
+    /// and audit shape.
+    #[astrid::install]
+    pub fn on_install(&self) -> Result<(), SysError> {
+        install::run()
+    }
+
     /// Send a user turn into an existing session's stdin.
     #[astrid::interceptor("handle_send")]
     pub fn handle_send(&self, req: SendRequest) -> Result<(), SysError> {
@@ -371,7 +498,7 @@ impl Sage {
     }
 
     /// Tool-result write-back. Topic `sage.v1.tool.result.<call_id>`.
-    /// Delegates to [`tooling::handle_tool_result`] which encodes a
+    /// Delegates to `tooling::handle_tool_result` which encodes a
     /// stream-json `control_response` (with the mandatory `mcp_response`
     /// wrapper) and pushes it to the matching session's stdin. After a
     /// successful match, drops the matching `tool_call_meta` sidecar
@@ -379,6 +506,18 @@ impl Sage {
     #[astrid::interceptor("handle_tool_result")]
     pub fn handle_tool_result(&self, payload: serde_json::Value) -> Result<(), SysError> {
         tooling::handle_tool_result(&self.sessions, &self.tool_call_meta, payload)
+    }
+
+    /// Settings-set handler. Topic `sage.v1.request.settings.set`.
+    /// Applies a partial patch to the per-principal
+    /// `config::PrincipalConfig`, persists, and publishes — in order —
+    /// `sage.v1.audit.settings_changed`, `sage.v1.install.relink`,
+    /// `sage.v1.settings.changed`. Implementation lives in
+    /// `settings::apply`; see that module's doc-comment for the
+    /// publish-ordering contract and error semantics.
+    #[astrid::interceptor("handle_settings_set")]
+    pub fn handle_settings_set(&self, req: SettingsSetRequest) -> Result<(), SysError> {
+        settings::apply(req)
     }
 
     /// Supervisor run loop. Each tick (~50 ms):
@@ -651,14 +790,26 @@ pub(crate) fn classify_install_complete(payload: &str, principal_id: &str) -> In
 ///   failure too. The host may have unloaded sage-install, or the
 ///   capsule registry may be missing it — in either case the spawn
 ///   has no useful work to do.
-fn ensure_install(principal_id: &str) -> EnsureInstall {
+fn ensure_install(principal_id: &str, cfg: &config::PrincipalConfig) -> EnsureInstall {
     let sub = match ipc::subscribe("sage.v1.install.complete") {
         Ok(s) => s,
         Err(e) => return EnsureInstall::Failed(format!("subscribe_failed: {e}")),
     };
+    // Thread the per-principal config in the install.run envelope so
+    // sage-install can branch its `.claude/settings.local.json` +
+    // `.mcp.json` writers without a cross-namespace KV read (sage-install
+    // lives in its own per-capsule KV namespace and can't peek at sage's
+    // `sage.principal.config` record directly — the kernel scopes KV
+    // by `{principal}:capsule:{capsule_id}`). The receiver defaults to
+    // `PrincipalConfig::default()` (i.e. `{Headless, ApiKey, v1}`) when
+    // the field is absent, preserving back-compat with older sage
+    // envelopes; see `sage-install::run_install` for that fallback.
     if let Err(e) = ipc::publish_json(
         "sage.v1.install.run",
-        &serde_json::json!({ "principal_id": principal_id }),
+        &serde_json::json!({
+            "principal_id": principal_id,
+            "config": cfg,
+        }),
     ) {
         return EnsureInstall::Failed(format!("publish_failed: {e}"));
     }
@@ -725,123 +876,9 @@ pub(crate) fn topic_tail(topic: &str) -> Option<&str> {
     topic.rsplit('.').next().filter(|s| !s.is_empty())
 }
 
+// Host-side unit tests live in a sibling file — see `lib_tests.rs` for
+// the bodies. `#[path]` keeps the test module attached to `lib.rs` via
+// `super::*` while moving the line-count weight out of this file.
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    // Regression: a sage.v1.install.complete payload with success:false
-    // must surface as Failure(error) so handle_spawn aborts with the
-    // real reason instead of progressing to api_key_missing.
-    #[test]
-    fn install_complete_failure_carries_error_reason() {
-        let payload = r#"{
-            "principal_id": "p1",
-            "success": false,
-            "home_path": "",
-            "error": "permission_denied: /.claude/settings.local.json"
-        }"#;
-        assert_eq!(
-            classify_install_complete(payload, "p1"),
-            InstallEnvelope::Failure("permission_denied: /.claude/settings.local.json".into()),
-        );
-    }
-
-    #[test]
-    fn install_complete_failure_without_error_falls_back_to_unknown() {
-        let payload = r#"{"principal_id":"p1","success":false,"home_path":""}"#;
-        assert_eq!(
-            classify_install_complete(payload, "p1"),
-            InstallEnvelope::Failure("unknown".into()),
-        );
-    }
-
-    #[test]
-    fn install_complete_empty_error_falls_back_to_unknown() {
-        let payload = r#"{"principal_id":"p1","success":false,"home_path":"","error":""}"#;
-        assert_eq!(
-            classify_install_complete(payload, "p1"),
-            InstallEnvelope::Failure("unknown".into()),
-        );
-    }
-
-    #[test]
-    fn install_complete_success_path() {
-        let payload =
-            r#"{"principal_id":"p1","success":true,"home_path":"/home/me/.astrid/principals/p1"}"#;
-        assert_eq!(
-            classify_install_complete(payload, "p1"),
-            InstallEnvelope::Success("/home/me/.astrid/principals/p1".into()),
-        );
-    }
-
-    #[test]
-    fn install_complete_cache_hit_already_installed_is_success() {
-        // sage-install fast-reply: success:true with already_installed:true.
-        let payload = r#"{
-            "principal_id": "p1",
-            "success": true,
-            "home_path": "/home/me/.astrid/principals/p1",
-            "already_installed": true
-        }"#;
-        assert_eq!(
-            classify_install_complete(payload, "p1"),
-            InstallEnvelope::Success("/home/me/.astrid/principals/p1".into()),
-        );
-    }
-
-    #[test]
-    fn install_complete_success_without_home_path_returns_empty_string() {
-        // Older sage-install incarnations may omit `home_path` from the
-        // success envelope; surface as empty string so the caller can
-        // detect and fall back to the VFS scheme without misclassifying
-        // it as a failure.
-        let payload = r#"{"principal_id":"p1","success":true}"#;
-        assert_eq!(
-            classify_install_complete(payload, "p1"),
-            InstallEnvelope::Success(String::new()),
-        );
-    }
-
-    #[test]
-    fn install_complete_other_principal_is_skip() {
-        let payload =
-            r#"{"principal_id":"p2","success":false,"home_path":"","error":"boom"}"#;
-        // Even a failure for a *different* principal must Skip, not
-        // Failure — otherwise concurrent installs would abort each
-        // other's spawn paths.
-        assert_eq!(
-            classify_install_complete(payload, "p1"),
-            InstallEnvelope::Skip,
-        );
-    }
-
-    #[test]
-    fn install_complete_missing_principal_id_is_skip() {
-        let payload = r#"{"success":true,"home_path":"/x"}"#;
-        assert_eq!(
-            classify_install_complete(payload, "p1"),
-            InstallEnvelope::Skip,
-        );
-    }
-
-    #[test]
-    fn install_complete_malformed_json_is_skip() {
-        assert_eq!(
-            classify_install_complete("not json", "p1"),
-            InstallEnvelope::Skip,
-        );
-    }
-
-    #[test]
-    fn install_complete_missing_success_field_treats_as_failure() {
-        // Defence in depth: an envelope missing both `success` and
-        // `error` is treated as a failure (with "unknown") rather than
-        // silently succeeded — preserves the original bug's invariant
-        // that a non-success payload cannot proceed to spawn.
-        let payload = r#"{"principal_id":"p1","home_path":"/x"}"#;
-        assert_eq!(
-            classify_install_complete(payload, "p1"),
-            InstallEnvelope::Failure("unknown".into()),
-        );
-    }
-}
+#[path = "lib_tests.rs"]
+mod tests;

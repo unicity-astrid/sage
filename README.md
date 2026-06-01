@@ -25,6 +25,117 @@ This is a multi-capsule bundle. Four wasm components ship together as a single A
 
 `capsule-router` picks per-turn — Sonnet/Haiku via completion mode for routine work, Opus via either mode only when reasoning depth warrants it.
 
+## Interaction modes
+
+Sage exposes two orthogonal per-principal axes. The first picks **who drives `claude`**:
+
+- **headless** (default) — Astrid spawns `claude -p` from the `sage` capsule and owns the agent loop. Tool surface is locked to `mcp__sage__*` (sage parses `tool_use` blocks out of stream-json and routes them via the bus). All native Claude Code tools (`Bash`, `Read`, `Write`, `Edit`, `WebFetch`, …) are denied. This is the recommended mode for unattended / multi-user / production deployments — every tool dispatch is auditable and capability-gated through Astrid.
+- **repl** — the operator runs `claude` directly inside the principal folder (`~/.astrid/home/<principal>/`). Sage refuses to spawn (publishes `sage.v1.event.session_rejected{reason:"interaction_mode_is_repl"}` on `sage.v1.request.spawn`). The deny list is empty so the user has full access to the native Claude Code tool set; sage's MCP surface is not wired (the in-process `mcp__sage__*` bridge requires sage to own the subprocess). Hooks are still declared in `settings.local.json` so a future native hook bridge can audit/police the session without re-shipping the file (see [Known deficiency #6](#known-deficiencies)).
+
+### Headless usage
+
+```bash
+astrid capsule install sage          # operator picks interaction_mode=headless, auth_mode=api_key
+astrid sage install <principal>      # provisions ~/.astrid/home/<principal>/.claude/
+astrid sage spawn <principal>        # sage publishes sage.v1.request.spawn; supervisor returns a session id
+astrid sage send <session-id> "hi"   # writes a user turn into the running claude -p stdin
+```
+
+### REPL usage
+
+```bash
+astrid capsule install sage          # operator picks interaction_mode=repl
+astrid sage install <principal>      # provisions ~/.astrid/home/<principal>/.claude/ (hooks declared, deny list empty)
+cd ~/.astrid/home/<principal>        # then drive claude directly:
+HOME="$PWD" claude
+```
+
+### Switching modes at runtime
+
+Publish a `sage.v1.request.settings.set` IPC envelope. Sage owns `kv://sage.principal.config` (the canonical source of truth) and re-emits `sage.v1.install.relink` so `sage-install` rewrites the on-disk `.claude/settings.local.json` + `.mcp.json` with the new shape. On a successful relink, sage publishes `sage.v1.settings.changed` for downstream subscribers (dashboards, audit sinks). Audit trail is `sage.v1.audit.settings_changed{previous_config, new_config}`. Topic shapes are in the [topic contract](#v1-ipc-topic-contract) below.
+
+```jsonc
+// publish on sage.v1.request.settings.set
+{ "principal_id": "alice", "interaction_mode": "repl" }                 // headless -> repl
+{ "principal_id": "alice", "auth_mode": "subscription" }                // api_key -> subscription
+{ "principal_id": "alice", "interaction_mode": "headless", "auth_mode": "api_key" }  // full reset
+```
+
+Absent fields are preserved (partial-patch semantics). The merged record is validated before persistence; an out-of-range `schema_version` is rejected.
+
+## Authentication modes
+
+The second axis picks **how `claude` authenticates against Anthropic**:
+
+- **api_key** (default) — sage reads the per-principal `api_key` secret (kernel-elicited at install time from `Capsule.toml [env]`, stored in the host SecretStore, surfaced as the capsule's runtime config) and exports it as `ANTHROPIC_API_KEY` in the `claude` child env on every spawn. `apiKeyHelper` is pinned to `/bin/false` in `settings.local.json` so Claude cannot fall back to ambient credentials. Each principal carries an independent key — full cryptographic isolation.
+- **subscription** — sage never sets `ANTHROPIC_API_KEY` and omits the `apiKeyHelper` pin so Claude can fall back to its keychain OAuth credential path. The operator runs `claude /login` **manually inside the principal folder** (sage explicitly never invokes `/login`). This unlocks the Anthropic Pro / Max subscription billing path that the Agent SDK is gated on.
+
+The operator selects both axes at `astrid capsule install sage` time. The `api_key` secret is offered unconditionally (the kernel walks every `[env]` key — there is no `when=` semantics today); subscription-mode operators **leave the secret prompt blank**, and empty values are not persisted.
+
+### macOS Keychain caveat
+
+`claude /login` on macOS writes OAuth tokens to a keychain entry keyed by **service+account**, NOT by `HOME`. Two principal folders on the same macOS user account share that credential — **subscription mode does NOT cryptographically isolate principals on macOS**. For full per-principal isolation on macOS, either:
+
+- use `api_key` mode (each principal gets its own `SecretStore`-encrypted key), or
+- run principals under separate macOS user accounts.
+
+Linux is unaffected — libsecret is namespaced by user session. Sage explicitly **never invokes `claude /login`** in either mode; subscription users run it manually inside the principal folder out-of-band.
+
+## Writing a capsule that extends Claude
+
+Any capsule that subscribes to `tool.v1.request.describe` and `tool.v1.execute.<name>` becomes a `mcp__sage__<name>` tool from Claude's perspective when headless mode is active. The `#[capsule]` + `#[astrid::tool]` macros generate the IPC plumbing, so authors write idiomatic Rust handlers:
+
+```toml
+# capsules/<your-capsule>/Capsule.toml
+[package]
+name = "my-cool-capsule"
+version = "0.1.0"
+astrid-version = ">=0.7.0"
+
+[[component]]
+id = "my-cool"
+file = "my_cool_capsule.wasm"
+type = "executable"
+
+[capabilities]
+fs_read = ["cwd://"]   # whatever your tool actually needs
+
+[publish]
+"tool.v1.response.describe.*" = {}
+"tool.v1.execute.*.result"    = {}
+
+[subscribe]
+"tool.v1.request.describe" = { handler = "tool_describe" }
+"tool.v1.execute.greet"    = { handler = "tool_execute_greet" }
+```
+
+```rust
+// capsules/<your-capsule>/src/lib.rs
+use astrid_sdk::prelude::*;
+use astrid_sdk::schemars;
+use serde::Deserialize;
+
+#[derive(Default)]
+pub struct MyCool;
+
+#[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
+pub struct GreetArgs {
+    /// Who to greet.
+    pub name: String,
+}
+
+#[capsule]
+impl MyCool {
+    /// Greet a person by name. Returns the greeting string.
+    #[astrid::tool("greet")]
+    pub fn greet(&self, args: GreetArgs) -> Result<String, SysError> {
+        Ok(format!("Hello, {}!", args.name))
+    }
+}
+```
+
+Install the capsule, run `astrid sage spawn <principal>`, and Claude sees `mcp__sage__greet` in its tool list. End-to-end flow: sage-mcp fans out `tool.v1.request.describe`, collates responses into `sage.v1.tools.list`, and bridges Claude's `tool_use` blocks onto `tool.v1.execute.<name>` (with a 50 s deadline). The tool descriptor's doc-comment becomes the description Claude sees; `inputSchema` is derived from `GreetArgs` via `schemars`.
+
 ## v1 IPC topic contract
 
 All topics follow the `<domain>.<v1>.<kind>.<verb>[.<discriminator>]` convention. Trailing `*` is a single-segment wildcard (correlation id or session id).
@@ -41,6 +152,7 @@ The same distinction applies to publishes: anything not covered by the `[publish
 |---|---|---|
 | Subscribe | `sage.v1.request.spawn` | `{principal_id: String, session_id?: String, initial_message?: String}` |
 | Subscribe | `sage.v1.request.send.<sid>` | `{session_id: String, text: String}` (single user turn, ≤1 MiB) |
+| Subscribe | `sage.v1.request.settings.set` | `{principal_id, interaction_mode?, auth_mode?}` (partial-patch; absent fields preserved) |
 | Subscribe | `sage.v1.tool.result.<call_id>` | `{content: String, isError: bool}` (write-back from sage-mcp) |
 | Subscribe (runtime) | `sage.v1.request.stop.<sid>` | `{}` — graceful termination request |
 | Subscribe (runtime) | `tool.v1.execute.save_identity.result` | `{success: bool, principal_id?: String}` — identity refresh trigger |
@@ -53,12 +165,16 @@ The same distinction applies to publishes: anything not covered by the `[publish
 | Publish | `sage.v1.event.<sid>.exited` | `{exit_code?: i32, signal?: i32, reason?: String, stdout_tail?: String, stderr_tail?: String}` |
 | Publish | `sage.v1.event.<sid>.respawned` | `{principal_id, reason: "identity_refresh", flags_hash}` |
 | Publish | `sage.v1.event.<sid>.error` | `{reason: String}` (e.g. `stdin_quota`, `api_key_missing`) |
-| Publish | `sage.v1.event.session_rejected` | `{reason: "principal_limit" \| ...}` |
+| Publish | `sage.v1.event.session_rejected` | `{reason: "principal_limit" \| "interaction_mode_is_repl" \| ...}` |
 | Publish | `sage.v1.tool.call.<call_id>` | `{session_id, principal_id, tool_name, arguments: JSON}` |
-| Publish (runtime) | `sage.v1.audit.spawn` | `{principal_id, session_id, pid, flags_hash: String}` |
+| Publish | `sage.v1.install.relink` | `{principal_id, config: PrincipalConfig}` (sage publishes on settings.set; sage-install rewrites the on-disk JSON) |
+| Publish | `sage.v1.settings.changed` | `{principal_id, config: PrincipalConfig, schema_version}` (emitted after sage-install confirms the rewrite) |
+| Publish (runtime) | `sage.v1.audit.spawn` | `{principal_id, session_id, pid, flags_hash, auth_mode, interaction_mode}` |
 | Publish (runtime) | `sage.v1.audit.tool_call` | `{principal_id, session_id, call_id, tool_name, allowed: bool, decision_source}` |
 | Publish (runtime) | `sage.v1.audit.identity_fallback` | `{principal_id, session_id, reason: String}` |
-| Publish (runtime) | `sage.v1.install.run` | `{principal_id}` (awakens `sage-install` from `ensure_install`) |
+| Publish (runtime) | `sage.v1.audit.install_choices` | `{interaction_mode, auth_mode}` (emitted from `#[astrid::install]`) |
+| Publish (runtime) | `sage.v1.audit.settings_changed` | `{principal_id, previous_config, new_config}` |
+| Publish (runtime) | `sage.v1.install.run` | `{principal_id, config?: PrincipalConfig}` (awakens `sage-install` from `ensure_install`) |
 
 ### `sage-mcp` (tool bridge)
 
@@ -70,7 +186,7 @@ The same distinction applies to publishes: anything not covered by the `[publish
 | Publish | `sage.v1.tool.result.<call_id>` | `{content: String, isError: bool}` |
 | Publish | `sage.v1.tools.list` | `{tools: [McpToolDescriptor]}` |
 | Publish | `tool.v1.request.describe` | `{}` (broadcast describe-collect) |
-| Publish | `tool.v1.request.execute` | `{tool_name, arguments, correlation_id}` |
+| Publish | `tool.v1.execute.<name>` (single) and `tool.v1.execute.<ns>.<name>` (dotted) | `{type: "tool_execute_request", call_id, tool_name, arguments}` |
 
 ### `sage-completion` (LLM provider)
 
@@ -88,10 +204,11 @@ The same distinction applies to publishes: anything not covered by the `[publish
 
 | Direction | Topic | Payload |
 |---|---|---|
-| Subscribe | `sage.v1.install.run` | `{principal_id, force?: bool}` |
-| Subscribe | `sage.v1.install.relink` | `{principal_id}` |
+| Subscribe | `sage.v1.install.run` | `{principal_id, force?: bool, config?: PrincipalConfig}` |
+| Subscribe | `sage.v1.install.relink` | `{principal_id, config?: PrincipalConfig}` |
 | Publish | `sage.v1.install.status` | `{principal_id, step: String}` |
 | Publish | `sage.v1.install.complete` | `{principal_id, success: bool, error?: String}` |
+| Publish | `sage.v1.audit.settings_changed` | `{principal_id, previous_config, new_config}` (emitted after every relink-confirmed rewrite) |
 
 Also publishes one-shot `spark.v1.request.build` and reads `spark.v1.response.ready` for identity injection per session (per-session-id `.sage-identity-<sid>` file written atomically to the principal's `.claude/`).
 
@@ -99,9 +216,15 @@ Also publishes one-shot `spark.v1.request.build` and reads `spark.v1.response.re
 
 1. **`.mcp.json` is a stub, not a real MCP server.** Claude expects to fork-exec the MCP server as a native subprocess; shipping such a binary requires host-side kernel work (an `astrid-mcp-shim` native binary) that is out of scope for the capsules-only Sage workspace. v1 ships with `.claude/.mcp.json` containing `{"mcpServers":{"sage":{"command":"/bin/false","args":[],"env":{}}}}` — the documented stub. Claude's tool surface still works because (a) `--allowed-tools mcp__sage__*` gates the surface, (b) `sage` parses `tool_use` content blocks directly out of `claude -p`'s `--output-format stream-json` and routes them via the bus, (c) `--append-system-prompt-file` enumerates available tools so Claude knows what to call. When the kernel ships a native `astrid-mcp-shim` binary, `sage-install` will rewrite `.mcp.json` to point at it (additive change, no IPC contract churn). **Flagged gap** — tracked outside this workspace.
 2. **No native MCP tools/list response.** Because of (1), Claude never sees a real MCP `tools/list` — the `--append-system-prompt-file` enumeration is the surrogate. Tool descriptions surface through that channel rather than the protocol-level `tools/list` call.
-3. **macOS Keychain is HOME-blind.** `claude /login` writes OAuth tokens to the macOS Keychain keyed by service+account, not by HOME. Setting `HOME=~/.astrid/principals/<id>/` does **not** isolate auth across principals on macOS. `sage-install` works around this by storing the per-principal `ANTHROPIC_API_KEY` in KV (collected via `elicit::secret` at install time, encrypted at rest by the host) and exporting it as env at spawn. Sage explicitly does **not** invoke `claude /login` on macOS.
+3. **Authentication is per-principal and dual-mode; macOS subscription mode is not isolated.** Sage supports two auth modes, configured per-principal at `astrid capsule install sage` time via `Capsule.toml [env]`:
+   - **api_key** — the kernel elicits the `api_key` secret, persists it in the host `SecretStore`, and injects it as the capsule's runtime config. Sage reads it back via `astrid_sdk::env::var("api_key")` at spawn time and exports it as `ANTHROPIC_API_KEY` in the `claude` child env. `apiKeyHelper` is pinned to `/bin/false` in `settings.local.json` so Claude cannot fall back to ambient credentials. Each principal carries an independent key — full cryptographic isolation.
+   - **subscription** — sage never sets `ANTHROPIC_API_KEY` and omits the `apiKeyHelper` pin. The operator runs `claude /login` manually inside the principal folder. **On macOS**, `claude /login` writes OAuth tokens to a keychain entry keyed by service+account, NOT by HOME — two principal folders on the same macOS user account share that credential, so subscription mode does NOT cryptographically isolate principals on macOS. Use api_key mode (or separate macOS users) for full isolation. Linux libsecret is namespaced by user session and is unaffected. Sage explicitly never invokes `claude /login` — operators run it manually.
+
+   See the [Authentication modes](#authentication-modes) section above for the full walkthrough and the macOS caveat.
 4. **Pre-#752 register-only describe.** `sage-completion` publishes to both `llm.v1.response.describe` (unsuffixed; legacy registry drain) and `llm.v1.response.describe.*` (correlation-routed; post-#752). Drop the unsuffixed publish once every consumer is on post-#752.
-5. **Manifest publish/subscribe surfaces narrower than runtime.** `sage/Capsule.toml` declares `sage.v1.event.*` and `sage.v1.tool.call.*` publishes plus the three handler-bound subscribes (`sage.v1.request.spawn`, `sage.v1.request.send.*`, `sage.v1.tool.result.*`). At runtime the supervisor additionally opens `ipc::subscribe` for `sage.v1.request.stop.*`, `tool.v1.execute.save_identity.result`, `approval.v1.response.*`, and `sage.v1.install.complete`, and publishes to `sage.v1.audit.*` and `sage.v1.install.run`. Once host enforcement of manifest `[publish]/[subscribe]` against runtime calls lands, these need to either be declared in `Capsule.toml` or converted to handler-bound subscribes. Until then the topic-contract table above is the source of truth — the `(runtime)` markers flag every gap.
+5. **Manifest publish/subscribe surfaces narrower than runtime.** `sage/Capsule.toml` declares `sage.v1.event.*` and `sage.v1.tool.call.*` publishes plus the four handler-bound subscribes (`sage.v1.request.spawn`, `sage.v1.request.send.*`, `sage.v1.request.settings.set`, `sage.v1.tool.result.*`). At runtime the supervisor additionally opens `ipc::subscribe` for `sage.v1.request.stop.*`, `tool.v1.execute.save_identity.result`, `approval.v1.response.*`, and `sage.v1.install.complete`, and publishes to `sage.v1.audit.*` and `sage.v1.install.run`. Once host enforcement of manifest `[publish]/[subscribe]` against runtime calls lands, these need to either be declared in `Capsule.toml` or converted to handler-bound subscribes. Until then the topic-contract table above is the source of truth — the `(runtime)` markers flag every gap.
+6. **No native hook-bridge binary; sage emits `/bin/true` placeholders today.** Claude Code's hook protocol invokes a configured `command` as a subprocess with the hook payload piped over stdin. The Astrid host has no helper binary today that bridges that stdin-JSON protocol onto the IPC bus (`astrid.v1.lifecycle.*`); the `astrid-capsule-hook-bridge` WASM capsule already maps lifecycle events to semantic hooks on the bus side, but the subprocess→bus shim is missing. Sage therefore declares all hook events in `settings.local.json` with a `/bin/true` placeholder — exit 0, no stdout, no policy. When the bridge binary lands (likely as an `astrid hook` subcommand on `astrid-cli` reading stdin and publishing with a capability-scoped principal token), the placeholder swaps to the bridge command in a single edit to `layout::hooks_block`. The placeholder approach keeps the JSON shape stable so the bridge ships as additive code, not a settings-shape RFC. The placeholder also implies a **Unix-only assumption** — `/bin/true` does not exist on Windows; sage is Unix-only today (the `claude` binary, the HOME redirect, and the `/bin/false` `apiKeyHelper` all assume Unix). **Flagged gap** — tracked outside this workspace.
+7. **Sage-side audit topics are not yet mirrored to a shared cross-capsule audit topic.** Sage publishes `sage.v1.audit.*` (spawn, tool_call, identity_fallback, install_choices, settings_changed, respawn_abandoned). The kernel-side `astrid.v1.audit.entry` is admin-action-shaped (method / required_capability / target_principal) and is not the right home for capsule-emitted attribution events. Establishing a shared cross-capsule audit namespace (`audit.v1.event` or equivalent) is RFC-class work, deferred. The TODO is present at every audit publish site in `sage` and `sage-install` source.
 
 ## Claude binary version pin
 
@@ -113,7 +236,7 @@ Currently expected: `claude-code` ≥ 2.1.x.
 
 ## Status
 
-Pre-alpha. The four crate skeletons + Capsule.toml contracts are landed; the `sage` supervisor (`#[astrid::run]`), spawn, send, tool-result write-back, identity refresh, and graceful stop paths are wired in `crates/sage/src/`. `sage-mcp` ships discovery + describe; the execute bridge (validation, capability check, `tool.v1.request.execute` fan-out, 60 s result drain, audit) lands in the follow-up slice — `handle_tool_call` is a documented logging-only stub today. `sage-completion` and `sage-install` are wired end-to-end against the surfaces above. S8 polish covers workspace lock cleanup, this README, the topic contract surface, and the adversarial review against the published behaviour invariants.
+Pre-alpha. The four crate skeletons + Capsule.toml contracts are landed; the `sage` supervisor (`#[astrid::run]`), spawn, send, tool-result write-back, identity refresh, and graceful stop paths are wired in `crates/sage/src/`. `sage-mcp` ships discovery + describe AND the execute bridge: `handle_tool_call` strips the `mcp__sage__` prefix, gates the bare name through a charset whitelist, subscribes to `tool.v1.execute.<bare>.result` BEFORE publishing the request on `tool.v1.execute.<bare>`, drains for 50 s in `EXECUTE_SLICE_MS` steps filtering by `call_id`, and synthesises an `isError:true` envelope on every failure path (unknown prefix, invalid name, subscribe/publish error, timeout) so sage's `pending_tool_calls` slot retires cleanly. Capability enforcement and bridge-side audit publishes remain follow-up work — the bridge itself is shipped. `sage-completion` and `sage-install` are wired end-to-end against the surfaces above. The `.mcp.json` native-shim caveat from Known Deficiency #1 below still applies — Claude does not actually fork-exec a sage MCP server, the tool surface is observed via stream-json parsing. S8 polish covers workspace lock cleanup, this README, the topic contract surface, and the adversarial review against the published behaviour invariants.
 
 ## Trademark
 

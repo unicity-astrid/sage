@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::config::{AuthMode, load_or_default as load_principal_config};
 use crate::identity;
 use crate::spawn::{self, SpawnInputs};
 use crate::state::{self, RuntimeSession, SessionRecord, Sessions};
@@ -363,18 +364,37 @@ fn respawn_one(
     // no regression from current behaviour.
     let resolved_home = fs::canonicalize(&home_scheme).unwrap_or_else(|_| home_scheme.clone());
 
-    // API key surfaces as a capsule runtime config — the kernel
-    // elicited `api_key` from `[env]` (type = "secret") at install time
-    // and the SecretStore injects cleartext via env::var. Mirror the
-    // read path used by lib.rs::handle_spawn so identity-refresh respawn
-    // behaves identically to a cold spawn.
-    let api_key = env::var("api_key").unwrap_or_default();
-    if api_key.is_empty() {
-        return Err(SysError::ApiError(format!(
-            "respawn({}): no api_key configured for principal {principal_id}",
-            s.session_id
-        )));
-    }
+    // Auth mode branch — mirrors `lib.rs::handle_spawn` so respawn
+    // honours the per-principal AuthMode and the two-axis matrix
+    // (Headless|Repl × ApiKey|Subscription) is consistent across the
+    // cold-spawn and identity-refresh pipelines. In ApiKey mode the
+    // kernel-elicited `api_key` secret is required; an empty value
+    // hard-errors (the prior single-mode behaviour). In Subscription
+    // mode we skip the env::var read entirely so the cleartext never
+    // lands in this stack frame and `spawn::spawn_claude` omits the
+    // `.env("ANTHROPIC_API_KEY")` call — Claude falls back to its
+    // keychain OAuth path written by `claude /login`.
+    //
+    // NOTE: `respawn_pending` runs in sage's supervisor loop under
+    // sage's capsule principal — same context as `handle_spawn`'s
+    // interceptor — so `load_or_default()` reads the same canonical
+    // `sage.principal.config` record that the cold-spawn pipeline
+    // reads. The `principal_id` argument here is threaded through to
+    // the spawned subprocess inputs / audit fields, not the KV lookup.
+    let cfg = load_principal_config();
+    let api_key: Option<String> = match cfg.auth_mode {
+        AuthMode::ApiKey => {
+            let key = env::var("api_key").unwrap_or_default();
+            if key.is_empty() {
+                return Err(SysError::ApiError(format!(
+                    "respawn({}): no api_key configured for principal {principal_id}",
+                    s.session_id
+                )));
+            }
+            Some(key)
+        }
+        AuthMode::Subscription => None,
+    };
 
     // Fetch fresh identity prompt from spark + materialize a new
     // append-system-prompt file under <home>/.claude/. The identity
@@ -384,12 +404,14 @@ fn respawn_one(
     let prompt = identity::fetch_prompt(principal_id, &s.session_id, &home_scheme)?;
     let identity_path = identity::write_prompt_file(&home_scheme, &s.session_id, &prompt)?;
 
+    // `SpawnInputs::api_key` is `Option<&str>`; the subscription path
+    // threads `None` so `spawn::spawn_claude` omits the env export.
     let spawned = spawn::spawn_claude(&SpawnInputs {
         principal_id,
         session_id: &s.session_id,
         home_path: &resolved_home,
         identity_path: &identity_path,
-        api_key: &api_key,
+        api_key: api_key.as_deref(),
     })?;
 
     let now_ms = match time::now() {
@@ -424,8 +446,19 @@ fn respawn_one(
 
     // Audit parity with handle_spawn: emit `sage.v1.audit.spawn` so
     // downstream consumers don't need a separate path for refreshed
-    // sessions vs. fresh ones. `sage.v1.event.<sid>.respawned` is the
-    // session-scoped event for UI / metrics.
+    // sessions vs. fresh ones. Include `auth_mode` in its canonical
+    // snake_case wire form so respawn audit lines carry the same
+    // attribution tuple as cold-spawn entries — without this a
+    // subscription-mode respawn would be indistinguishable from an
+    // api_key one in the audit stream. `interaction_mode` is omitted
+    // here: respawn is only reachable from sessions sage spawned itself
+    // (i.e. headless), so the mode is implicit.
+    // `sage.v1.event.<sid>.respawned` is the session-scoped event for
+    // UI / metrics.
+    let auth_mode_str = match cfg.auth_mode {
+        AuthMode::ApiKey => "api_key",
+        AuthMode::Subscription => "subscription",
+    };
     let _ = ipc::publish_json(
         "sage.v1.audit.spawn",
         &serde_json::json!({
@@ -433,6 +466,7 @@ fn respawn_one(
             "session_id": s.session_id,
             "pid": spawned.os_pid,
             "flags_hash": spawned.flags_hash,
+            "auth_mode": auth_mode_str,
             "reason": "identity_refresh",
         }),
     );

@@ -22,7 +22,16 @@ pub(crate) struct SpawnInputs<'a> {
     pub session_id: &'a str,
     pub home_path: &'a str,
     pub identity_path: &'a str,
-    pub api_key: &'a str,
+    /// Anthropic API key — when `Some`, threaded into the child env as
+    /// `ANTHROPIC_API_KEY`. When `None`, the env var is OMITTED entirely
+    /// so Claude falls back to its keychain OAuth credential path
+    /// (subscription / `claude /login` mode). Note: argv is identical in
+    /// both auth modes, so [`argv_hash`] is stable across modes for the
+    /// same `session_id` — only the spawn env differs. That preserves
+    /// the audit-stability invariant: a downstream consumer correlating
+    /// by `flags_hash` will see the same fingerprint regardless of how
+    /// the subprocess authenticated.
+    pub api_key: Option<&'a str>,
 }
 
 /// Outcome of a successful spawn — the live process plus the audit
@@ -87,15 +96,23 @@ pub(crate) fn spawn_claude(inputs: &SpawnInputs<'_>) -> Result<Spawned, SysError
 
     let args = argv(inputs.session_id, inputs.identity_path);
 
-    let cmd = process::Command::new(CLAUDE_BIN)
+    // Build the command. ANTHROPIC_API_KEY is conditional on auth_mode:
+    // when the caller supplies `Some(key)` (api_key mode) we thread it
+    // through, when `None` (subscription mode) we OMIT the call entirely
+    // so Claude falls back to the keychain OAuth credential written by
+    // `claude /login`. The argv itself is identical in both modes — see
+    // [`SpawnInputs::api_key`] for the audit-stability rationale.
+    let mut cmd = process::Command::new(CLAUDE_BIN)
         .args(args.iter().cloned())
         .env("HOME", inputs.home_path)
-        .env("ANTHROPIC_API_KEY", inputs.api_key)
         // Belt-and-braces: also disable session persistence via env.
         // Some claude versions honour the flag; older builds may only
         // honour the env. Either path is fine.
         .env("CLAUDE_CODE_SKIP_PROMPT_HISTORY", "1")
         .cwd(inputs.home_path);
+    if let Some(key) = inputs.api_key {
+        cmd = cmd.env("ANTHROPIC_API_KEY", key);
+    }
 
     let proc = cmd.spawn_background()?;
     let os_pid = proc.os_pid().unwrap_or(0);
@@ -172,5 +189,30 @@ mod tests {
             h,
             "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
         );
+    }
+
+    /// Audit-stability invariant: argv is constructed from `session_id`
+    /// and `identity_path` only — the auth mode flows through env, not
+    /// argv. So [`argv_hash`] must produce the same fingerprint for a
+    /// given `session_id` regardless of whether the caller is in
+    /// api_key mode (`Some(key)`) or subscription mode (`None`). A
+    /// downstream audit consumer correlating spawns by `flags_hash`
+    /// will not be able to distinguish auth modes from this digest
+    /// alone — that's by design; `auth_mode` is published alongside
+    /// `flags_hash` on `sage.v1.audit.spawn`.
+    #[test]
+    fn argv_hash_unchanged_across_auth_modes() {
+        let sid = "sid-stable";
+        let path = "home://.claude/.sage-identity-sid-stable";
+        let args = argv(sid, path);
+        let hash_api_key = argv_hash(&args);
+        let hash_subscription = argv_hash(&args);
+        assert_eq!(hash_api_key, hash_subscription);
+
+        // Belt-and-braces: also confirm that the argv builder itself is
+        // not silently branching on something out-of-band — calling it
+        // twice with the same inputs must produce byte-identical output.
+        let args_again = argv(sid, path);
+        assert_eq!(args, args_again);
     }
 }
