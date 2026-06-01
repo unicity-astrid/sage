@@ -12,7 +12,6 @@ astrid-version = ">=0.7.0"
 id = "sage-completion"
 file = "sage_completion.wasm"
 type = "executable"
-capabilities = { net = ["api.anthropic.com"] }
 
 [exports]
 "astrid:llm" = "1.0.0"
@@ -20,7 +19,6 @@ capabilities = { net = ["api.anthropic.com"] }
 [publish]
 "llm.v1.stream.sage" = { wit = "@unicity-astrid/wit/llm/stream-event" }
 "llm.v1.response.describe" = { wit = "@unicity-astrid/wit/llm/describe-response" }
-"llm.v1.response.describe.*" = { wit = "@unicity-astrid/wit/llm/describe-response" }
 
 [subscribe]
 "llm.v1.request.describe" = { wit = "@unicity-astrid/wit/llm/describe-request", handler = "llm_describe" }

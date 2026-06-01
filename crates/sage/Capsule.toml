@@ -12,14 +12,35 @@ astrid-version = ">=0.7.0"
 id = "sage"
 file = "sage.wasm"
 type = "executable"
-capabilities = { host_process = true, kv = true }
 
 [capabilities]
-host_process = true
-kv = true
+host_process = ["claude"]
+kv = []
+# The `home://` scheme resolves dynamically at check time against the
+# per-invocation principal's home root (`~/.astrid/home/<principal>/` in
+# the FHS layout; see core/crates/astrid-kernel/src/lib.rs:75). Sage
+# writes the identity prompt file under `home://.claude/`; restricting
+# the write scope keeps it the only mutable subdirectory.
+fs_read = ["home://"]
+fs_write = ["home://.claude/"]
+
+# Per-principal Anthropic API key. The kernel elicits this once at
+# install time (typed as `secret`, stored via SecretStore), and injects
+# it as the capsule's runtime `api_key` config — read back at spawn
+# time with `astrid_sdk::env::var("api_key")` and forwarded to
+# `claude -p` as `ANTHROPIC_API_KEY`. Mirrors the onboarding shape used
+# by capsule-anthropic / capsule-openai.
+[env]
+api_key = { type = "secret", request = "Enter your Anthropic API key for `claude -p` spawn", placeholder = "sk-ant-..." }
 
 # Topics are pre-RFC placeholders; the agent-provider contract
 # (rfc:agent-provider.v1) will lock these once drafted.
+#
+# `*` in kernel topic patterns matches exactly one segment (see
+# astrid-capsule::topic::topic_matches). Multi-depth wildcards therefore
+# require multiple patterns. Anything subscribed to dynamically inside
+# `#[astrid::run]` is still kernel-gated, so it must appear in
+# `[subscribe]` here too (no handler key means runtime-only subscribe).
 [subscribe]
 # Per-principal spawn request: provision a long-lived `claude -p`
 # subprocess and return a session handle.
@@ -29,12 +50,38 @@ kv = true
 # Tool-call result coming back from sage-mcp, routed into the
 # correct session's stdin.
 "sage.v1.tool.result.*" = { handler = "handle_tool_result" }
+# Dynamic subscribes opened inside `#[astrid::run]`. Listed here so
+# the kernel admits them; no handler key — the run loop polls them.
+"sage.v1.request.stop.*" = {}
+"sage.v1.audit.tool_call" = {}
+"sage.v1.install.complete" = {}
+"tool.v1.execute.save_identity.result" = {}
+"approval.v1.request" = {}
+"approval.v1.response.*" = {}
+# Spark identity-prompt response (dynamic subscribe in identity::fetch_prompt).
+"spark.v1.response.ready" = {}
 
 [publish]
-# Streamed events from a `claude -p` subprocess (text deltas, tool
-# calls, usage, done, errors). One topic per session.
+# Streamed events from a `claude -p` subprocess. Both 4-segment
+# (e.g. `sage.v1.event.session_rejected`) and 5-segment session-scoped
+# topics (e.g. `sage.v1.event.<sid>.spawned|exited|error|respawned|
+# tool_timeout|text|tool_use|result|usage|done|init`) are published.
 "sage.v1.event.*" = {}
+"sage.v1.event.*.*" = {}
 # Tool-call request emitted when Claude wants to call an MCP tool;
 # sage-mcp picks these up, executes via capsule IPC, replies on
 # `sage.v1.tool.result.<call-id>`.
 "sage.v1.tool.call.*" = {}
+# Audit events: `sage.v1.audit.spawn`, `sage.v1.audit.tool_call`,
+# `sage.v1.audit.identity_fallback`, `sage.v1.audit.respawn_abandoned`.
+"sage.v1.audit.*" = {}
+# Approval request emitted when claude wants to call a tool that
+# requires explicit user verdict. sage-mcp / a UI capsule answers on
+# `approval.v1.response.<request_id>`.
+"approval.v1.request" = {}
+# Install-trigger published by `ensure_install` when no completion
+# marker is in KV. sage-install consumes it and replies on
+# `sage.v1.install.complete`.
+"sage.v1.install.run" = {}
+# Per-session identity-prompt build request to spark.
+"spark.v1.request.build" = {}

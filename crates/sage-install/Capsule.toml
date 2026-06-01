@@ -12,18 +12,26 @@ astrid-version = ">=0.7.0"
 id = "sage-install"
 file = "sage_install.wasm"
 type = "executable"
-capabilities = { fs = ["~/.astrid/principals/**"], host_process = true, kv = true }
 
 [capabilities]
-fs = ["~/.astrid/principals/**"]
-host_process = true
-kv = true
+# The `home://` scheme resolves at check time against the per-invocation
+# principal home (`~/.astrid/home/<principal>/` in the FHS layout — see
+# core/crates/astrid-kernel/src/lib.rs:75). sage-install writes
+# `.claude/settings.local.json` + `.claude/.mcp.json` so the write scope
+# is intentionally narrowed to `home://.claude/`; the read side stays
+# permissive within the principal home for diagnostics.
+fs_read = ["home://"]
+fs_write = ["home://.claude/"]
+kv = []
 
 [subscribe]
-# Run the per-principal install: create ~/.astrid/principals/<p>/.claude/,
-# write settings.local.json (hooks + MCP server entry pointing at
-# sage-mcp), then run an interactive `HOME=... claude /login` so the
-# user can authenticate with their Anthropic account.
+# Run the per-principal install: create home://.claude/, write
+# settings.local.json (hardened permissions + the MCP stub pointing at
+# /bin/false — sage parses tool_use blocks out of stream-json directly).
+# Onboarding credentials (the Anthropic API key) are NOT elicited from
+# here; the sibling `sage` crate's Capsule.toml `[env]` block declares
+# them so the kernel elicits at install time and persists via the host
+# SecretStore. See the crate-level doc in src/lib.rs.
 "sage.v1.install.run" = { handler = "handle_install" }
 # Re-link an existing principal (re-run /login or refresh config).
 "sage.v1.install.relink" = { handler = "handle_relink" }

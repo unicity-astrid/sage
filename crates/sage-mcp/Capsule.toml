@@ -12,10 +12,9 @@ astrid-version = ">=0.7.0"
 id = "sage-mcp"
 file = "sage_mcp.wasm"
 type = "executable"
-capabilities = { kv = true }
 
 [capabilities]
-kv = true
+kv = []
 
 # sage-mcp picks up tool-call requests from `sage` (claude -p emitted
 # a tool call), dispatches them via tool.v1 bus protocol, and returns
@@ -25,9 +24,31 @@ kv = true
 "sage.v1.tool.call.*" = { handler = "handle_tool_call" }
 "sage.v1.tools.describe" = { handler = "describe_tools" }
 "tool.v1.response.describe.*" = { handler = "collect_tool_descriptors" }
+# Dynamic-subscribe pattern: `execute::handle_tool_call` calls
+# `ipc::subscribe("tool.v1.execute.<bare>.result")` per call. The kernel
+# gates runtime subscribes against this list, so the pattern must be
+# declared here even though there is no static handler — the
+# subscription is drained inline inside `handle_tool_call`.
+#
+# Kernel `topic_matches` treats `*` as a single-segment wildcard, so a
+# one-pattern declaration cannot cover both flat names ("read_file") and
+# MCP-style dot-namespaced names ("fs.read"). `is_valid_tool_name`
+# permits `.` in the bare name, so both shapes are legitimate and the
+# subscribe surface must enumerate both arities.
+"tool.v1.execute.*.result" = {}
+"tool.v1.execute.*.*.result" = {}
 
 [publish]
+# Reshaped result envelope consumed by `sage::tooling::result::handle_tool_result`.
 "sage.v1.tool.result.*" = {}
 "sage.v1.tools.list" = {}
 "tool.v1.request.describe" = { wit = "@unicity-astrid/wit/tool/describe-request" }
-"tool.v1.request.execute" = { wit = "@unicity-astrid/wit/tool/execute-request" }
+# Execute fan-out from `handle_tool_call` — the bridge strips the
+# `mcp__sage__` MCP prefix and forwards to the bare tool topic.
+# Two patterns because the kernel `*` is single-segment: the first
+# matches one-segment tool names ("read_file"), the second matches
+# MCP-style dot-namespaced names ("fs.read"). Tool-name charset is
+# already gated by `is_valid_tool_name` to ASCII alnum + `_.-`, so the
+# wildcards cannot be widened beyond the legitimate name surface.
+"tool.v1.execute.*" = { wit = "@unicity-astrid/wit/types/tool-call" }
+"tool.v1.execute.*.*" = { wit = "@unicity-astrid/wit/types/tool-call" }
