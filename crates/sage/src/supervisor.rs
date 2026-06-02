@@ -455,10 +455,24 @@ fn publish_exit(session_id: &str, reason: &str, exit_code: Option<i32>, signal: 
 
 /// Drop a runtime session AND its persisted record.
 fn evict(sessions: &Sessions, session_id: &str) -> Result<(), SysError> {
-    sessions.with(|map| {
-        map.remove(session_id);
+    // Snapshot the principal_id BEFORE removing the runtime entry so we
+    // can build the `sage.hook_token.<principal>.<session>` KV key for
+    // cleanup. After `map.remove` returns, the only place the
+    // principal binding lives is the persisted SessionRecord — and
+    // `delete_record` may run before we'd otherwise have a chance to
+    // look it up, so capture it here in one critical section.
+    let principal_id = sessions.with(|map| -> Option<String> {
+        let session = map.remove(session_id)?;
+        Some(session.record.principal_id)
     })?;
     let _ = delete_record(session_id);
+    // Drop the per-(principal, session) hook token alongside the
+    // persisted record so a forged `sage.v1.unverified_hook.*` event
+    // arriving after eviction cannot pass the validator lookup. Best-
+    // effort: a missing principal (session already gone) is a no-op.
+    if let Some(principal_id) = principal_id {
+        let _ = crate::hooks::forget_token(&principal_id, session_id);
+    }
     Ok(())
 }
 
@@ -486,10 +500,18 @@ fn reload_recover(sessions: &Sessions) -> Result<(), SysError> {
         if crate::validate_id("session_id", &rec.session_id).is_err() {
             log::warn("sage: reload-recovery dropping record with invalid session_id");
             let _ = delete_record(&rec.session_id);
+            // Even when the session_id is malformed, the matching hook
+            // token (if any) is keyed by the same id; best-effort sweep.
+            let _ = crate::hooks::forget_token(&rec.principal_id, &rec.session_id);
             continue;
         }
         publish_exit(&rec.session_id, "capsule_reload", None, None);
         let _ = delete_record(&rec.session_id);
+        // Sweep any hook token left over from the prior capsule
+        // incarnation. Without this, tokens stranded by a reload would
+        // remain in KV until a fresh spawn at the same session_id
+        // overwrote them — leaving a stale credential live on the bus.
+        let _ = crate::hooks::forget_token(&rec.principal_id, &rec.session_id);
     }
     Ok(())
 }

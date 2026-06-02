@@ -59,6 +59,12 @@ mod codec;
 // loosening warnings crate-wide.
 #[allow(dead_code)]
 mod config;
+// `hooks` — hook-event-bridge primitives (token mint / persist /
+// lookup / forget / compare + canonical topic map). Surface-only in
+// this slice; spawn-env wiring, run-loop subscriber, and shutdown
+// cleanup land in follow-on slices. The module itself carries an
+// `#![allow(dead_code)]` until those wirings appear.
+pub(crate) mod hooks;
 mod identity;
 // `#[astrid::install]` body — split out of `lib.rs` to keep that file
 // under the 1000-line CI gate.
@@ -431,6 +437,36 @@ impl Sage {
             AuthMode::Subscription => None,
         };
 
+        // Mint the per-(principal, session) hook token AFTER every
+        // up-front rejection path (schema_version, Repl, principal_limit,
+        // install_failed, api_key_missing) so we never persist a token
+        // for a session that won't actually spawn. The token is the
+        // shared secret `astrid-emit` (shipping in core via astrid#814)
+        // echoes back in every `sage.v1.unverified_hook.*` envelope; the
+        // run loop verifies it against KV before republishing on
+        // `hook.v1.event.<name>`. Two distinct failure modes:
+        //
+        //   * `hook_token_mint_failed` — host CSPRNG unavailable. Fatal:
+        //     spawning without a token would let any unverified hook
+        //     publish republish under sage's vouching.
+        //   * `hook_token_persist_failed` — KV write failed. Also fatal:
+        //     without a persisted token the run loop has nothing to
+        //     match the envelope against, so every hook fire would be
+        //     dropped as a spoof.
+        let hook_token = match crate::hooks::mint_token() {
+            Ok(t) => t,
+            Err(e) => {
+                log::warn(format!("sage: hook token mint failed: {e:?}"));
+                publish_spawn_error(&session_id, &principal_id, "hook_token_mint_failed");
+                return Ok(());
+            }
+        };
+        if let Err(e) = crate::hooks::persist_token(&principal_id, &session_id, &hook_token) {
+            log::warn(format!("sage: hook token persist failed: {e:?}"));
+            publish_spawn_error(&session_id, &principal_id, "hook_token_persist_failed");
+            return Ok(());
+        }
+
         // Fetch identity prompt from spark with a 5 s budget. Falls
         // back to a hard-coded minimal prompt + audit on timeout.
         //
@@ -483,9 +519,17 @@ impl Sage {
             home_path: &home_path,
             identity_path: &identity_path,
             api_key: api_key.as_deref(),
+            hook_token: &hook_token,
         }) {
             Ok(s) => s,
             Err(e) => {
+                // Best-effort: drop the just-persisted hook token so it
+                // doesn't strand in KV. The session never started so
+                // letting it leak is non-fatal — the next spawn for
+                // (principal, session) would overwrite anyway — but
+                // cleanup keeps the key space tidy. Ignore the delete
+                // result; nothing to do if KV is wedged.
+                let _ = crate::hooks::forget_token(&principal_id, &session_id);
                 publish_spawn_error(&session_id, &principal_id, &format!("spawn_failed: {e}"));
                 return Ok(());
             }
@@ -637,6 +681,14 @@ impl Sage {
         // Sidecar feed: supervisor's audit publish carries call_id +
         // tool_name + session_id. Drained into self.tool_call_meta.
         let tool_audit_sub = ipc::subscribe("sage.v1.audit.tool_call")?;
+        // Hook validator (sage-as-CA): `astrid-emit` (shipping in core
+        // via astrid#814) stamps a per-session token onto every Claude
+        // hook fire and publishes on `sage.v1.unverified_hook.<name>`.
+        // The run loop drains those, verifies the token against KV,
+        // and republishes the validated payload on the canonical
+        // `hook.v1.event.<name>` topic. Mismatches are dropped with an
+        // audit on `sage.v1.audit.hook_spoof_attempt`.
+        let unverified_hook_sub = ipc::subscribe("sage.v1.unverified_hook.*")?;
         let _ = runtime::signal_ready();
         log::info("sage: supervisor loop starting");
 
@@ -694,6 +746,20 @@ impl Sage {
                 )
             {
                 log::warn(format!("sage: approval register failed: {e:?}"));
+            }
+
+            // Hook validator drain — runs BEFORE approval_response_sub
+            // to group it with the other "validate then route"
+            // subscribers. `validate_and_route` parses, looks up the
+            // per-session token in KV, strips the transport envelope
+            // (principal_id / session_id / token), and republishes on
+            // `hook.v1.event.<name>` (canonical) or `sage.v1.notification`
+            // (no canonical equivalent yet). Token mismatches drop the
+            // event and publish `sage.v1.audit.hook_spoof_attempt`.
+            // Errors are swallowed (helper logs internally) so a bad
+            // poll doesn't tear down the run loop.
+            if let Ok(poll) = unverified_hook_sub.poll() {
+                let _ = crate::hooks::validate_and_route(poll.messages);
             }
 
             if let Ok(poll) = approval_response_sub.poll()

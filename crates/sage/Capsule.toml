@@ -79,6 +79,12 @@ api_key = { type = "secret", request = "Anthropic API key (leave blank for subsc
 "tool.v1.execute.save_identity.result" = {}
 "approval.v1.request" = {}
 "approval.v1.response.*" = {}
+# Hook validator drain: `astrid-emit` (astrid#814) publishes
+# per-Claude-hook envelopes here with a per-session token. Sage's
+# run loop verifies the token, then republishes on `hook.v1.event.*`
+# (canonical) or `sage.v1.notification`. Token mismatches drop and
+# audit on `sage.v1.audit.hook_spoof_attempt`.
+"sage.v1.unverified_hook.*" = {}
 # Spark identity-prompt response (dynamic subscribe in identity::fetch_prompt).
 "spark.v1.response.ready" = {}
 
@@ -95,7 +101,25 @@ api_key = { type = "secret", request = "Anthropic API key (leave blank for subsc
 "sage.v1.tool.call.*" = {}
 # Audit events: `sage.v1.audit.spawn`, `sage.v1.audit.tool_call`,
 # `sage.v1.audit.identity_fallback`, `sage.v1.audit.respawn_abandoned`.
+# hook validator: republish + audit
+#   `sage.v1.audit.hook_spoof_attempt` — token mismatch on an
+#     `sage.v1.unverified_hook.*` event; the offending claim is
+#     captured for observability and the event is dropped.
+#   `sage.v1.audit.hook_token.minted` / `sage.v1.audit.hook_token.forgotten`
+#     — lifecycle audits emitted by `crate::hooks::{mint_token,forget_token}`.
 "sage.v1.audit.*" = {}
+# Canonical hook-event republish — after sage validates the per-session
+# token on an `sage.v1.unverified_hook.<name>` event, it strips the
+# transport fields (principal_id, session_id, token) and re-emits on
+# the canonical Astrid hook topic. Subscribers trust sage's attribution
+# ("sage as a CA") because the kernel attributes the republish from
+# sage's run-loop context; the principal_id rides inside the payload.
+"hook.v1.event.*" = {}
+# Notification republish — Claude's `Notification` hook has no
+# canonical Astrid equivalent yet, so sage republishes validated
+# notifications on a sage-namespaced topic. Forward-compatible: once a
+# canonical `notification.v1.*` topic lands, the validator switches.
+"sage.v1.notification" = {}
 # Approval request emitted when claude wants to call a tool that
 # requires explicit user verdict. sage-mcp / a UI capsule answers on
 # `approval.v1.response.<request_id>`.

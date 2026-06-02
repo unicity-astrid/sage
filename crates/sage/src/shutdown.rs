@@ -122,6 +122,7 @@ pub(crate) fn stop_session(
         let session = map.remove(session_id)?;
         Some(PreparedKill {
             process: Arc::clone(&session.process),
+            principal_id: session.record.principal_id.clone(),
         })
     })?;
 
@@ -145,30 +146,39 @@ pub(crate) fn stop_session(
             summary.stdout_tail = trailing(&logs.stdout);
             summary.stderr_tail = trailing(&logs.stderr);
         }
-        summary
+        (summary, p.principal_id)
     });
 
     match final_exit {
-        Some(summary) => {
+        Some((summary, principal_id)) => {
             publish_exited(session_id, reason, &summary);
+            // Persisted record cleanup is best-effort — a stale row gets
+            // cleaned up by the next reload-recovery sweep if delete fails.
+            if let Err(e) = state::delete_record(session_id) {
+                log::warn(format!(
+                    "sage: KV record cleanup for {session_id} failed: {e:?}"
+                ));
+            }
+            // Drop the per-(principal, session) hook token so a forged
+            // `sage.v1.unverified_hook.*` event arriving after the
+            // session is gone can no longer pass token validation. Best-
+            // effort: log on failure (parallel to delete_record above).
+            if let Err(e) = crate::hooks::forget_token(&principal_id, session_id) {
+                log::warn(format!(
+                    "sage: hook-token cleanup for {session_id} failed: {e:?}"
+                ));
+            }
         }
         None => {
             // Supervisor's drive_session beat us to the eviction and
             // has already published an `exited` event with its own
             // reason ("exited"/"buffer_overflow"/"capsule_reload").
-            // Drop our publish — at-most-once on the bus.
+            // Drop our publish — at-most-once on the bus. The matching
+            // `evict()` path performs the hook-token + record cleanup.
             log::info(format!(
                 "sage: stop({session_id}) — already evicted by supervisor; skipping duplicate exited event"
             ));
         }
-    }
-
-    // Persisted record cleanup is best-effort — a stale row gets cleaned
-    // up by the next reload-recovery sweep if delete fails.
-    if let Err(e) = state::delete_record(session_id) {
-        log::warn(format!(
-            "sage: KV record cleanup for {session_id} failed: {e:?}"
-        ));
     }
 
     Ok(())
@@ -404,6 +414,16 @@ fn respawn_one(
     let prompt = identity::fetch_prompt(principal_id, &s.session_id, &home_scheme)?;
     let identity_path = identity::write_prompt_file(&home_scheme, &s.session_id, &prompt)?;
 
+    // Mint a fresh per-(principal, session) hook token for the
+    // respawned subprocess. The previous incarnation's token was deleted
+    // by `stop_session` during identity-refresh teardown; without a new
+    // token persisted to KV, `astrid-emit` invocations from the
+    // respawned `claude -p` child would fail sage's validator lookup and
+    // get dropped as forgeries. Mirrors the mint+persist pattern in
+    // `handle_spawn` for cold spawns.
+    let hook_token = crate::hooks::mint_token()?;
+    crate::hooks::persist_token(principal_id, &s.session_id, &hook_token)?;
+
     // `SpawnInputs::api_key` is `Option<&str>`; the subscription path
     // threads `None` so `spawn::spawn_claude` omits the env export.
     let spawned = spawn::spawn_claude(&SpawnInputs {
@@ -412,6 +432,7 @@ fn respawn_one(
         home_path: &resolved_home,
         identity_path: &identity_path,
         api_key: api_key.as_deref(),
+        hook_token: &hook_token,
     })?;
 
     let now_ms = match time::now() {
@@ -500,6 +521,11 @@ struct ExitSummary {
 /// [`crate::tooling::result::PreparedWrite`].
 struct PreparedKill {
     process: Arc<process::Process>,
+    /// Snapshotted under the lock in phase 3a so phase 3b can build the
+    /// `sage.hook_token.<principal>.<session>` KV key without re-locking
+    /// the sessions map. Required for hook-token cleanup on session end
+    /// (the per-(principal, session) token minted at spawn time).
+    principal_id: String,
 }
 
 /// Spin-wait outside the registry lock until either the session exits

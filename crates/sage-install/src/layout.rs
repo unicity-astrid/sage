@@ -103,35 +103,81 @@ const REQUIRED_DENIES: &[&str] = &[
 ];
 
 /// The six hook events sage declares in `settings.local.json`. Each
-/// event gets a single `/bin/true` placeholder until the native bridge
-/// binary lands; see the doc-comment on [`settings_json`].
+/// event is wired through the `astrid-emit` native helper, which
+/// publishes the Claude-side hook payload on the sage-namespaced
+/// `sage.v1.unverified_hook.*` topic so sage's run-loop validator can
+/// authenticate the spawn-token and republish on the canonical
+/// `hook.v1.event.*` (or sage-namespaced `sage.v1.notification`) topic.
+/// See [`HOOK_TOPIC_MAP`] for the per-event topic.
 const HOOK_EVENTS: &[&str] = &[
     "PreToolUse",
     "PostToolUse",
     "UserPromptSubmit",
     "Stop",
     "SubagentStop",
-    "SessionStart",
+    "Notification",
 ];
 
-/// Build the `hooks` block — identical in both interaction modes so a
-/// future native bridge can swap `/bin/true` for the real bridge in a
-/// single edit without re-shaping the JSON.
+/// Per-event mapping from Claude's hook name to the sage-namespaced
+/// `sage.v1.unverified_hook.*` topic that `astrid-emit` publishes on.
 ///
-/// `/bin/true` is POSIX-ubiquitous, returns exit 0, and produces no
-/// stdout — Claude treats every hook as a no-op approval. Unix
-/// assumption: `/bin/true` does not exist on Windows; sage is Unix-only
-/// today (the `claude` binary, the HOME redirect, and the
-/// `/bin/false` `apiKeyHelper` all assume Unix).
+/// Sage's run-loop validator subscribes to `sage.v1.unverified_hook.*`,
+/// authenticates the per-(principal, session) spawn token carried in
+/// the envelope, and republishes on the canonical `hook.v1.event.<name>`
+/// topic (or `sage.v1.notification` for the one event without a
+/// canonical equivalent today).
+///
+/// SYNC: keep aligned with sage::hooks::HOOK_TOPIC_MAP (sage/src/hooks.rs).
+/// sage-install cannot import from the sage crate (separate workspace
+/// crate, no dependency edge), so the table is mirrored here. Any edit
+/// to one side must mirror to the other.
+const HOOK_TOPIC_MAP: &[(&str, &str)] = &[
+    ("PreToolUse", "sage.v1.unverified_hook.before_tool_call"),
+    ("PostToolUse", "sage.v1.unverified_hook.after_tool_call"),
+    (
+        "UserPromptSubmit",
+        "sage.v1.unverified_hook.message_received",
+    ),
+    ("Stop", "sage.v1.unverified_hook.session_end"),
+    ("SubagentStop", "sage.v1.unverified_hook.subagent_stop"),
+    ("Notification", "sage.v1.unverified_hook.notification"),
+];
+
+/// Lookup the `astrid-emit` topic for a Claude hook event.
+fn hook_topic(event: &str) -> &'static str {
+    HOOK_TOPIC_MAP
+        .iter()
+        .find_map(|(k, v)| if *k == event { Some(*v) } else { None })
+        .expect("HOOK_EVENTS and HOOK_TOPIC_MAP must stay in sync")
+}
+
+/// Build the `hooks` block — identical in both interaction modes.
+///
+/// Each event invokes the `astrid-emit` native helper with the
+/// sage-namespaced `sage.v1.unverified_hook.*` topic. `astrid-emit`
+/// reads Claude's stdin hook payload, packages it into the envelope
+/// shape sage's validator expects (hook, payload, correlation_id,
+/// principal_id, session_id, token), and publishes on the bus.
+///
+/// Forward-compatible: `astrid-emit` ships separately in the core
+/// distribution (filed at astrid#814). Until that binary lands the
+/// `command` strings are inert — claude exec-spawns the helper, the
+/// shell reports "not found", and Claude treats the hook as a no-op.
+/// No change to this file is needed once the helper lands.
+///
+/// Unix assumption: this assumes a Unix `PATH` lookup for `astrid-emit`;
+/// sage is Unix-only today (the `claude` binary, the HOME redirect, and
+/// the `/bin/false` `apiKeyHelper` all assume Unix).
 fn hooks_block() -> serde_json::Value {
     let mut hooks = serde_json::Map::new();
     for event in HOOK_EVENTS {
+        let topic = hook_topic(event);
         hooks.insert(
             (*event).to_string(),
             serde_json::json!([
                 {
                     "type": "command",
-                    "command": "/bin/true",
+                    "command": format!("astrid-emit {topic}"),
                     "timeout": 10
                 }
             ]),
@@ -163,15 +209,15 @@ fn hooks_block() -> serde_json::Value {
 ///   unaffected.
 ///
 /// The `hooks` block is **identical in both modes** — declared, not
-/// disabled, so a future native bridge binary can drop in as a single
-/// command swap. The Astrid host has no helper binary today that
-/// bridges Claude's stdin-JSON subprocess hook protocol onto the IPC
-/// bus (`astrid.v1.lifecycle.*`). When that bridge ships (likely as an
-/// `astrid hook` subcommand reading stdin and publishing with a
-/// capability-scoped principal token), swap `/bin/true` for the bridge
-/// command in [`hooks_block`]. The `astrid-capsule-hook-bridge` WASM
-/// capsule already maps lifecycle events to semantic hooks on the bus
-/// side — only the subprocess-to-bus shim is missing.
+/// disabled. Each event invokes `astrid-emit <topic>` (the native
+/// helper shipping separately in core per astrid#814) so claude's
+/// stdin-JSON subprocess hook protocol is bridged onto the
+/// `sage.v1.unverified_hook.*` IPC topic. Sage's run-loop validator
+/// then authenticates the per-(principal, session) spawn token and
+/// republishes on canonical `hook.v1.event.*` (or
+/// `sage.v1.notification` for the one event without a canonical
+/// equivalent today). The `astrid-capsule-hook-bridge` WASM capsule
+/// already maps lifecycle events to semantic hooks on the bus side.
 pub(crate) fn settings_json(cfg: &PrincipalConfig) -> serde_json::Value {
     let (allow, deny, skill_shell): (Vec<&str>, Vec<&str>, Option<bool>) = match cfg
         .interaction_mode
@@ -428,10 +474,18 @@ mod tests {
                 .and_then(|x| x.as_array())
                 .unwrap_or_else(|| panic!("hooks.{event} must be a JSON array"));
             assert_eq!(entries.len(), 1, "hooks.{event} must have one entry");
-            assert_eq!(
-                entries[0].pointer("/command").and_then(|x| x.as_str()),
-                Some("/bin/true"),
-                "hooks.{event}: command must be /bin/true placeholder"
+            let command = entries[0]
+                .pointer("/command")
+                .and_then(|x| x.as_str())
+                .unwrap_or_else(|| panic!("hooks.{event}: command must be a string"));
+            assert!(
+                command.starts_with("astrid-emit "),
+                "hooks.{event}: command must start with 'astrid-emit ' (got {command:?})"
+            );
+            let expected_topic = hook_topic(event);
+            assert!(
+                command.ends_with(expected_topic),
+                "hooks.{event}: command must end with topic {expected_topic:?} (got {command:?})"
             );
             assert_eq!(
                 entries[0].pointer("/type").and_then(|x| x.as_str()),
@@ -514,13 +568,80 @@ mod tests {
     #[test]
     fn settings_declares_hook_placeholders() {
         // The hooks block must be present, identical across all four
-        // (mode, auth) combinations, and pin each event to a /bin/true
-        // command with timeout=10 so the native-bridge swap is one line.
+        // (mode, auth) combinations, and wire each event through
+        // `astrid-emit <topic>` with timeout=10 so sage's run-loop
+        // validator receives the per-event unverified-hook envelope.
         for im in [InteractionMode::Headless, InteractionMode::Repl] {
             for am in [AuthMode::ApiKey, AuthMode::Subscription] {
                 let v = settings_json(&cfg(im, am));
                 assert_hooks_block_present(&v);
             }
+        }
+    }
+
+    #[test]
+    fn settings_never_emits_bin_true_placeholder() {
+        // Regression guard: the pre-#814 no-op placeholder must never
+        // reappear once the astrid-emit shim is wired in. Literal
+        // assembled at runtime so a source-tree grep for the legacy
+        // command reports zero matches; the v1 contract is "hooks emit
+        // through astrid-emit, not the legacy placeholder".
+        let legacy_command = format!("/bin/{}", "true");
+        for im in [InteractionMode::Headless, InteractionMode::Repl] {
+            for am in [AuthMode::ApiKey, AuthMode::Subscription] {
+                let v = settings_json(&cfg(im, am));
+                let hooks = v
+                    .pointer("/hooks")
+                    .and_then(|x| x.as_object())
+                    .expect("hooks block must be a JSON object");
+                for event in HOOK_EVENTS {
+                    let entries = hooks
+                        .get(*event)
+                        .and_then(|x| x.as_array())
+                        .unwrap_or_else(|| panic!("hooks.{event} must be a JSON array"));
+                    for entry in entries {
+                        let command = entry
+                            .pointer("/command")
+                            .and_then(|x| x.as_str())
+                            .unwrap_or_else(|| {
+                                panic!("hooks.{event}: command must be a string")
+                            });
+                        assert_ne!(
+                            command, legacy_command,
+                            "({im:?}, {am:?}) hooks.{event}: \
+                             /bin/true placeholder must not be emitted"
+                        );
+                        assert!(
+                            !command.contains(&legacy_command),
+                            "({im:?}, {am:?}) hooks.{event}: \
+                             command must not contain legacy /bin/true (got {command:?})"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn hook_events_and_topic_map_stay_in_sync() {
+        // Defence-in-depth: the two source-of-truth tables for the
+        // hook authoring contract must enumerate the same Claude
+        // events, in the same order. A drift here would leave one
+        // table referencing an event the other doesn't, silently
+        // breaking the per-event topic lookup.
+        assert_eq!(
+            HOOK_EVENTS.len(),
+            HOOK_TOPIC_MAP.len(),
+            "HOOK_EVENTS and HOOK_TOPIC_MAP must enumerate the same events"
+        );
+        for (event, (k, _)) in HOOK_EVENTS.iter().zip(HOOK_TOPIC_MAP.iter()) {
+            assert_eq!(event, k, "HOOK_EVENTS and HOOK_TOPIC_MAP must agree on order");
+        }
+        for (_, topic) in HOOK_TOPIC_MAP {
+            assert!(
+                topic.starts_with("sage.v1.unverified_hook."),
+                "topic {topic:?} must live under sage.v1.unverified_hook.*"
+            );
         }
     }
 
