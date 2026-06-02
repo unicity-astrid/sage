@@ -1,0 +1,706 @@
+//! Broker-side elicitation/approval bridge.
+//!
+//! ROLE: this is the **Claude-front-door renderer** of Astrid's existing
+//! runtime approval flow — NOT a new elicitation mechanism or channel. The
+//! consent prompt is *originated* by the host `astrid:approval` syscall
+//! (`request_approval`, ungated at runtime); the TUI renders it inline; this
+//! bridge renders the same `astrid.v1.approval` envelope into Claude's UI via
+//! the shim's `ctx.peer.elicit`. It invents no origination primitive, reuses
+//! the host's response topic + verb set verbatim, and never round-trips a
+//! secret. Runtime user-prompting already exists in Astrid (`request_approval`
+//! for consent, `SelectionRequired` for choice); see the runtime-value-elicit
+//! RFC for the one gap these do NOT cover (typed value / out-of-band secret).
+//!
+//! When a broker `tool.call` ([`crate::broker::handle_mcp_call`]) routes a
+//! capability-gated tool, the tool's host-side `request_approval` syscall
+//! publishes an `astrid.v1.approval` envelope and BLOCKS the tool's WASM
+//! thread until a decision lands on
+//! `astrid.v1.approval.response.<request-id>`. The broker can't call the
+//! host `astrid:elicit` syscall (it is hard-gated to install/upgrade), so
+//! it relays the bus-level envelopes instead: it surfaces an
+//! `approval-required` flag in the `tool.call` reply so the shim can elicit
+//! the choice from Claude, then maps the returned choice back onto the
+//! `astrid.v1.approval.response.<request-id>` decision topic to unblock the
+//! tool.
+//!
+//! ## Topic contract (meets the core elicit-shim slice)
+//!
+//! * **inbound (observed during dispatch)** `astrid.v1.approval` —
+//!   `IpcPayload::ApprovalRequired` = `{ type:"approval_required",
+//!   request_id, action, resource, reason }`. Published by the host
+//!   `request_approval` path ([`core` `host/approval.rs`]).
+//! * **inbound (shim's elicited choice)**
+//!   `astrid.v1.request.mcp.approval.respond` -> [`handle_mcp_approval`] —
+//!   `{ req_id, request_id, decision, tool_name, call_id }`. The shim
+//!   collected the choice from Claude and forwards it through the same broker
+//!   front door it uses for tool calls; `req_id` is the proxy correlation
+//!   token (echoed into the reply), `request_id` is the approval correlation
+//!   id from the `approval_required` envelope, and `tool_name` / `call_id`
+//!   are echoed back from the `approval_required` reply flag so this handler
+//!   can re-establish the result drain the original dispatch dropped.
+//! * **outbound (decision → unblock tool)**
+//!   `astrid.v1.approval.response.<request_id>` —
+//!   `IpcPayload::ApprovalResponse` = `{ type:"approval_response",
+//!   request_id, decision, reason? }`. The blocked host `request_approval`
+//!   wakes on this and returns the typed decision to the tool.
+//! * **outbound (resumed result → shim)** `astrid.v1.response.<req_id>` —
+//!   `{ kind:"tool.call", req_id, content:[...], isError:bool }`. After
+//!   publishing the decision this handler re-subscribes to the tool's result
+//!   topic and drains the resumed (approve) or `isError` (deny) result,
+//!   delivering it to the shim as a terminal `tool.call` reply — the same
+//!   shape [`crate::broker::handle_mcp_call`] would have produced had the
+//!   tool not parked on approval. THIS is the leg that completes the
+//!   round-trip: the original dispatch could not keep its result
+//!   subscription alive across the synchronous interceptor return, so
+//!   ownership of result delivery moves here.
+//!
+//! ## Why the result drain lives here, not in the original dispatch
+//!
+//! A WASM interceptor is synchronous and returns exactly once. When
+//! [`crate::execute::dispatch_with_approval`] observes the `approval_required`
+//! envelope it must return so the broker can surface the elicit flag — at
+//! which point its `tool.v1.execute.<name>.result` subscription is dropped.
+//! The tool only publishes its result AFTER a decision lands, so by the time
+//! the result exists no subscriber remains. This handler therefore re-opens
+//! that subscription (subscribe BEFORE publishing the decision to avoid the
+//! resume race) and owns delivering the single terminal result back to the
+//! shim. The `tool_name` + `call_id` it needs are echoed by the shim from
+//! the reply flag.
+//!
+//! ## Concurrency / correlation
+//!
+//! `astrid.v1.approval` is a single global broadcast topic and the host
+//! envelope carries NO `call_id` / `tool_name` — only an opaque host-minted
+//! `request_id`. The concern is whether one tool's approval could be surfaced
+//! to a *different* tool's `tool.call` reply.
+//!
+//! This is prevented at the engine level: the kernel serialises guest calls
+//! per capsule instance behind the store mutex
+//! (`core` `engine/wasm/mod.rs`: *"The mutex still serialises one guest call
+//! at a time per capsule"*). A broker dispatch
+//! ([`crate::execute::dispatch_with_approval`]) holds that lock for the whole
+//! synchronous drain and returns the instant it observes ANY approval, so a
+//! second sage-mcp `handle_mcp_call` cannot run — and cannot be watching the
+//! approval topic — while another is in flight. There is therefore at most
+//! ONE sage-mcp approval-watcher at a time: the only `astrid.v1.approval`
+//! envelope it can observe during its window is the one ITS OWN routed tool
+//! raised (it published that tool's execute request and nothing else of
+//! sage-mcp's is running). Intra-capsule cross-talk is structurally
+//! impossible — no claim registry is needed.
+//!
+//! The decision is independently routed correctly regardless: it targets
+//! `astrid.v1.approval.response.<request_id>`, the exact per-request topic the
+//! blocked host `request_approval` subscribed to, so the shim round-trip
+//! carrying a given `request_id` unblocks exactly the tool that raised it.
+//!
+//! Residual (documented, not fixed here): a DIFFERENT capsule's tool that
+//! calls `request_approval` during this dispatch's drain window also lands on
+//! the global topic, and nothing on the wire distinguishes it from this
+//! tool's approval — the host stamps a nil source and omits any `call_id` /
+//! `tool_name`. Attributing such a foreign approval correctly needs a kernel
+//! correlation field on `IpcPayload::ApprovalRequired`; that is a kernel
+//! contract change, out of scope for this capsule-only slice.
+//!
+//! ## Decision surface — approvals/confirms/selects ONLY
+//!
+//! The decision string is constrained to the host's recognised approval
+//! verbs ([`MAP` in core `host/approval.rs::decision_from_str`]):
+//! `approve`, `approve_session`, `approve_always`, `deny`. Anything else
+//! (including unknown / empty) is normalised to `deny` — fail secure. A
+//! `deny` decision results in the tool call returning `isError` upstream
+//! (the host returns `ApprovalDecision::Denied`, the gated tool publishes
+//! an error result, and the broker's drain reshapes it). **This bridge
+//! NEVER relays a secret through elicitation** — it carries only the
+//! action/resource/reason display fields (already host-sanitized) and a
+//! constrained decision verb. No free-form text is round-tripped into the
+//! tool.
+
+use astrid_sdk::prelude::*;
+use serde::Deserialize;
+use serde_json::{Value, json};
+
+/// Bus topic the host publishes capability-approval requests on. A single
+/// fixed (segment-arity-stable) topic — the correlation id lives in the
+/// body (`request_id`), not the topic, so a wildcard suffix is not needed
+/// to observe it.
+pub(crate) const APPROVAL_REQUEST_TOPIC: &str = "astrid.v1.approval";
+
+/// Egress topic PREFIX for the decision. The host's blocked
+/// `request_approval` subscribed to `astrid.v1.approval.response.<id>`
+/// before publishing the request, so the decision lands on the exact
+/// per-request topic. `<id>` is charset-gated by [`response_topic`].
+const APPROVAL_RESPONSE_PREFIX: &str = "astrid.v1.approval.response.";
+
+/// `request_id` charset cap. The approval correlation id is a host-minted
+/// UUID; anything longer is rejected before it can be stamped into an
+/// egress topic.
+const MAX_REQUEST_ID_LEN: usize = 128;
+
+/// Display-field cap mirrored from the host sanitizer
+/// (`MAX_RESOURCE_LEN`). The host already trims/strips/truncates these
+/// before publishing `astrid.v1.approval`; we re-cap defensively so a
+/// future producer that skips sanitization cannot inflate the reply body
+/// the shim renders to Claude.
+const MAX_DISPLAY_LEN: usize = 1024;
+
+/// The four approval verbs the host's `decision_from_str` recognises.
+/// `approve` / `approve_session` / `approve_always` grant; everything
+/// else (including `deny`) is treated as a deny by the host. We normalise
+/// the shim's choice to exactly one of these so no free-form string is
+/// ever round-tripped onto the decision topic.
+const APPROVE: &str = "approve";
+const APPROVE_SESSION: &str = "approve_session";
+const APPROVE_ALWAYS: &str = "approve_always";
+const DENY: &str = "deny";
+
+/// Bound on the post-decision result drain in [`handle_mcp_approval`].
+/// The tool resumes (or denies) the instant the decision lands; its result
+/// is one bus hop away, so this only needs to cover scheduling latency, not
+/// a fresh tool runtime. Kept well under the host's 60 s approval window and
+/// the proxy's own request deadline so the shim gets a terminal reply
+/// promptly rather than hanging.
+const RESUME_TIMEOUT_MS: u64 = 50_000;
+
+/// Poll slice for the resume drain. Mirrors the execute-path slice cadence
+/// so a result published the instant the tool resumes is picked up within
+/// one short slice rather than blocking the whole budget on the first
+/// `recv`.
+const RESUME_SLICE_MS: u64 = 250;
+
+/// Parsed `astrid.v1.approval` envelope (`IpcPayload::ApprovalRequired`).
+///
+/// Only the display + correlation fields are deserialized. The `type`
+/// discriminator tag is ignored by the struct-deserialize (serde drops
+/// unknown fields), and `is_approval_required` gates on it explicitly so
+/// a sibling `IpcPayload` variant published on the shared topic is not
+/// mistaken for an approval.
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct ApprovalRequired {
+    /// Host-minted correlation id; echoed onto the response topic suffix.
+    pub(crate) request_id: String,
+    /// The action being requested (e.g. `"git push"`). Display only.
+    #[serde(default)]
+    pub(crate) action: String,
+    /// The resource target (e.g. full command string). Display only.
+    #[serde(default)]
+    pub(crate) resource: String,
+    /// Justification shown to the user. Display only.
+    #[serde(default)]
+    pub(crate) reason: String,
+}
+
+impl ApprovalRequired {
+    /// Shape the `approval_required` flag embedded in the broker
+    /// `tool.call` reply.
+    ///
+    /// Carries the host-sanitized display fields plus the correlation id
+    /// (never any tool argument or secret), AND the dispatch's `tool_name` +
+    /// `call_id`. The latter two are NOT secrets — they are the same routing
+    /// tokens the shim already used to make the `tool.call` — and the shim
+    /// MUST echo them back on `astrid.v1.request.mcp.approval.respond` so
+    /// [`handle_mcp_approval`] can re-subscribe to the tool's result topic
+    /// and deliver the resumed/denied outcome the original dispatch could not
+    /// keep a subscription alive for.
+    pub(crate) fn to_reply_flag(&self, tool_name: &str, call_id: &str) -> Value {
+        json!({
+            "request_id": self.request_id,
+            "action": clamp(&self.action),
+            "resource": clamp(&self.resource),
+            "reason": clamp(&self.reason),
+            "tool_name": tool_name,
+            "call_id": call_id,
+        })
+    }
+}
+
+/// Decide whether a JSON value parsed from the `astrid.v1.approval` topic
+/// is actually an `ApprovalRequired` envelope.
+///
+/// The `IpcPayload` enum is `#[serde(tag = "type", rename_all =
+/// "snake_case")]`, so a genuine approval carries `"type":
+/// "approval_required"`. Gate on the tag AND a non-empty `request_id` (a
+/// blank id can't be routed back). Other payloads sharing the topic are
+/// skipped.
+pub(crate) fn is_approval_required(value: &Value) -> bool {
+    value.get("type").and_then(Value::as_str) == Some("approval_required")
+        && value
+            .get("request_id")
+            .and_then(Value::as_str)
+            .is_some_and(|id| !id.is_empty())
+}
+
+/// Inbound `astrid.v1.request.mcp.approval.respond` payload — the shim's
+/// elicited choice for an outstanding approval.
+///
+/// `req_id` is the proxy correlation token (echoed into the terminal reply);
+/// `request_id` is the approval correlation id from the `approval_required`
+/// envelope; `decision` is the shim's choice, normalised to a host verb by
+/// [`normalize_decision`]. `tool_name` + `call_id` are echoed back from the
+/// reply flag and identify which `tool.v1.execute.<name>.result` to drain for
+/// the resumed/denied outcome. An optional `reason` is carried as a display /
+/// audit string only — it is NOT a tool argument and never substitutes into
+/// the tool call.
+#[derive(Debug, Deserialize)]
+struct ApprovalRespond {
+    req_id: String,
+    request_id: String,
+    decision: String,
+    tool_name: String,
+    call_id: String,
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+/// Handle `astrid.v1.request.mcp.approval.respond`.
+///
+/// Maps the shim's elicited choice onto an
+/// `astrid.v1.approval.response.<request_id>` decision so the blocked host
+/// `request_approval` resumes, then DRAINS the resumed (approve) or `isError`
+/// (deny) tool result and delivers it to the shim on
+/// `astrid.v1.response.<req_id>` as a terminal `tool.call` reply — completing
+/// the round-trip the original [`crate::execute::dispatch_with_approval`]
+/// could not (its result subscription died when the interceptor returned).
+///
+/// Ordering is load-bearing: we subscribe to the tool's result topic BEFORE
+/// publishing the decision, otherwise the tool could resume and publish its
+/// result before we are listening.
+///
+/// State-mutating (it can grant a capability), so it is confused-deputy
+/// gated identically to [`crate::broker::handle_mcp_call`]: the inbound
+/// message's kernel-set `source_id` must be in the operator-pinned
+/// `trusted_ingress_ids` allow-set before any decision is published. A
+/// rejected or malformed request publishes a `deny` so an outstanding tool
+/// can never hang waiting on a decision that will not come — fail secure —
+/// and (when routable) delivers the resulting `isError` reply to the shim.
+pub(crate) fn handle_mcp_approval(payload: Value) -> Result<(), SysError> {
+    let req: ApprovalRespond = match serde_json::from_value(payload) {
+        Ok(v) => v,
+        Err(e) => {
+            // No recoverable req_id — there is no channel to reply on, and no
+            // request_id to deny. The host's approval times out (60 s) on
+            // its own schedule. Log and drop.
+            log::warn(format!(
+                "sage-mcp: broker approval.respond: malformed payload: {e}"
+            ));
+            return Ok(());
+        }
+    };
+
+    let reply_topic = crate::broker::reply_topic(&req.req_id);
+    let Some(response_topic) = response_topic(&req.request_id) else {
+        log::warn(format!(
+            "sage-mcp: broker approval.respond: rejecting unroutable request_id '{}'",
+            req.request_id
+        ));
+        // Reply to the shim if we at least have a clean req_id so it doesn't
+        // hang; the decision was never published (bad request_id).
+        if let Some(reply) = &reply_topic {
+            deliver_error(reply, &req.req_id, "approval request_id was not routable");
+        }
+        return Ok(());
+    };
+
+    // Confused-deputy gate. Granting a capability is the most sensitive
+    // action this capsule performs — require the kernel-set `source_id`
+    // (NOT a body field) to be in the operator-pinned trusted-ingress
+    // allow-set. On any failure (no caller context, untrusted ingress) we
+    // publish a `deny` decision so the blocked tool retires cleanly, then
+    // deliver the resulting denied outcome to the shim.
+    let source_id = match runtime::caller() {
+        Ok(ctx) => ctx.source_id,
+        Err(e) => {
+            log::warn(format!(
+                "sage-mcp: broker approval.respond: no caller context, denying request_id '{}': {e}",
+                req.request_id
+            ));
+            resolve_with_decision(&req, &response_topic, DENY, None);
+            return Ok(());
+        }
+    };
+    if !crate::execute::is_trusted_ingress(&source_id) {
+        log::warn(format!(
+            "sage-mcp: broker approval.respond: untrusted ingress source_id '{source_id}', \
+             denying request_id '{}'",
+            req.request_id
+        ));
+        resolve_with_decision(&req, &response_topic, DENY, None);
+        return Ok(());
+    }
+
+    // Normalise the shim's choice to exactly one host verb. Unknown /
+    // empty collapses to `deny` — fail secure. The optional `reason` is a
+    // display/audit string only; it is forwarded verbatim into the
+    // `ApprovalResponse.reason` field and is NEVER treated as a tool
+    // argument (the host's approval path discards it after logging).
+    let decision = normalize_decision(&req.decision);
+    resolve_with_decision(&req, &response_topic, decision, req.reason.as_deref());
+    Ok(())
+}
+
+/// Publish `decision` on the per-request response topic to unblock the host,
+/// then drain the resumed/denied tool result and deliver it to the shim.
+///
+/// Subscribe-before-publish: the result subscription on
+/// `tool.v1.execute.<tool_name>.result` is established BEFORE the decision is
+/// published so the tool cannot resume and publish ahead of us. Then we drain
+/// for `call_id` and reply on `astrid.v1.response.<req_id>` with the same
+/// terminal `tool.call` shape the broker's non-parked path produces.
+///
+/// `tool_name` is charset-validated (it must form the result topic). A
+/// non-routable `tool_name`, a subscribe failure, or a drain timeout still
+/// publishes the decision (so the host-blocked tool is never left hanging)
+/// and delivers a best-effort `isError` reply to the shim.
+fn resolve_with_decision(
+    req: &ApprovalRespond,
+    response_topic: &str,
+    decision: &'static str,
+    reason: Option<&str>,
+) {
+    let reply_topic = crate::broker::reply_topic(&req.req_id);
+
+    // Validate the tool name BEFORE building the result topic — the same
+    // charset gate the execute path applies, so a hostile / buggy echo
+    // cannot smuggle topic segments into our subscription.
+    if !crate::execute::is_valid_tool_name(&req.tool_name) {
+        log::warn(format!(
+            "sage-mcp: broker approval.respond: invalid tool_name '{}' for request_id '{}'; \
+             publishing decision without result drain",
+            req.tool_name, req.request_id
+        ));
+        // Still unblock the host so the tool retires, then surface an error.
+        publish_decision(response_topic, &req.request_id, decision, reason);
+        if let Some(reply) = &reply_topic {
+            deliver_error(reply, &req.req_id, "approval echoed an invalid tool name");
+        }
+        return;
+    }
+
+    let result_topic = format!("tool.v1.execute.{}.result", req.tool_name);
+
+    // Subscribe BEFORE publishing the decision so the resumed tool's result
+    // cannot race ahead of our subscription. A subscribe failure is
+    // non-fatal: we still publish the decision (the host must not be left
+    // blocked) and fall back to a best-effort error reply.
+    let result_sub = match ipc::subscribe(&result_topic) {
+        Ok(s) => Some(s),
+        Err(e) => {
+            log::warn(format!(
+                "sage-mcp: broker approval.respond: failed to subscribe {result_topic}: {e}"
+            ));
+            None
+        }
+    };
+
+    publish_decision(response_topic, &req.request_id, decision, reason);
+
+    let Some(reply) = &reply_topic else {
+        // Decision is published (tool unblocked) but we have no channel to
+        // deliver the terminal result on. The shim will time out its own
+        // request; nothing more we can do.
+        log::warn(format!(
+            "sage-mcp: broker approval.respond: decision published but req_id '{}' unroutable; \
+             no terminal reply delivered",
+            req.req_id
+        ));
+        return;
+    };
+
+    // Drain the resumed/denied result and deliver it as the terminal reply.
+    match result_sub.and_then(|sub| drain_result(&sub, &req.call_id)) {
+        Some((content, is_error)) => deliver_result(reply, &req.req_id, content, is_error),
+        None => deliver_error(
+            reply,
+            &req.req_id,
+            "tool did not return a result after the approval decision",
+        ),
+    }
+}
+
+/// Drain `tool.v1.execute.<name>.result` for `call_id` after a decision,
+/// returning `(content, is_error)` for the first matching result or `None` on
+/// timeout. Bounded by [`RESUME_TIMEOUT_MS`]; polled in [`RESUME_SLICE_MS`]
+/// slices so a result published the instant the tool resumes is picked up
+/// promptly. Reuses the execute path's result-envelope parser so both legs
+/// agree on the wire shape.
+fn drain_result(sub: &ipc::Subscription, call_id: &str) -> Option<(Value, bool)> {
+    let mut remaining = RESUME_TIMEOUT_MS;
+    while remaining > 0 {
+        let step = remaining.min(RESUME_SLICE_MS);
+        match sub.recv(step) {
+            Ok(poll) => {
+                for msg in poll.messages {
+                    if let Some(found) = crate::execute::match_result(&msg.payload, call_id) {
+                        return Some(found);
+                    }
+                }
+            }
+            Err(_) => {
+                // Slice timeout — keep draining until the budget closes.
+            }
+        }
+        remaining = remaining.saturating_sub(step);
+    }
+    None
+}
+
+/// Deliver a terminal `tool.call` reply to the shim carrying the resumed/
+/// denied tool result, mirroring [`crate::broker::handle_mcp_call`]'s
+/// non-parked reply shape so the shim needs no special-casing.
+fn deliver_result(reply_topic: &str, req_id: &str, content: Value, is_error: bool) {
+    let reply = json!({
+        "kind": "tool.call",
+        "req_id": req_id,
+        "content": crate::broker::mcp_content(content),
+        "isError": is_error,
+    });
+    if let Err(e) = ipc::publish_json(reply_topic, &reply) {
+        log::warn(format!(
+            "sage-mcp: broker approval.respond: failed to deliver result {reply_topic}: {e}"
+        ));
+    }
+}
+
+/// Deliver a terminal `isError` `tool.call` reply to the shim with `text` as
+/// the body. Used for every failure path so the shim always gets exactly one
+/// terminal reply and never hangs.
+fn deliver_error(reply_topic: &str, req_id: &str, text: &str) {
+    deliver_result(
+        reply_topic,
+        req_id,
+        Value::String(format!("sage-mcp: {text}")),
+        true,
+    );
+}
+
+/// Normalise an arbitrary decision string to one of the host's recognised
+/// approval verbs. Trims and lowercases first so `"Approve"` / `" deny "`
+/// behave intuitively, then maps; anything unrecognised → `deny`.
+fn normalize_decision(decision: &str) -> &'static str {
+    match decision.trim().to_ascii_lowercase().as_str() {
+        APPROVE => APPROVE,
+        APPROVE_SESSION => APPROVE_SESSION,
+        APPROVE_ALWAYS => APPROVE_ALWAYS,
+        // `deny` and EVERYTHING else (unknown verbs, empty, free-form) →
+        // deny. Fail secure: no string the shim can send grants a
+        // capability unless it is exactly one of the three approve verbs.
+        _ => DENY,
+    }
+}
+
+/// Publish the `IpcPayload::ApprovalResponse` decision on the per-request
+/// response topic so the blocked host `request_approval` wakes. The `type`
+/// tag matches the host's `#[serde(tag = "type", rename_all =
+/// "snake_case")]` discriminator for `ApprovalResponse`.
+fn publish_decision(topic: &str, request_id: &str, decision: &str, reason: Option<&str>) {
+    let mut envelope = json!({
+        "type": "approval_response",
+        "request_id": request_id,
+        "decision": decision,
+    });
+    if let Some(r) = reason
+        && let Some(obj) = envelope.as_object_mut()
+    {
+        // `reason` is a display/audit field on the host side — clamp it
+        // like the other display strings so a hostile shim can't inflate
+        // it. Empty after clamping is omitted.
+        let clamped = clamp(r);
+        if !clamped.is_empty() {
+            obj.insert("reason".to_string(), Value::String(clamped));
+        }
+    }
+    if let Err(e) = ipc::publish_json(topic, &envelope) {
+        log::warn(format!(
+            "sage-mcp: failed to publish approval decision {topic}: {e}"
+        ));
+    }
+}
+
+/// Build the single-segment decision topic for `request_id`, or `None` if
+/// the id cannot form a clean topic segment.
+///
+/// Same charset family as [`crate::broker::reply_topic`]: a `.` would turn
+/// the egress topic into one the host's exact
+/// `astrid.v1.approval.response.<id>` subscription can't match, and
+/// whitespace / control / wildcard bytes could forge or shadow topics.
+fn response_topic(request_id: &str) -> Option<String> {
+    if request_id.is_empty() || request_id.len() > MAX_REQUEST_ID_LEN {
+        return None;
+    }
+    let clean = request_id
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'));
+    if !clean {
+        return None;
+    }
+    Some(format!("{APPROVAL_RESPONSE_PREFIX}{request_id}"))
+}
+
+/// Trim + length-clamp a host display string defensively. The host
+/// already sanitizes these; this is belt-and-suspenders against a future
+/// producer that skips it.
+fn clamp(s: &str) -> String {
+    let trimmed = s.trim();
+    if trimmed.chars().count() <= MAX_DISPLAY_LEN {
+        return trimmed.to_string();
+    }
+    trimmed.chars().take(MAX_DISPLAY_LEN).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn approval_required_parses_canonical_envelope() {
+        let v = json!({
+            "type": "approval_required",
+            "request_id": "0191f3a2b4c74d8e9f01234567890abc",
+            "action": "git push",
+            "resource": "git push origin main",
+            "reason": "Capsule 'shell' requests approval",
+        });
+        assert!(is_approval_required(&v));
+        let req: ApprovalRequired = serde_json::from_value(v).unwrap();
+        assert_eq!(req.request_id, "0191f3a2b4c74d8e9f01234567890abc");
+        assert_eq!(req.action, "git push");
+    }
+
+    #[test]
+    fn is_approval_required_rejects_other_payloads() {
+        // Wrong tag.
+        assert!(!is_approval_required(&json!({
+            "type": "approval_response",
+            "request_id": "x",
+            "decision": "approve"
+        })));
+        // Right tag, empty request_id.
+        assert!(!is_approval_required(&json!({
+            "type": "approval_required",
+            "request_id": ""
+        })));
+        // No tag at all.
+        assert!(!is_approval_required(&json!({ "request_id": "x" })));
+    }
+
+    #[test]
+    fn normalize_decision_maps_approve_verbs() {
+        assert_eq!(normalize_decision("approve"), APPROVE);
+        assert_eq!(normalize_decision("approve_session"), APPROVE_SESSION);
+        assert_eq!(normalize_decision("approve_always"), APPROVE_ALWAYS);
+    }
+
+    #[test]
+    fn normalize_decision_is_case_and_whitespace_insensitive() {
+        assert_eq!(normalize_decision("  Approve "), APPROVE);
+        assert_eq!(normalize_decision("APPROVE_ALWAYS"), APPROVE_ALWAYS);
+    }
+
+    #[test]
+    fn normalize_decision_fails_secure_on_unknown() {
+        // Anything not exactly an approve verb denies — no string the shim
+        // sends can smuggle a grant.
+        assert_eq!(normalize_decision("deny"), DENY);
+        assert_eq!(normalize_decision(""), DENY);
+        assert_eq!(normalize_decision("yes"), DENY);
+        assert_eq!(normalize_decision("approve; rm -rf /"), DENY);
+        assert_eq!(normalize_decision("allow"), DENY);
+    }
+
+    #[test]
+    fn response_topic_accepts_uuid() {
+        assert_eq!(
+            response_topic("0191f3a2b4c74d8e9f01234567890abc").as_deref(),
+            Some("astrid.v1.approval.response.0191f3a2b4c74d8e9f01234567890abc")
+        );
+        assert!(response_topic("0191f3a2-b4c7-4d8e-9f01-234567890abc").is_some());
+    }
+
+    #[test]
+    fn response_topic_rejects_topic_smuggling() {
+        assert!(response_topic("").is_none());
+        assert!(response_topic("a.b").is_none());
+        assert!(response_topic("a b").is_none());
+        assert!(response_topic("a*b").is_none());
+        assert!(response_topic("a/b").is_none());
+        assert!(response_topic("a\nb").is_none());
+        let too_long = "a".repeat(MAX_REQUEST_ID_LEN + 1);
+        assert!(response_topic(&too_long).is_none());
+    }
+
+    #[test]
+    fn reply_flag_carries_display_and_routing_fields_only() {
+        let req = ApprovalRequired {
+            request_id: "rid".to_string(),
+            action: "  git push  ".to_string(),
+            resource: "git push origin main".to_string(),
+            reason: "needs consent".to_string(),
+        };
+        let flag = req.to_reply_flag("shell.exec", "call-7");
+        assert_eq!(flag["request_id"], "rid");
+        // Trimmed.
+        assert_eq!(flag["action"], "git push");
+        assert_eq!(flag["resource"], "git push origin main");
+        assert_eq!(flag["reason"], "needs consent");
+        // Routing tokens the shim must echo back so the resume path can
+        // re-establish the result drain. These are not secrets — they are the
+        // same tokens the shim used to make the original tool.call.
+        assert_eq!(flag["tool_name"], "shell.exec");
+        assert_eq!(flag["call_id"], "call-7");
+        // No arguments / secret fields leak in.
+        assert!(flag.get("arguments").is_none());
+    }
+
+    #[test]
+    fn clamp_truncates_oversize_display() {
+        let long = "a".repeat(MAX_DISPLAY_LEN + 50);
+        assert_eq!(clamp(&long).chars().count(), MAX_DISPLAY_LEN);
+        assert_eq!(clamp("  hi  "), "hi");
+    }
+
+    #[test]
+    fn approval_respond_parses_minimum_shape() {
+        let v = json!({
+            "req_id": "r1",
+            "request_id": "rid",
+            "decision": "approve",
+            "tool_name": "shell.exec",
+            "call_id": "r1",
+        });
+        let parsed: ApprovalRespond = serde_json::from_value(v).unwrap();
+        assert_eq!(parsed.req_id, "r1");
+        assert_eq!(parsed.request_id, "rid");
+        assert_eq!(parsed.decision, "approve");
+        assert_eq!(parsed.tool_name, "shell.exec");
+        assert_eq!(parsed.call_id, "r1");
+        assert!(parsed.reason.is_none());
+    }
+
+    #[test]
+    fn approval_respond_requires_routing_fields() {
+        // `tool_name` / `call_id` are mandatory — without them the resume
+        // path cannot re-establish the result drain, so the wire shape must
+        // reject a payload missing them rather than silently default.
+        assert!(
+            serde_json::from_value::<ApprovalRespond>(json!({
+                "req_id": "r1",
+                "request_id": "rid",
+                "decision": "approve",
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn approval_respond_carries_optional_reason() {
+        let v = json!({
+            "req_id": "r1",
+            "request_id": "rid",
+            "decision": "deny",
+            "tool_name": "shell.exec",
+            "call_id": "r1",
+            "reason": "user declined",
+        });
+        let parsed: ApprovalRespond = serde_json::from_value(v).unwrap();
+        assert_eq!(parsed.reason.as_deref(), Some("user declined"));
+    }
+}

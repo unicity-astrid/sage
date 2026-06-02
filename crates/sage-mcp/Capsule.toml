@@ -16,6 +16,19 @@ type = "executable"
 [capabilities]
 kv = []
 
+# Confused-deputy allow-set for the state-mutating broker front door
+# (`astrid.v1.request.mcp.tool.call`). Comma-separated list of trusted
+# ingress capsule UUIDs — the kernel-set `source_id` of the capsule that
+# forwarded the call (today the cli proxy; extensible to future
+# Telegram / Discord bridges). Read back at call time via
+# `astrid_sdk::env::var_opt("trusted_ingress_ids")` and matched against
+# `runtime::caller().source_id` in `execute::is_trusted_ingress`. Unset
+# fails closed: no ingress is trusted until the operator pins one. The
+# read-only `astrid.v1.request.mcp.tools.list` front door is not gated by
+# this — it only exposes the public tool surface.
+[env]
+trusted_ingress_ids = { type = "string", default = "", request = "Comma-separated UUIDs of trusted ingress capsules allowed to drive MCP tool calls (e.g. the cli proxy capsule UUID)" }
+
 # sage-mcp picks up tool-call requests from `sage` (claude -p emitted
 # a tool call), dispatches them via tool.v1 bus protocol, and returns
 # results. It also describes the tool surface Claude sees by querying
@@ -24,6 +37,29 @@ kv = []
 "sage.v1.tool.call.*" = { handler = "handle_tool_call" }
 "sage.v1.tools.describe" = { handler = "describe_tools" }
 "tool.v1.response.describe.*" = { handler = "collect_tool_descriptors" }
+# Broker front door: the sanitized `astrid.v1.*` MCP surface for a
+# generic third-party MCP client behind a shim/proxy. Same
+# discovery/execute internals as the `sage.v1.*` agent-runner path; the
+# shim never sees `tool.v1.*`. Both are exact (segment-arity-fixed)
+# topics — the proxy carries the correlation token in the body, not the
+# topic, so no wildcard suffix is needed here.
+"astrid.v1.request.mcp.tools.list" = { handler = "handle_mcp_list" }
+"astrid.v1.request.mcp.tool.call" = { handler = "handle_mcp_call" }
+# Elicitation/approval bridge (broker side). The shim forwards Claude's
+# elicited approval choice here; `handle_mcp_approval` maps it onto
+# `astrid.v1.approval.response.<id>` to unblock the parked tool. Exact
+# (segment-arity-fixed) topic — the proxy carries the correlation token in
+# the body. State-mutating (it can grant a capability), so the handler is
+# confused-deputy gated on `source_id` against `trusted_ingress_ids`, the
+# same allow-set the tool-call front door uses.
+"astrid.v1.request.mcp.approval.respond" = { handler = "handle_mcp_approval" }
+# Dynamic-subscribe pattern: `execute::dispatch_with_approval` calls
+# `ipc::subscribe("astrid.v1.approval")` per broker tool call to observe a
+# capability-approval request published by the host while a gated tool is
+# blocked. The kernel gates runtime subscribes against this list, so the
+# fixed topic must be declared here even though there is no static handler
+# — the subscription is drained inline inside `dispatch_with_approval`.
+"astrid.v1.approval" = {}
 # Dynamic-subscribe pattern: `execute::handle_tool_call` calls
 # `ipc::subscribe("tool.v1.execute.<bare>.result")` per call. The kernel
 # gates runtime subscribes against this list, so the pattern must be
@@ -42,6 +78,21 @@ kv = []
 # Reshaped result envelope consumed by `sage::tooling::result::handle_tool_result`.
 "sage.v1.tool.result.*" = {}
 "sage.v1.tools.list" = {}
+# Broker reply channel. Both broker handlers reply on
+# `astrid.v1.response.<req_id>`; the `req_id` is a single clean segment
+# (UUID-ish, validated in `broker::reply_topic`) so the egress topic is
+# exactly 4 segments — the kernel `*` is single-segment, so this
+# one-pattern declaration covers every routable reply and a multi-segment
+# req_id is rejected before it can reach the wire.
+"astrid.v1.response.*" = {}
+# Elicitation/approval bridge decision channel. `handle_mcp_approval` maps
+# the shim's elicited choice onto `astrid.v1.approval.response.<request_id>`,
+# which the host's blocked `request_approval` is subscribed to. The
+# `request_id` is a single clean segment (host-minted UUID, charset-gated in
+# `approval::response_topic`) so the egress topic is exactly 4 segments — the
+# kernel `*` is single-segment, so this one-pattern declaration covers every
+# routable decision and a multi-segment id is rejected before the wire.
+"astrid.v1.approval.response.*" = {}
 "tool.v1.request.describe" = { wit = "@unicity-astrid/wit/tool/describe-request" }
 # Execute fan-out from `handle_tool_call` — the bridge strips the
 # `mcp__sage__` MCP prefix and forwards to the bare tool topic.

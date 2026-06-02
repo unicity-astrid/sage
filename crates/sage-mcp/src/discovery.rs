@@ -61,16 +61,69 @@ const MAX_TOOLS_PER_RESPONSE: usize = 256;
 /// stale path: subscribe-before-publish fan-out, dedupe by name
 /// (last-write-wins), replace the cache, publish the new list.
 pub(crate) fn describe_tools() {
+    let snapshot = collect_snapshot();
+    publish_tools_list(&snapshot);
+}
+
+/// Assemble the current tool-descriptor snapshot, running the
+/// describe-collect fan-out only when the cache is stale.
+///
+/// Shared by the agent-facing `describe_tools` publish path and the
+/// broker-facing `astrid.v1.request.mcp.tools.list` handler so the two
+/// front doors run the exact same discovery + cache logic — no
+/// duplicated fan-out, dedupe, or TTL handling.
+pub(crate) fn collect_snapshot() -> Vec<McpToolDescriptor> {
     let cached = cache::load();
     let now = wall_ms();
     if cached.is_fresh(now) {
-        publish_tools_list(&cached.as_vec());
-        return;
+        return cached.as_vec();
     }
 
     let descriptors = discover();
-    let snapshot = cache::replace(descriptors).as_vec();
-    publish_tools_list(&snapshot);
+    cache::replace(descriptors).as_vec()
+}
+
+/// Convert internal descriptors to the standard MCP `tools/list`
+/// descriptor shape (`name`, `description`, `inputSchema`, plus optional
+/// `title`/`capabilities`) for the broker reply body.
+///
+/// Unlike [`publish_tools_list`], names are emitted RAW — the broker is
+/// a generic MCP front door, not Claude's `mcp__sage__*` namespace, so
+/// it must not stamp the agent-runner prefix onto the descriptors a
+/// third-party MCP client consumes.
+pub(crate) fn to_mcp_descriptors(descriptors: &[McpToolDescriptor]) -> Vec<serde_json::Value> {
+    descriptors.iter().map(mcp_descriptor).collect()
+}
+
+/// Shape one internal descriptor into an MCP tool-descriptor object.
+/// `prefix` is prepended to the name (empty for the broker surface,
+/// `mcp__sage__` for the agent-runner surface).
+fn mcp_descriptor_with_prefix(d: &McpToolDescriptor, prefix: &str) -> serde_json::Value {
+    let mut obj = serde_json::Map::new();
+    obj.insert(
+        "name".to_string(),
+        serde_json::Value::String(format!("{prefix}{}", d.name)),
+    );
+    if let Some(title) = &d.title {
+        obj.insert(
+            "title".to_string(),
+            serde_json::Value::String(title.clone()),
+        );
+    }
+    obj.insert(
+        "description".to_string(),
+        serde_json::Value::String(d.description.clone()),
+    );
+    obj.insert("inputSchema".to_string(), d.input_schema.clone());
+    if let Some(caps) = &d.capabilities {
+        obj.insert("capabilities".to_string(), caps.clone());
+    }
+    serde_json::Value::Object(obj)
+}
+
+/// Broker-surface MCP descriptor: raw (unprefixed) name.
+fn mcp_descriptor(d: &McpToolDescriptor) -> serde_json::Value {
+    mcp_descriptor_with_prefix(d, "")
 }
 
 /// Handle an inbound `tool.v1.response.describe.*` broadcast.
@@ -246,32 +299,13 @@ fn remap_input_schema(mut value: serde_json::Value) -> serde_json::Value {
 fn publish_tools_list(descriptors: &[McpToolDescriptor]) {
     let mcp_shaped: Vec<serde_json::Value> = descriptors
         .iter()
-        .map(|d| {
-            let mut obj = serde_json::Map::new();
-            obj.insert(
-                "name".to_string(),
-                serde_json::Value::String(format!("{MCP_TOOL_PREFIX}{}", d.name)),
-            );
-            if let Some(title) = &d.title {
-                obj.insert(
-                    "title".to_string(),
-                    serde_json::Value::String(title.clone()),
-                );
-            }
-            obj.insert(
-                "description".to_string(),
-                serde_json::Value::String(d.description.clone()),
-            );
-            obj.insert("inputSchema".to_string(), d.input_schema.clone());
-            if let Some(caps) = &d.capabilities {
-                obj.insert("capabilities".to_string(), caps.clone());
-            }
-            serde_json::Value::Object(obj)
-        })
+        .map(|d| mcp_descriptor_with_prefix(d, MCP_TOOL_PREFIX))
         .collect();
 
     if let Err(e) = ipc::publish_json(TOOLS_LIST_TOPIC, &mcp_shaped) {
-        log::warn(format!("sage-mcp: failed to publish {TOOLS_LIST_TOPIC}: {e}"));
+        log::warn(format!(
+            "sage-mcp: failed to publish {TOOLS_LIST_TOPIC}: {e}"
+        ));
     }
 }
 
