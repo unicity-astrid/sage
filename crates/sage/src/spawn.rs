@@ -16,7 +16,7 @@ const CLAUDE_BIN: &str = "claude";
 pub(crate) struct SpawnInputs<'a> {
     /// Principal that owns this session. Threaded into the child env as
     /// `ASTRID_PRINCIPAL_ID` so the `astrid-emit` hook helper can stamp
-    /// it on outgoing `sage.v1.unverified_hook.*` events. Sage's run
+    /// it on outgoing `sage.v1.hook.*` events. Sage's run
     /// loop re-verifies the claim against the per-(principal, session)
     /// hook token before republishing on the canonical `hook.v1.event.*`
     /// topic; the env value itself is untrusted (the child process may
@@ -40,7 +40,7 @@ pub(crate) struct SpawnInputs<'a> {
     /// `sage.hook_token.<principal>.<session>`. Threaded into the child
     /// env as `ASTRID_HOOK_TOKEN`; `astrid-emit` echoes it back in the
     /// hook envelope so sage can distinguish authentic hook fires from
-    /// forged `sage.v1.unverified_hook.*` publishes. Always present
+    /// forged `sage.v1.hook.*` publishes. Always present
     /// (no Option) — every spawn gets a token. Must NEVER appear in
     /// argv: it would land in process listings / audit logs and the
     /// `flags_hash` audit-stability invariant
@@ -126,7 +126,7 @@ pub(crate) fn spawn_claude(inputs: &SpawnInputs<'_>) -> Result<Spawned, SysError
         .env("CLAUDE_CODE_SKIP_PROMPT_HISTORY", "1")
         // Hook-bridge envelope: the `astrid-emit` helper (shipping in
         // core via astrid#814) reads these three vars and stamps them
-        // onto every `sage.v1.unverified_hook.*` publish. Sage's run
+        // onto every `sage.v1.hook.*` publish. Sage's run
         // loop verifies the token against KV before republishing on
         // the canonical `hook.v1.event.*` topic — env values are
         // untrusted on the way in, but the KV lookup acts as the CA.

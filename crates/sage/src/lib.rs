@@ -442,12 +442,12 @@ impl Sage {
         // install_failed, api_key_missing) so we never persist a token
         // for a session that won't actually spawn. The token is the
         // shared secret `astrid-emit` (shipping in core via astrid#814)
-        // echoes back in every `sage.v1.unverified_hook.*` envelope; the
+        // echoes back in every `sage.v1.hook.*` envelope; the
         // run loop verifies it against KV before republishing on
         // `hook.v1.event.<name>`. Two distinct failure modes:
         //
         //   * `hook_token_mint_failed` — host CSPRNG unavailable. Fatal:
-        //     spawning without a token would let any unverified hook
+        //     spawning without a token would let any forged hook
         //     publish republish under sage's vouching.
         //   * `hook_token_persist_failed` — KV write failed. Also fatal:
         //     without a persisted token the run loop has nothing to
@@ -683,12 +683,12 @@ impl Sage {
         let tool_audit_sub = ipc::subscribe("sage.v1.audit.tool_call")?;
         // Hook validator (sage-as-CA): `astrid-emit` (shipping in core
         // via astrid#814) stamps a per-session token onto every Claude
-        // hook fire and publishes on `sage.v1.unverified_hook.<name>`.
+        // hook fire and publishes on `sage.v1.hook.<name>`.
         // The run loop drains those, verifies the token against KV,
         // and republishes the validated payload on the canonical
         // `hook.v1.event.<name>` topic. Mismatches are dropped with an
         // audit on `sage.v1.audit.hook_spoof_attempt`.
-        let unverified_hook_sub = ipc::subscribe("sage.v1.unverified_hook.*")?;
+        let hook_sub = ipc::subscribe("sage.v1.hook.*")?;
         let _ = runtime::signal_ready();
         log::info("sage: supervisor loop starting");
 
@@ -758,7 +758,7 @@ impl Sage {
             // event and publish `sage.v1.audit.hook_spoof_attempt`.
             // Errors are swallowed (helper logs internally) so a bad
             // poll doesn't tear down the run loop.
-            if let Ok(poll) = unverified_hook_sub.poll() {
+            if let Ok(poll) = hook_sub.poll() {
                 let _ = crate::hooks::validate_and_route(poll.messages);
             }
 

@@ -105,7 +105,7 @@ const REQUIRED_DENIES: &[&str] = &[
 /// The six hook events sage declares in `settings.local.json`. Each
 /// event is wired through the `astrid-emit` native helper, which
 /// publishes the Claude-side hook payload on the sage-namespaced
-/// `sage.v1.unverified_hook.*` topic so sage's run-loop validator can
+/// `sage.v1.hook.*` topic so sage's run-loop validator can
 /// authenticate the spawn-token and republish on the canonical
 /// `hook.v1.event.*` (or sage-namespaced `sage.v1.notification`) topic.
 /// See [`HOOK_TOPIC_MAP`] for the per-event topic.
@@ -119,9 +119,9 @@ const HOOK_EVENTS: &[&str] = &[
 ];
 
 /// Per-event mapping from Claude's hook name to the sage-namespaced
-/// `sage.v1.unverified_hook.*` topic that `astrid-emit` publishes on.
+/// `sage.v1.hook.*` topic that `astrid-emit` publishes on.
 ///
-/// Sage's run-loop validator subscribes to `sage.v1.unverified_hook.*`,
+/// Sage's run-loop validator subscribes to `sage.v1.hook.*`,
 /// authenticates the per-(principal, session) spawn token carried in
 /// the envelope, and republishes on the canonical `hook.v1.event.<name>`
 /// topic (or `sage.v1.notification` for the one event without a
@@ -132,15 +132,15 @@ const HOOK_EVENTS: &[&str] = &[
 /// crate, no dependency edge), so the table is mirrored here. Any edit
 /// to one side must mirror to the other.
 const HOOK_TOPIC_MAP: &[(&str, &str)] = &[
-    ("PreToolUse", "sage.v1.unverified_hook.before_tool_call"),
-    ("PostToolUse", "sage.v1.unverified_hook.after_tool_call"),
+    ("PreToolUse", "sage.v1.hook.before_tool_call"),
+    ("PostToolUse", "sage.v1.hook.after_tool_call"),
     (
         "UserPromptSubmit",
-        "sage.v1.unverified_hook.message_received",
+        "sage.v1.hook.message_received",
     ),
-    ("Stop", "sage.v1.unverified_hook.session_end"),
-    ("SubagentStop", "sage.v1.unverified_hook.subagent_stop"),
-    ("Notification", "sage.v1.unverified_hook.notification"),
+    ("Stop", "sage.v1.hook.session_end"),
+    ("SubagentStop", "sage.v1.hook.subagent_stop"),
+    ("Notification", "sage.v1.hook.notification"),
 ];
 
 /// Lookup the `astrid-emit` topic for a Claude hook event.
@@ -154,7 +154,7 @@ fn hook_topic(event: &str) -> &'static str {
 /// Build the `hooks` block — identical in both interaction modes.
 ///
 /// Each event invokes the `astrid-emit` native helper with the
-/// sage-namespaced `sage.v1.unverified_hook.*` topic. `astrid-emit`
+/// sage-namespaced `sage.v1.hook.*` topic. `astrid-emit`
 /// reads Claude's stdin hook payload, packages it into the envelope
 /// shape sage's validator expects (hook, payload, correlation_id,
 /// principal_id, session_id, token), and publishes on the bus.
@@ -212,7 +212,7 @@ fn hooks_block() -> serde_json::Value {
 /// disabled. Each event invokes `astrid-emit <topic>` (the native
 /// helper shipping separately in core per astrid#814) so claude's
 /// stdin-JSON subprocess hook protocol is bridged onto the
-/// `sage.v1.unverified_hook.*` IPC topic. Sage's run-loop validator
+/// `sage.v1.hook.*` IPC topic. Sage's run-loop validator
 /// then authenticates the per-(principal, session) spawn token and
 /// republishes on canonical `hook.v1.event.*` (or
 /// `sage.v1.notification` for the one event without a canonical
@@ -570,7 +570,7 @@ mod tests {
         // The hooks block must be present, identical across all four
         // (mode, auth) combinations, and wire each event through
         // `astrid-emit <topic>` with timeout=10 so sage's run-loop
-        // validator receives the per-event unverified-hook envelope.
+        // validator receives the per-event hook envelope.
         for im in [InteractionMode::Headless, InteractionMode::Repl] {
             for am in [AuthMode::ApiKey, AuthMode::Subscription] {
                 let v = settings_json(&cfg(im, am));
@@ -639,8 +639,8 @@ mod tests {
         }
         for (_, topic) in HOOK_TOPIC_MAP {
             assert!(
-                topic.starts_with("sage.v1.unverified_hook."),
-                "topic {topic:?} must live under sage.v1.unverified_hook.*"
+                topic.starts_with("sage.v1.hook."),
+                "topic {topic:?} must live under sage.v1.hook.*"
             );
         }
     }

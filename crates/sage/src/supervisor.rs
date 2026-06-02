@@ -467,7 +467,7 @@ fn evict(sessions: &Sessions, session_id: &str) -> Result<(), SysError> {
     })?;
     let _ = delete_record(session_id);
     // Drop the per-(principal, session) hook token alongside the
-    // persisted record so a forged `sage.v1.unverified_hook.*` event
+    // persisted record so a forged `sage.v1.hook.*` event
     // arriving after eviction cannot pass the validator lookup. Best-
     // effort: a missing principal (session already gone) is a no-op.
     if let Some(principal_id) = principal_id {

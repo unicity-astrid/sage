@@ -5,7 +5,7 @@
 //! Wired end-to-end: `handle_spawn` (lib.rs) mints + persists tokens
 //! and sets `ASTRID_HOOK_TOKEN`/`ASTRID_PRINCIPAL_ID`/`ASTRID_SESSION_ID`
 //! on the `claude` child env; the `#[astrid::run]` supervisor subscribes
-//! to `sage.v1.unverified_hook.*` and routes each event through
+//! to `sage.v1.hook.*` and routes each event through
 //! `lookup_token` + `tokens_match` + canonical-topic republish;
 //! `shutdown::stop_session` and `supervisor::evict` call `forget_token`
 //! on every session-end path. See unicity-astrid/astrid#814 (binary) and
@@ -17,7 +17,7 @@
 //! The native `astrid-emit` binary (shipping separately in core) reads
 //! a per-session token from the spawned `claude -p` process env
 //! (`ASTRID_HOOK_TOKEN`) and includes it in every published
-//! `sage.v1.unverified_hook.*` event. Sage's run loop looks the token
+//! `sage.v1.hook.*` event. Sage's run loop looks the token
 //! up in KV at `sage.hook_token.<principal>.<session>` and only
 //! republishes on the canonical `hook.v1.event.*` topics when the
 //! claimed token matches the stored one.
@@ -44,7 +44,7 @@ pub(crate) const HOOK_TOKEN_KEY_PREFIX: &str = "sage.hook_token";
 const TOKEN_BYTES: usize = 32;
 
 /// Mapping from Claude-side hook event names (as they appear in the
-/// `sage.v1.unverified_hook.<name>` topic tail) to the topic the
+/// `sage.v1.hook.<name>` topic tail) to the topic the
 /// validator republishes on after a successful token match.
 ///
 /// Five entries map to canonical Astrid `hook.v1.event.<name>` topics.
@@ -145,13 +145,13 @@ pub(crate) fn tokens_match(claimed: &str, stored: &str) -> bool {
     diff == 0
 }
 
-/// Wire shape of an `sage.v1.unverified_hook.<name>` envelope as
+/// Wire shape of an `sage.v1.hook.<name>` envelope as
 /// published by the native `astrid-emit` binary (core PR for
 /// unicity-astrid/astrid#814). `principal_id`, `session_id`, and
-/// `token` are *unverified* transport fields — sage trusts none of
+/// `token` are claim-only transport fields — sage trusts none of
 /// them until [`tokens_match`] succeeds against the KV-stored token.
 #[derive(Debug, Deserialize)]
-struct UnverifiedHookEnvelope {
+struct HookEnvelope {
     hook: String,
     payload: String,
     #[serde(default)]
@@ -186,7 +186,7 @@ fn canonical_topic_for(hook_name: &str) -> Option<&'static str> {
 /// [`validate_and_route`] so the strip-the-transport regression test
 /// (`session_id` / `token` MUST NOT appear in the serialized JSON) is
 /// host-call-free and deterministic.
-fn build_canonical_body(envelope: &UnverifiedHookEnvelope) -> serde_json::Value {
+fn build_canonical_body(envelope: &HookEnvelope) -> serde_json::Value {
     serde_json::json!({
         "hook": envelope.hook,
         "payload": envelope.payload,
@@ -196,7 +196,7 @@ fn build_canonical_body(envelope: &UnverifiedHookEnvelope) -> serde_json::Value 
 }
 
 /// Hard cap on attacker-controlled string fields echoed onto the
-/// audit topic. The producer of `sage.v1.unverified_hook.*` is
+/// audit topic. The producer of `sage.v1.hook.*` is
 /// authenticated only by a token *we* mint, so a spoof attempt can
 /// place arbitrary bytes in `principal_id` / `session_id` / `hook`.
 /// Truncating before republish bounds 1:1 amplification onto
@@ -229,7 +229,7 @@ fn audit_truncate(s: &str) -> &str {
 /// the audit topic would defeat its purpose as a secret.
 ///
 /// The claim fields (`claimed_principal`, `claimed_session`, `hook`)
-/// originate from an unverified envelope under attacker control, so
+/// originate from a claim-only envelope under attacker control, so
 /// each is truncated via [`audit_truncate`] before publish to bound
 /// the audit topic's amplification factor on adversarial input.
 ///
@@ -260,7 +260,7 @@ fn publish_spoof_audit(
     );
 }
 
-/// Run-loop drain helper for `sage.v1.unverified_hook.*` events.
+/// Run-loop drain helper for `sage.v1.hook.*` events.
 ///
 /// Mirrors the shape of [`crate::tooling::approval::route_approvals`]
 /// but is single-phase — no `Sessions` lock is involved, only a KV
@@ -291,11 +291,11 @@ pub(crate) fn validate_and_route(messages: Vec<ipc::Message>) -> Result<(), SysE
         return Ok(());
     }
     for msg in messages {
-        let envelope: UnverifiedHookEnvelope = match serde_json::from_str(&msg.payload) {
+        let envelope: HookEnvelope = match serde_json::from_str(&msg.payload) {
             Ok(e) => e,
             Err(e) => {
                 log::warn(format!(
-                    "sage: unverified_hook parse failed on '{}': {e}",
+                    "sage: hook event parse failed on '{}': {e}",
                     msg.topic
                 ));
                 continue;
@@ -318,7 +318,7 @@ pub(crate) fn validate_and_route(messages: Vec<ipc::Message>) -> Result<(), SysE
         }
 
         // Look up the per-session token. The `principal_id` and
-        // `session_id` here are *unverified* — the token match below
+        // `session_id` here are claim-only — the token match below
         // is what makes the claim trustworthy. The kernel's
         // per-(principal, capsule) KV scoping means we can't read
         // another principal's namespace even if the envelope tries

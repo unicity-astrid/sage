@@ -160,7 +160,7 @@ pub(crate) fn stop_session(
                 ));
             }
             // Drop the per-(principal, session) hook token so a forged
-            // `sage.v1.unverified_hook.*` event arriving after the
+            // `sage.v1.hook.*` event arriving after the
             // session is gone can no longer pass token validation. Best-
             // effort: log on failure (parallel to delete_record above).
             if let Err(e) = crate::hooks::forget_token(&principal_id, session_id) {

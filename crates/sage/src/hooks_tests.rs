@@ -93,7 +93,7 @@ fn canonical_topic_for_resolves_all_known_hooks() {
 }
 
 #[test]
-fn unverified_envelope_parses_minimal_shape() {
+fn envelope_parses_minimal_shape() {
     // Canonical envelope shape published by `astrid-emit` once the
     // core PR for unicity-astrid/astrid#814 lands.
     let raw = r#"{
@@ -104,7 +104,7 @@ fn unverified_envelope_parses_minimal_shape() {
         "session_id": "sess-1",
         "token": "deadbeef"
     }"#;
-    let e: UnverifiedHookEnvelope = serde_json::from_str(raw).unwrap();
+    let e: HookEnvelope = serde_json::from_str(raw).unwrap();
     assert_eq!(e.hook, "before_tool_call");
     assert_eq!(e.payload, "eyJ0b29sIjoiZnMifQ==");
     assert_eq!(e.principal_id, "alice");
@@ -114,7 +114,7 @@ fn unverified_envelope_parses_minimal_shape() {
 }
 
 #[test]
-fn unverified_envelope_treats_missing_correlation_id_as_none() {
+fn envelope_treats_missing_correlation_id_as_none() {
     // `correlation_id` is `#[serde(default)]` so producers MAY
     // omit the key entirely (in addition to emitting it as
     // `null`). Both forms round-trip to `None`.
@@ -125,7 +125,7 @@ fn unverified_envelope_treats_missing_correlation_id_as_none() {
         "session_id": "sess-2",
         "token": "cafe"
     }"#;
-    let e: UnverifiedHookEnvelope = serde_json::from_str(raw).unwrap();
+    let e: HookEnvelope = serde_json::from_str(raw).unwrap();
     assert!(e.correlation_id.is_none());
 }
 
@@ -133,8 +133,8 @@ fn unverified_envelope_treats_missing_correlation_id_as_none() {
 /// regression suite. Sets every field including the transport ones
 /// (`session_id`, `token`) so the strip assertions have something
 /// to assert against.
-fn envelope_for_body_test() -> UnverifiedHookEnvelope {
-    UnverifiedHookEnvelope {
+fn envelope_for_body_test() -> HookEnvelope {
+    HookEnvelope {
         hook: "before_tool_call".to_string(),
         payload: "eyJ0b29sIjoiZnMifQ==".to_string(),
         correlation_id: Some("corr-1".to_string()),
@@ -225,7 +225,7 @@ fn canonical_body_preserves_payload_bytes() {
 /// present regardless of whether the producer set it.
 #[test]
 fn canonical_body_serializes_none_correlation_as_null() {
-    let env = UnverifiedHookEnvelope {
+    let env = HookEnvelope {
         correlation_id: None,
         ..envelope_for_body_test()
     };
@@ -275,7 +275,7 @@ fn canonical_body_has_exactly_four_keys() {
 /// the assertion accidentally over-matching.
 #[test]
 fn canonical_body_token_substring_check_is_not_a_false_positive() {
-    let env = UnverifiedHookEnvelope {
+    let env = HookEnvelope {
         principal_id: "user-deadbeef-test".to_string(),
         token: "cafef00d".to_string(),
         ..envelope_for_body_test()
