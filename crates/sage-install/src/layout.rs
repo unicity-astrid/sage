@@ -88,40 +88,117 @@ pub(crate) fn sanitize_principal_id(id: &str) -> Result<String, SysError> {
 /// Source-of-truth deny list for the headless mode — every built-in
 /// Claude tool that must be blocked so `mcp__sage__*` is the SOLE tool
 /// surface. The rule is exhaustive by design: any built-in that can act
-/// (file/shell/web/task), surface other tools, or drive control flow
-/// outside the MCP surface is denied, so a session cannot reach around
-/// the sandbox via a tool the list forgot.
+/// (file/shell/web), spawn agents, schedule or drive control flow, read
+/// MCP resources, or surface other tools is denied, so a session cannot
+/// reach around the sandbox via a tool the list forgot.
 ///
-/// Public so tests in this module can both assert presence in the JSON
-/// and use it as a parameterised fixture.
+/// Defence-in-depth caveat: this list lives in `settings.local.json`,
+/// Claude's WEAKEST, fully session-overridable settings tier — a capable
+/// session can edit any of these denies away. The BINDING tool gate is
+/// the spawn argv (`--tools ""` + `--allowed-tools mcp__sage__*` +
+/// `--disallowedTools <this list>`, see `sage::spawn::argv` /
+/// `sage::spawn::DENIED_TOOLS`), which sits above every on-disk file tier
+/// in Claude's precedence order. This file copy is a redundant second
+/// layer, not the primary enforcement boundary.
+///
+/// SYNC (load-bearing): every name here MUST also appear in
+/// `sage::spawn::DENIED_TOOLS` (sage/src/spawn.rs), the copy hoisted into
+/// the binding `--disallowedTools` CLI tier. The two crates have no
+/// dependency edge, so the list is mirrored, not shared. A name present
+/// HERE but absent THERE is denied only in the overridable tier — a
+/// session edits it out of `settings.local.json` and calls it, so the
+/// deny is not actually binding. Both sides anchor on the same element
+/// count (`assert_headless_shape` here, `denied_tools_count_anchors_…`
+/// there) so a one-sided edit trips a test. Any change to one list must
+/// mirror to the other.
+///
+/// Coverage strategy: entries fall into two groups.
+/// * Current surface — every tool in Claude's published tools reference
+///   that can act, spawn, schedule, message, read MCP resources, or load
+///   other tools. Inert read-only conveniences with no escape value
+///   (e.g. `AskUserQuestion`) are intentionally NOT listed; the argv gate
+///   is the real boundary and a deny here would only add churn.
+/// * Legacy aliases — older tool names (`Task`, `MultiEdit`, `BashOutput`,
+///   `KillShell`, `SlashCommand`) Claude has since renamed or folded into
+///   other tools. Denying a name Claude no longer ships is a harmless
+///   no-op, and keeps the gate intact for principals pinned to an older
+///   `claude` build during the version-pin window.
+///
+/// Public-in-module so tests can both assert presence in the JSON and use
+/// it as a parameterised fixture.
 const REQUIRED_DENIES: &[&str] = &[
-    // File / shell / web / task — the original action surface.
+    // File / shell / web — the core action surface.
     "Bash",
+    "PowerShell",
     "Read",
     "Write",
     "Edit",
-    "MultiEdit",
     "NotebookEdit",
     "WebFetch",
     "WebSearch",
     "Glob",
     "Grep",
+    "LSP",
+    // Background command execution: `Monitor` runs a command in the
+    // background under Bash-equivalent semantics; denying `Bash` does not
+    // cover it because it is a distinct tool name.
+    "Monitor",
+    // Agent / sub-agent spawning and orchestration — the highest-value
+    // escape: a spawned agent or workflow runs its own tool calls and
+    // could reach a capability this session is denied. `Agent` is the
+    // current name; `Task` is the legacy alias for the same surface.
+    "Agent",
     "Task",
-    // Background-shell control: `Bash` is denied, but these address shells
-    // by id and must not remain reachable on their own.
+    "Workflow",
+    "SendMessage",
+    "TeamCreate",
+    "TeamDelete",
+    // Scheduling / control flow — anything that can queue a future prompt,
+    // reschedule a loop, or drive plan-mode transitions outside sage's
+    // run loop.
+    "CronCreate",
+    "CronDelete",
+    "CronList",
+    "ScheduleWakeup",
+    "EnterPlanMode",
+    "ExitPlanMode",
+    "EnterWorktree",
+    "ExitWorktree",
+    // Task-list surface — created/queried/stopped tasks are control flow
+    // that bypasses sage's loop; deny the whole family.
+    "TaskCreate",
+    "TaskGet",
+    "TaskList",
+    "TaskStop",
+    "TaskUpdate",
+    "TaskOutput",
+    "TodoWrite",
+    // External / exfiltration surfaces — push notifications, remote
+    // routine triggers on claude.ai, and the onboarding-guide upload all
+    // reach off-host channels sage does not mediate.
+    "PushNotification",
+    "RemoteTrigger",
+    "ShareOnboardingGuide",
+    // MCP resource + tool-loading surfaces: reading raw MCP resources or
+    // loading deferred tools is a way back to a capability the curated
+    // `mcp__sage__*` allow list does not expose. `ListMcpResourcesTool`
+    // and `ReadMcpResourceTool` carry the `Tool` suffix in the current
+    // reference.
+    "ListMcpResourcesTool",
+    "ReadMcpResourceTool",
+    "ToolSearch",
+    "WaitForMcpServers",
+    // Skill subsystem: a skill can run shell / arbitrary tools.
+    // `disableSkillShellExecution` blunts the shell path, but deny the
+    // tool itself too. `SlashCommand` is the legacy alias for the same
+    // indirect-execution surface.
+    "Skill",
+    "SlashCommand",
+    // Legacy file-edit / shell-control aliases — folded into other tools
+    // in current builds; kept as harmless no-ops for older `claude` pins.
+    "MultiEdit",
     "BashOutput",
     "KillShell",
-    // Indirect-execution surfaces: a slash command or a skill can run
-    // shell / arbitrary tools, and tool-search can load deferred tools —
-    // each is a way back to a denied capability.
-    "SlashCommand",
-    "Skill",
-    "ToolSearch",
-    // Control / internal tools: harmless individually, denied to keep the
-    // invariant clean — `mcp__sage__*` is the only surface a session sees.
-    "TodoWrite",
-    "WaitForMcpServers",
-    "ExitPlanMode",
 ];
 
 /// The six hook events sage declares in `settings.local.json`. Each
@@ -209,6 +286,32 @@ fn hooks_block() -> serde_json::Value {
 }
 
 /// `.claude/settings.local.json` body for the given principal config.
+///
+/// ENFORCEABILITY: this authors `settings.local.json`, which is Claude's
+/// **Local** settings tier — the WEAKEST, fully session-overridable tier
+/// in Claude's precedence order (Managed > CLI args > Local > Project >
+/// User). A capable session can edit any value here — the deny list, the
+/// permission modes, `apiKeyHelper` — and Claude will honour the edit.
+/// So nothing in this file is binding on its own.
+///
+/// The BINDING tool/permission gate is the spawn argv, which sits above
+/// every on-disk file tier (only Managed, a fixed SYSTEM-path tier sage
+/// cannot author, outranks it). See `sage::spawn::argv`: `--tools ""`
+/// disables the built-in surface, `--allowed-tools mcp__sage__*` pins the
+/// only reachable tools, `--strict-mcp-config` ignores on-disk `.mcp.json`,
+/// `--permission-prompt-tool mcp__sage__approve` routes approvals through
+/// the bus, and `--no-session-persistence` suppresses Claude's own JSONL.
+/// Those flags cannot be overridden from within the session.
+///
+/// This file therefore serves two non-binding purposes:
+/// * a redundant, defence-in-depth deny layer ([`REQUIRED_DENIES`]) that
+///   only narrows the surface the argv already pins — useful while a
+///   value still holds, never relied on as the boundary; and
+/// * a carrier for two strings Claude reads only from a settings tier and
+///   not from argv: the `apiKeyHelper` command path and the `hooks` block.
+///   Both name external commands Claude execs; their integrity rests on
+///   the commands themselves (and, for hooks, the per-spawn token sage's
+///   validator checks), not on this file being tamper-proof.
 ///
 /// Branching is driven by the two axes in [`PrincipalConfig`]:
 ///
@@ -729,6 +832,108 @@ mod tests {
         assert_eq!(
             install_complete_key("alice"),
             "sage.install.complete.alice"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Cross-crate deny-list mirror — full-membership drift guard.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn required_denies_equal_canonical_binding_mirror() {
+        // Drift guard for the mirror with `sage::spawn::DENIED_TOOLS`
+        // (sage/src/spawn.rs). No dependency edge exists between the two
+        // crates (each is a `cdylib`-only workspace member, so neither can
+        // import the other's const as a library), so the lists cannot be
+        // `assert_eq!`d directly. Instead this pins `REQUIRED_DENIES`
+        // against a FULL, independently-written canonical set — the same
+        // canonical surface the spawn-side test
+        // (`denied_tools_equal_canonical_required_denies`) pins
+        // `DENIED_TOOLS` to. The pairing is load-bearing: `REQUIRED_DENIES`
+        // rides only the overridable Local tier (`settings.local.json`), so
+        // a name present here but dropped from `DENIED_TOOLS` is denied
+        // only in the defeasible tier and never reaches the binding
+        // `--disallowedTools` CLI tier. Anchoring BOTH lists to the same
+        // canonical set means a one-sided add/drop/substitute fails the
+        // build on at least one side, forcing the mirror back into
+        // alignment. Stronger than a count anchor: a same-size substitution
+        // (swap one tool for another) is caught here.
+        //
+        // SYNC: this canonical set MUST match the `CANONICAL` set in
+        // sage::spawn::tests::denied_tools_equal_canonical_required_denies
+        // (sage/src/spawn.rs) exactly.
+        const CANONICAL: &[&str] = &[
+            "Bash",
+            "PowerShell",
+            "Read",
+            "Write",
+            "Edit",
+            "NotebookEdit",
+            "WebFetch",
+            "WebSearch",
+            "Glob",
+            "Grep",
+            "LSP",
+            "Monitor",
+            "Agent",
+            "Task",
+            "Workflow",
+            "SendMessage",
+            "TeamCreate",
+            "TeamDelete",
+            "CronCreate",
+            "CronDelete",
+            "CronList",
+            "ScheduleWakeup",
+            "EnterPlanMode",
+            "ExitPlanMode",
+            "EnterWorktree",
+            "ExitWorktree",
+            "TaskCreate",
+            "TaskGet",
+            "TaskList",
+            "TaskStop",
+            "TaskUpdate",
+            "TaskOutput",
+            "TodoWrite",
+            "PushNotification",
+            "RemoteTrigger",
+            "ShareOnboardingGuide",
+            "ListMcpResourcesTool",
+            "ReadMcpResourceTool",
+            "ToolSearch",
+            "WaitForMcpServers",
+            "Skill",
+            "SlashCommand",
+            "MultiEdit",
+            "BashOutput",
+            "KillShell",
+        ];
+
+        // Compare as sets so a pure reordering of either list (no semantic
+        // effect — deny order is irrelevant) does not spuriously fail,
+        // while any membership difference (add, drop, substitute) does.
+        let actual: std::collections::BTreeSet<&str> =
+            REQUIRED_DENIES.iter().copied().collect();
+        let canonical: std::collections::BTreeSet<&str> =
+            CANONICAL.iter().copied().collect();
+
+        let missing: Vec<&str> = canonical.difference(&actual).copied().collect();
+        let unexpected: Vec<&str> = actual.difference(&canonical).copied().collect();
+        assert!(
+            missing.is_empty() && unexpected.is_empty(),
+            "REQUIRED_DENIES drifted from the canonical binding mirror.\n  \
+             missing from REQUIRED_DENIES: {missing:?}\n  \
+             unexpected in REQUIRED_DENIES: {unexpected:?}\n  \
+             re-sync REQUIRED_DENIES with sage::spawn::DENIED_TOOLS.",
+        );
+
+        // Belt-and-braces: no duplicate collapsed the set below the list
+        // length, which would mask a drift behind an equal-set comparison.
+        assert_eq!(
+            actual.len(),
+            REQUIRED_DENIES.len(),
+            "REQUIRED_DENIES contains a duplicate entry",
         );
     }
 

@@ -4,13 +4,139 @@
 //! Every flag here matters: dropping `--strict-mcp-config` smuggles in
 //! `.mcp.json` from the redirected HOME; dropping `--tools ""` lets the
 //! built-in Bash/Read/Write/Edit tools loose against the host
-//! filesystem; etc. See the agent_mode_subprocess_lifecycle design
-//! decision in the slice for the rationale on each flag.
+//! filesystem; etc.
+//!
+//! Enforcement lives in the argv on purpose. Claude's tier precedence is
+//! `Managed > CLI args > Local (settings.local.json) > Project > User`.
+//! CLI args are the only session-un-overridable tier reachable from
+//! capsule-space — sage owns the full argv and execs `claude` directly,
+//! so anything expressed as a flag here sits above every on-disk file
+//! tier and a running session cannot edit it away. Two flags carry that
+//! weight: `--disallowedTools` hoists the deny list out of the Local
+//! tier (`settings.local.json`, fully session-overridable) into the
+//! binding CLI tier, and `--setting-sources local` narrows on-disk tier
+//! loading to just sage's own authored file so a stray `user`/`project`
+//! settings file cannot dilute the posture. Managed and CLI flags always
+//! load regardless of `--setting-sources`, so the narrowing only shrinks
+//! the overridable surface; it never weakens the managed tier.
 
 use astrid_sdk::prelude::*;
 use sha2::{Digest, Sha256};
 
 const CLAUDE_BIN: &str = "claude";
+
+/// Built-in Claude tools denied at the CLI-args tier.
+///
+/// Claude's tier precedence is `Managed > CLI args > Local
+/// (settings.local.json) > Project (settings.json) > User
+/// (~/.claude/settings.json)`. CLI args are the only
+/// session-un-overridable tier reachable from capsule-space: sage owns
+/// the full argv and execs `claude` directly, so a deny passed here as
+/// `--disallowedTools` sits above every on-disk file tier and a session
+/// cannot edit it away mid-run. The same list also rides in
+/// `settings.local.json` (sage-install's `REQUIRED_DENIES`) as
+/// defense-in-depth, but that file is the *Local* tier — Claude's
+/// weakest, fully session-overridable scope — so the file copy alone is
+/// not binding. Hoisting it into argv is the genuine enforceable upgrade.
+///
+/// A bare tool name (no scope qualifier) removes the tool from the
+/// model's context entirely. The rule is exhaustive by design: any
+/// built-in that can act (file/shell/web/task), surface other tools, or
+/// drive control flow outside the `mcp__sage__*` surface is denied so a
+/// session cannot reach around the sandbox via a tool the list forgot.
+///
+/// SYNC: this list MUST be identical (same set) to
+/// `sage_install::layout::REQUIRED_DENIES` (sage-install/src/layout.rs).
+/// The two crates have no dependency edge (each sage crate is a
+/// `cdylib`-only workspace member, so one cannot import the other's const
+/// as a library without adding `rlib` to the producer's crate-type — a
+/// build-profile change out of scope), so the list is mirrored here by
+/// hand — same arrangement as the `HOOK_TOPIC_MAP` mirror. The mirror is
+/// load-bearing, not cosmetic: `REQUIRED_DENIES` rides only the fully
+/// session-overridable Local tier (`settings.local.json`), so a tool
+/// denied there but ABSENT here is not actually blocked — a capable
+/// session edits it out of the Local file and calls it. Only the names
+/// that appear in THIS list reach the binding `--disallowedTools` CLI
+/// tier. Any edit to either list must mirror to the other; the
+/// [`denied_tools_equal_canonical_required_denies`] test pins this copy
+/// against an independently-written canonical set (full membership, not
+/// just count) so a name added to or dropped from either side fails the
+/// build, and the per-name presence on the Local-tier copy is asserted in
+/// sage-install's `assert_headless_shape`.
+const DENIED_TOOLS: &[&str] = &[
+    // File / shell / web — the core action surface. `PowerShell` is a
+    // Bash-equivalent shell on its own tool name; `LSP` drives a language
+    // server that can read/edit; `Monitor` runs a command in the
+    // background under Bash-equivalent semantics — none are covered by
+    // denying `Bash` alone.
+    "Bash",
+    "PowerShell",
+    "Read",
+    "Write",
+    "Edit",
+    "MultiEdit",
+    "NotebookEdit",
+    "WebFetch",
+    "WebSearch",
+    "Glob",
+    "Grep",
+    "LSP",
+    "Monitor",
+    // Background-shell control: `Bash` is denied, but these address
+    // shells by id and must not remain reachable on their own.
+    "BashOutput",
+    "KillShell",
+    // Agent / sub-agent spawning and orchestration — the highest-value
+    // escape: a spawned agent or workflow runs its own tool calls and
+    // could reach a capability this session is denied. `Agent` is the
+    // current name; `Task` is the legacy alias for the same surface.
+    "Agent",
+    "Task",
+    "Workflow",
+    "SendMessage",
+    "TeamCreate",
+    "TeamDelete",
+    // Scheduling / control flow — anything that can queue a future
+    // prompt, reschedule a loop, or drive plan-mode / worktree
+    // transitions outside sage's run loop.
+    "CronCreate",
+    "CronDelete",
+    "CronList",
+    "ScheduleWakeup",
+    "EnterPlanMode",
+    "ExitPlanMode",
+    "EnterWorktree",
+    "ExitWorktree",
+    // Task-list surface — created/queried/stopped tasks are control flow
+    // that bypasses sage's loop; deny the whole family.
+    "TaskCreate",
+    "TaskGet",
+    "TaskList",
+    "TaskStop",
+    "TaskUpdate",
+    "TaskOutput",
+    "TodoWrite",
+    // External / exfiltration surfaces — push notifications, remote
+    // routine triggers on claude.ai, and the onboarding-guide upload all
+    // reach off-host channels sage does not mediate.
+    "PushNotification",
+    "RemoteTrigger",
+    "ShareOnboardingGuide",
+    // MCP resource + tool-loading surfaces: reading raw MCP resources or
+    // loading deferred tools is a way back to a capability the curated
+    // `mcp__sage__*` allow list does not expose. `ListMcpResourcesTool`
+    // and `ReadMcpResourceTool` carry the `Tool` suffix in the current
+    // reference.
+    "ListMcpResourcesTool",
+    "ReadMcpResourceTool",
+    "ToolSearch",
+    "WaitForMcpServers",
+    // Indirect-execution surfaces: a slash command or a skill can run
+    // shell / arbitrary tools. `SlashCommand` is the legacy alias for the
+    // skill surface; deny both.
+    "Skill",
+    "SlashCommand",
+];
 
 /// Inputs for [`spawn_claude`].
 pub(crate) struct SpawnInputs<'a> {
@@ -75,6 +201,21 @@ fn argv(session_id: &str, identity_path: &str) -> Vec<String> {
         // No `.mcp.json` from disk — sage parses tool_use directly out
         // of the stream, the .mcp.json on disk is a documented stub.
         "--strict-mcp-config".to_string(),
+        // Constrain which on-disk setting tiers load to `local` only —
+        // the scope of the `settings.local.json` sage-install authors
+        // (`local` = `.claude/settings.local.json`, which under the HOME
+        // redirect resolves to sage's authored file). This excludes the
+        // `user` (`~/.claude/settings.json`) and `project`
+        // (`.claude/settings.json`) tiers so a stray file in either —
+        // dropped into the redirected HOME or the project dir — cannot
+        // dilute sage's posture by injecting allow rules or flipping a
+        // permission mode. Managed (system/MDM) and CLI flags always
+        // load regardless of this list, so this only NARROWS the
+        // overridable file surface; it cannot weaken the managed tier.
+        // sage's hooks block has no CLI-flag form, so `local` must stay
+        // in the list for the `astrid-emit` hook wiring to load.
+        "--setting-sources".to_string(),
+        "local".to_string(),
         // Disable every built-in tool. Tool surface is exclusively
         // mcp__sage__* (which sage parses inline; claude only sees the
         // tool names through --append-system-prompt for now).
@@ -82,6 +223,16 @@ fn argv(session_id: &str, identity_path: &str) -> Vec<String> {
         String::new(),
         "--allowed-tools".to_string(),
         "mcp__sage__*".to_string(),
+        // Hoist the deny list into the CLI-args tier. The same names
+        // also ride in `settings.local.json` (the Local tier, fully
+        // session-overridable) as defense-in-depth, but a CLI deny sits
+        // above every on-disk file tier in Claude's precedence
+        // (`Managed > CLI args > Local > Project > User`) — a session
+        // cannot edit a process-argv flag, so this is the binding,
+        // session-un-overridable copy. Bare tool names remove each tool
+        // from the model's context entirely. See [`DENIED_TOOLS`].
+        "--disallowedTools".to_string(),
+        DENIED_TOOLS.join(" "),
         // Permission prompts route through an MCP tool — sage-mcp
         // handles them on the bus.
         "--permission-prompt-tool".to_string(),
@@ -224,6 +375,13 @@ mod tests {
     /// will not be able to distinguish auth modes from this digest
     /// alone — that's by design; `auth_mode` is published alongside
     /// `flags_hash` on `sage.v1.audit.spawn`.
+    ///
+    /// The enforcement flags added to the argv (`--disallowedTools`,
+    /// `--setting-sources`) are likewise built from neither the auth
+    /// mode nor any per-spawn secret, so adding them does not perturb
+    /// this invariant: the digest stays stable across auth modes, only
+    /// its value changed (a deliberate fingerprint update — see
+    /// [`argv_carries_tier_narrowing_enforcement`]).
     #[test]
     fn argv_hash_unchanged_across_auth_modes() {
         let sid = "sid-stable";
@@ -238,5 +396,201 @@ mod tests {
         // twice with the same inputs must produce byte-identical output.
         let args_again = argv(sid, path);
         assert_eq!(args, args_again);
+    }
+
+    /// The argv must carry the two session-un-overridable enforcement
+    /// levers reachable from capsule-space: `--disallowedTools` (the deny
+    /// list hoisted into the binding CLI tier) and `--setting-sources
+    /// local` (on-disk tier narrowing). Both ride above every on-disk
+    /// file tier in Claude's precedence, so a running session cannot edit
+    /// them away. Dropping either silently regresses enforcement back to
+    /// the fully session-overridable `settings.local.json` posture, so
+    /// pin their presence.
+    #[test]
+    fn argv_carries_tier_narrowing_enforcement() {
+        let args = argv("sid", "home://.claude/.sage-identity-sid");
+
+        // `--setting-sources local`: the value must be exactly `local`
+        // (the scope of sage's authored settings.local.json). `user` or
+        // `project` would either drop sage's own hook wiring or readmit a
+        // stray settings file — both regressions.
+        let ss = args
+            .iter()
+            .position(|a| a == "--setting-sources")
+            .expect("argv must pass --setting-sources to narrow on-disk tiers");
+        assert_eq!(
+            args.get(ss + 1).map(String::as_str),
+            Some("local"),
+            "--setting-sources must be `local` — the scope of sage's settings.local.json",
+        );
+
+        // `--disallowedTools`: the deny list rides the CLI tier. The
+        // value is the space-joined DENIED_TOOLS list, so a session
+        // cannot override it from any on-disk file.
+        let dt = args
+            .iter()
+            .position(|a| a == "--disallowedTools")
+            .expect("argv must pass --disallowedTools to bind the deny list");
+        let joined = args
+            .get(dt + 1)
+            .expect("--disallowedTools must carry a value");
+        assert_eq!(joined, &DENIED_TOOLS.join(" "));
+        // Spot-check the load-bearing escape tools are individually
+        // present in the rendered BINDING value. These are the names a
+        // capable session would reach for to break out of the
+        // `mcp__sage__*` sandbox — `Agent`/`Workflow` (sub-agent spawn,
+        // the highest-value escape), `PowerShell`/`Monitor` (Bash-
+        // equivalent shells the plain `Bash` deny does not cover),
+        // `ListMcpResourcesTool`/`ReadMcpResourceTool` (raw MCP resource
+        // reads around the curated allow list) — alongside the original
+        // action surface. A deny that lands only in the overridable
+        // `settings.local.json` (REQUIRED_DENIES) but not here is NOT
+        // binding, so pin each one in argv.
+        for tool in [
+            "Bash",
+            "PowerShell",
+            "Read",
+            "Write",
+            "Edit",
+            "WebFetch",
+            "Task",
+            "Agent",
+            "Workflow",
+            "Monitor",
+            "ListMcpResourcesTool",
+            "ReadMcpResourceTool",
+        ] {
+            assert!(
+                joined.split(' ').any(|t| t == tool),
+                "deny list must include {tool}",
+            );
+        }
+    }
+
+    /// `DENIED_TOOLS` mirrors `sage_install::layout::REQUIRED_DENIES`
+    /// across a crate boundary with no dependency edge. Guard the local
+    /// copy's shape so an accidental trim is caught here: every entry is
+    /// a bare tool name (no scope qualifier — a bare name removes the
+    /// tool from context, a scoped rule like `Bash(rm *)` would only
+    /// deny matching calls and leave the tool reachable), and there are
+    /// no duplicates. The exhaustiveness contract itself is asserted in
+    /// sage-install's tests against the settings.local.json deny array.
+    #[test]
+    fn denied_tools_are_bare_unscoped_names() {
+        let mut seen = std::collections::HashSet::new();
+        for t in DENIED_TOOLS {
+            assert!(
+                !t.contains('(') && !t.contains(' ') && !t.is_empty(),
+                "{t} must be a bare unscoped tool name",
+            );
+            assert!(seen.insert(*t), "{t} is duplicated in DENIED_TOOLS");
+        }
+    }
+
+    /// Drift guard for the cross-crate mirror with
+    /// `sage_install::layout::REQUIRED_DENIES`.
+    ///
+    /// No dependency edge exists between the two crates (each is a
+    /// `cdylib`-only workspace member, so neither can import the other's
+    /// const as a library), so the lists cannot be `assert_eq!`d
+    /// directly. Instead this test pins `DENIED_TOOLS` against a FULL,
+    /// independently-written canonical set — the exhaustive headless deny
+    /// surface. This is deliberately stronger than a count anchor: a count
+    /// check passes whenever the two lists merely have the same length,
+    /// so swapping one tool for another (same count, different members)
+    /// would slip through. Comparing the whole set catches additions,
+    /// removals, AND substitutions.
+    ///
+    /// The matching guard on the other side of the mirror lives in
+    /// sage-install's `assert_headless_shape`, which asserts every
+    /// `REQUIRED_DENIES` member appears in the authored `settings.local.json`
+    /// deny array and that the array length equals `REQUIRED_DENIES.len()`.
+    /// Together the two guards anchor both copies to the same canonical
+    /// surface: a name added to or dropped from either list, without the
+    /// mirror edit, fails the build on at least one side.
+    ///
+    /// SYNC: when you add/remove a denied tool, update this canonical set
+    /// AND `REQUIRED_DENIES` (sage-install/src/layout.rs) in lockstep.
+    #[test]
+    fn denied_tools_equal_canonical_required_denies() {
+        // The canonical headless deny surface — every built-in Claude tool
+        // that must be blocked so `mcp__sage__*` is the SOLE reachable
+        // surface. Independently written (not derived from DENIED_TOOLS) so
+        // it is a genuine cross-check, not a tautology. MUST match
+        // `sage_install::layout::REQUIRED_DENIES` exactly.
+        const CANONICAL: &[&str] = &[
+            "Bash",
+            "PowerShell",
+            "Read",
+            "Write",
+            "Edit",
+            "NotebookEdit",
+            "WebFetch",
+            "WebSearch",
+            "Glob",
+            "Grep",
+            "LSP",
+            "Monitor",
+            "Agent",
+            "Task",
+            "Workflow",
+            "SendMessage",
+            "TeamCreate",
+            "TeamDelete",
+            "CronCreate",
+            "CronDelete",
+            "CronList",
+            "ScheduleWakeup",
+            "EnterPlanMode",
+            "ExitPlanMode",
+            "EnterWorktree",
+            "ExitWorktree",
+            "TaskCreate",
+            "TaskGet",
+            "TaskList",
+            "TaskStop",
+            "TaskUpdate",
+            "TaskOutput",
+            "TodoWrite",
+            "PushNotification",
+            "RemoteTrigger",
+            "ShareOnboardingGuide",
+            "ListMcpResourcesTool",
+            "ReadMcpResourceTool",
+            "ToolSearch",
+            "WaitForMcpServers",
+            "Skill",
+            "SlashCommand",
+            "MultiEdit",
+            "BashOutput",
+            "KillShell",
+        ];
+
+        // Compare as sets so a pure reordering of either list (which has no
+        // semantic effect — `--disallowedTools` is order-insensitive) does
+        // not spuriously fail, while any membership difference (add, drop,
+        // or substitute) does.
+        let actual: std::collections::BTreeSet<&str> = DENIED_TOOLS.iter().copied().collect();
+        let canonical: std::collections::BTreeSet<&str> = CANONICAL.iter().copied().collect();
+
+        // Surface the exact drift on failure so the fix is obvious.
+        let missing: Vec<&str> = canonical.difference(&actual).copied().collect();
+        let unexpected: Vec<&str> = actual.difference(&canonical).copied().collect();
+        assert!(
+            missing.is_empty() && unexpected.is_empty(),
+            "DENIED_TOOLS drifted from the canonical REQUIRED_DENIES mirror.\n  \
+             missing from DENIED_TOOLS (denied only in the overridable Local tier, \
+             NOT in the binding CLI tier): {missing:?}\n  \
+             unexpected in DENIED_TOOLS (not in canonical set): {unexpected:?}\n  \
+             re-sync DENIED_TOOLS with sage_install::layout::REQUIRED_DENIES.",
+        );
+
+        // Belt-and-braces: no duplicate collapsed the set below the list
+        // length, which would mask a drift behind an equal-set comparison.
+        assert_eq!(
+            actual.len(),
+            DENIED_TOOLS.len(),
+            "DENIED_TOOLS contains a duplicate entry",
+        );
     }
 }
