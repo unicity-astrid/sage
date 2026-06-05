@@ -86,20 +86,42 @@ pub(crate) fn sanitize_principal_id(id: &str) -> Result<String, SysError> {
 }
 
 /// Source-of-truth deny list for the headless mode — every built-in
-/// Claude tool that must be blocked so the `mcp__sage__*` sandbox holds.
+/// Claude tool that must be blocked so `mcp__sage__*` is the SOLE tool
+/// surface. The rule is exhaustive by design: any built-in that can act
+/// (file/shell/web/task), surface other tools, or drive control flow
+/// outside the MCP surface is denied, so a session cannot reach around
+/// the sandbox via a tool the list forgot.
+///
 /// Public so tests in this module can both assert presence in the JSON
 /// and use it as a parameterised fixture.
 const REQUIRED_DENIES: &[&str] = &[
+    // File / shell / web / task — the original action surface.
     "Bash",
     "Read",
     "Write",
     "Edit",
+    "MultiEdit",
+    "NotebookEdit",
     "WebFetch",
     "WebSearch",
     "Glob",
     "Grep",
     "Task",
-    "NotebookEdit",
+    // Background-shell control: `Bash` is denied, but these address shells
+    // by id and must not remain reachable on their own.
+    "BashOutput",
+    "KillShell",
+    // Indirect-execution surfaces: a slash command or a skill can run
+    // shell / arbitrary tools, and tool-search can load deferred tools —
+    // each is a way back to a denied capability.
+    "SlashCommand",
+    "Skill",
+    "ToolSearch",
+    // Control / internal tools: harmless individually, denied to keep the
+    // invariant clean — `mcp__sage__*` is the only surface a session sees.
+    "TodoWrite",
+    "WaitForMcpServers",
+    "ExitPlanMode",
 ];
 
 /// The six hook events sage declares in `settings.local.json`. Each
