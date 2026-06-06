@@ -47,7 +47,14 @@ const TOKEN_BYTES: usize = 32;
 /// `sage.v1.hook.<name>` topic tail) to the topic the
 /// validator republishes on after a successful token match.
 ///
-/// Five entries map to canonical Astrid `hook.v1.event.<name>` topics.
+/// Ten entries map to canonical Astrid `hook.v1.event.<name>` topics —
+/// the session lifecycle (`session_start` / `session_end`), the prompt
+/// and tool-call turns (`message_received` / `before_tool_call` /
+/// `after_tool_call` / `message_sent`), the subagent lifecycle
+/// (`subagent_start` / `subagent_stop`), and the compaction window
+/// (`on_compaction_started` / `on_compaction_completed`). Every tail
+/// resolves to a name the hook-bridge capsule already defines, so this
+/// table widens without any cross-capsule contract change.
 /// `notification` has no canonical equivalent yet — sage republishes
 /// it on the sage-namespaced `sage.v1.notification` instead.
 ///
@@ -56,11 +63,22 @@ const TOKEN_BYTES: usize = 32;
 /// run-loop validator agree on the topic alphabet from a single
 /// source of truth.
 pub(crate) const HOOK_TOPIC_MAP: &[(&str, &str)] = &[
+    ("session_start", "hook.v1.event.session_start"),
+    ("session_end", "hook.v1.event.session_end"),
+    ("message_received", "hook.v1.event.message_received"),
     ("before_tool_call", "hook.v1.event.before_tool_call"),
     ("after_tool_call", "hook.v1.event.after_tool_call"),
-    ("message_received", "hook.v1.event.message_received"),
-    ("session_end", "hook.v1.event.session_end"),
+    ("message_sent", "hook.v1.event.message_sent"),
+    ("subagent_start", "hook.v1.event.subagent_start"),
     ("subagent_stop", "hook.v1.event.subagent_stop"),
+    (
+        "on_compaction_started",
+        "hook.v1.event.on_compaction_started",
+    ),
+    (
+        "on_compaction_completed",
+        "hook.v1.event.on_compaction_completed",
+    ),
     ("notification", "sage.v1.notification"),
 ];
 

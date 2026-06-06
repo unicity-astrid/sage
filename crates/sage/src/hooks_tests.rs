@@ -41,15 +41,20 @@ fn tokens_match_length_mismatch_false() {
 }
 
 #[test]
-fn topic_map_contains_all_six_hooks() {
+fn topic_map_contains_all_known_hooks() {
     let names: Vec<&str> = HOOK_TOPIC_MAP.iter().map(|(n, _)| *n).collect();
+    assert!(names.contains(&"session_start"));
+    assert!(names.contains(&"session_end"));
+    assert!(names.contains(&"message_received"));
     assert!(names.contains(&"before_tool_call"));
     assert!(names.contains(&"after_tool_call"));
-    assert!(names.contains(&"message_received"));
-    assert!(names.contains(&"session_end"));
+    assert!(names.contains(&"message_sent"));
+    assert!(names.contains(&"subagent_start"));
     assert!(names.contains(&"subagent_stop"));
+    assert!(names.contains(&"on_compaction_started"));
+    assert!(names.contains(&"on_compaction_completed"));
     assert!(names.contains(&"notification"));
-    assert_eq!(names.len(), 6);
+    assert_eq!(names.len(), 11);
 }
 
 #[test]
@@ -78,12 +83,36 @@ fn topic_map_canonical_entries_use_hook_v1_event_prefix() {
 #[test]
 fn canonical_topic_for_resolves_all_known_hooks() {
     assert_eq!(
+        canonical_topic_for("session_start"),
+        Some("hook.v1.event.session_start")
+    );
+    assert_eq!(
+        canonical_topic_for("session_end"),
+        Some("hook.v1.event.session_end")
+    );
+    assert_eq!(
         canonical_topic_for("before_tool_call"),
         Some("hook.v1.event.before_tool_call")
     );
     assert_eq!(
         canonical_topic_for("after_tool_call"),
         Some("hook.v1.event.after_tool_call")
+    );
+    assert_eq!(
+        canonical_topic_for("message_sent"),
+        Some("hook.v1.event.message_sent")
+    );
+    assert_eq!(
+        canonical_topic_for("subagent_start"),
+        Some("hook.v1.event.subagent_start")
+    );
+    assert_eq!(
+        canonical_topic_for("on_compaction_started"),
+        Some("hook.v1.event.on_compaction_started")
+    );
+    assert_eq!(
+        canonical_topic_for("on_compaction_completed"),
+        Some("hook.v1.event.on_compaction_completed")
     );
     assert_eq!(
         canonical_topic_for("notification"),
@@ -414,11 +443,22 @@ fn topic_map_matches_documented_sage_install_alphabet() {
     // table when emitting hook command strings, and the resulting
     // settings.local.json should be deterministic across runs.
     let expected = [
+        ("session_start", "hook.v1.event.session_start"),
+        ("session_end", "hook.v1.event.session_end"),
+        ("message_received", "hook.v1.event.message_received"),
         ("before_tool_call", "hook.v1.event.before_tool_call"),
         ("after_tool_call", "hook.v1.event.after_tool_call"),
-        ("message_received", "hook.v1.event.message_received"),
-        ("session_end", "hook.v1.event.session_end"),
+        ("message_sent", "hook.v1.event.message_sent"),
+        ("subagent_start", "hook.v1.event.subagent_start"),
         ("subagent_stop", "hook.v1.event.subagent_stop"),
+        (
+            "on_compaction_started",
+            "hook.v1.event.on_compaction_started",
+        ),
+        (
+            "on_compaction_completed",
+            "hook.v1.event.on_compaction_completed",
+        ),
         ("notification", "sage.v1.notification"),
     ];
     assert_eq!(HOOK_TOPIC_MAP, &expected);

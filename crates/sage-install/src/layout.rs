@@ -201,19 +201,33 @@ const REQUIRED_DENIES: &[&str] = &[
     "KillShell",
 ];
 
-/// The six hook events sage declares in `settings.local.json`. Each
+/// The Claude hook events sage declares in `settings.local.json`. Each
 /// event is wired through the `astrid-emit` native helper, which
 /// publishes the Claude-side hook payload on the sage-namespaced
 /// `sage.v1.hook.*` topic so sage's run-loop validator can
 /// authenticate the spawn-token and republish on the canonical
 /// `hook.v1.event.*` (or sage-namespaced `sage.v1.notification`) topic.
 /// See [`HOOK_TOPIC_MAP`] for the per-event topic.
+///
+/// The set spans Claude's session lifecycle (start/end), the prompt and
+/// tool-call turns, the subagent lifecycle (start/stop), and the
+/// compaction window (pre/post). Every canonical target already exists
+/// in the hook-bridge event vocabulary, so this set widens with no
+/// cross-capsule contract change. Events Claude reports as semantically
+/// distinct are kept distinct: `Stop` is a per-turn "assistant message
+/// sent" signal, NOT session end — `SessionEnd` is the real session
+/// terminator (see [`HOOK_TOPIC_MAP`]).
 const HOOK_EVENTS: &[&str] = &[
+    "SessionStart",
+    "SessionEnd",
+    "UserPromptSubmit",
     "PreToolUse",
     "PostToolUse",
-    "UserPromptSubmit",
     "Stop",
+    "SubagentStart",
     "SubagentStop",
+    "PreCompact",
+    "PostCompact",
     "Notification",
 ];
 
@@ -226,19 +240,27 @@ const HOOK_EVENTS: &[&str] = &[
 /// topic (or `sage.v1.notification` for the one event without a
 /// canonical equivalent today).
 ///
+/// Semantic care: Claude's `Stop` fires at the end of every response
+/// turn (the assistant message was sent), so it maps to `message_sent`,
+/// NOT `session_end`. `SessionEnd` — which fires once when the session
+/// actually terminates — is what carries `session_end`. Conflating the
+/// two would make any session-lifecycle subscriber fire on every turn.
+///
 /// SYNC: keep aligned with sage::hooks::HOOK_TOPIC_MAP (sage/src/hooks.rs).
 /// sage-install cannot import from the sage crate (separate workspace
 /// crate, no dependency edge), so the table is mirrored here. Any edit
-/// to one side must mirror to the other.
+/// to one side must mirror to the other. Order must match HOOK_EVENTS.
 const HOOK_TOPIC_MAP: &[(&str, &str)] = &[
+    ("SessionStart", "sage.v1.hook.session_start"),
+    ("SessionEnd", "sage.v1.hook.session_end"),
+    ("UserPromptSubmit", "sage.v1.hook.message_received"),
     ("PreToolUse", "sage.v1.hook.before_tool_call"),
     ("PostToolUse", "sage.v1.hook.after_tool_call"),
-    (
-        "UserPromptSubmit",
-        "sage.v1.hook.message_received",
-    ),
-    ("Stop", "sage.v1.hook.session_end"),
+    ("Stop", "sage.v1.hook.message_sent"),
+    ("SubagentStart", "sage.v1.hook.subagent_start"),
     ("SubagentStop", "sage.v1.hook.subagent_stop"),
+    ("PreCompact", "sage.v1.hook.on_compaction_started"),
+    ("PostCompact", "sage.v1.hook.on_compaction_completed"),
     ("Notification", "sage.v1.hook.notification"),
 ];
 
