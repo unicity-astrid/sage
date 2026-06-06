@@ -87,6 +87,7 @@
 //! instead.
 
 mod atomic;
+mod claude_md;
 mod config;
 mod layout;
 mod settings;
@@ -355,6 +356,7 @@ fn run_install(req: &InstallRequest, cfg: PrincipalConfig) -> Result<String, Sys
     // next *successful* run.
     atomic::cleanup_temp(&layout::settings_path());
     atomic::cleanup_temp(&layout::mcp_path());
+    atomic::cleanup_temp(&claude_md::claude_md_path());
 
     // Run the remaining steps. On error, scrub temp siblings of the two
     // known files and propagate; the outer handler publishes the failure
@@ -413,6 +415,7 @@ fn run_relink(req: &RelinkRequest, cfg: PrincipalConfig) -> Result<String, SysEr
     // because cleanup_temp only matches the `.<basename>.tmp.` prefix.
     atomic::cleanup_temp(&layout::settings_path());
     atomic::cleanup_temp(&layout::mcp_path());
+    atomic::cleanup_temp(&claude_md::claude_md_path());
 
     if let Err(e) = write_configs(&sanitized, &cfg) {
         atomic::cleanup_temp(&layout::settings_path());
@@ -438,6 +441,8 @@ fn write_configs(sanitized_id: &str, cfg: &PrincipalConfig) -> Result<(), SysErr
     settings::write_settings(cfg)?;
     publish_status(sanitized_id, "write_mcp", "writing .mcp.json stub");
     settings::write_mcp(cfg)?;
+    publish_status(sanitized_id, "write_claude_md", "writing CLAUDE.md");
+    settings::write_claude_md(cfg)?;
     Ok(())
 }
 

@@ -4,7 +4,7 @@
 
 use astrid_sdk::prelude::*;
 
-use crate::{atomic, config::PrincipalConfig, layout};
+use crate::{atomic, claude_md, config::PrincipalConfig, layout};
 
 /// Write the `.claude/settings.local.json` for the invoking principal,
 /// shaped by `cfg` (interaction × auth axes — see
@@ -28,4 +28,14 @@ pub(crate) fn write_mcp(cfg: &PrincipalConfig) -> Result<(), SysError> {
     let path = layout::mcp_path();
     let body = serde_json::to_vec_pretty(&layout::mcp_json(cfg))?;
     atomic::write_atomic(&path, &body)
+}
+
+/// Write the `.claude/CLAUDE.md` for the invoking principal — the
+/// standalone Astrid grounding (what Astrid OS is and the role it runs
+/// the agent in), branched on interaction mode. User-tier memory Claude
+/// loads every session; authored as plain UTF-8 markdown through
+/// [`crate::atomic::write_atomic`].
+pub(crate) fn write_claude_md(cfg: &PrincipalConfig) -> Result<(), SysError> {
+    let path = claude_md::claude_md_path();
+    atomic::write_atomic(&path, claude_md::claude_md(cfg).as_bytes())
 }
