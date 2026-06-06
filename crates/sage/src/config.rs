@@ -31,7 +31,10 @@ use serde::{Deserialize, Serialize};
 pub(crate) const KV_KEY: &str = "sage.principal.config";
 
 /// Current schema version. Bump only when the wire shape changes.
-pub(crate) const SCHEMA_VERSION: u32 = 1;
+/// v2 added the `model` + `max_turns` governance fields (both additive
+/// with `#[serde(default)]`, so v1 records migrate forward by filling
+/// the fail-secure defaults — see [`classify`]).
+pub(crate) const SCHEMA_VERSION: u32 = 2;
 
 /// How users drive `claude` in this principal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -66,16 +69,46 @@ pub enum AuthMode {
     Subscription,
 }
 
+/// Which Anthropic model tier `claude` runs under for this principal.
+/// Astrid governance lever: an operator pins a principal to a tier.
+/// `Default` omits `--model` entirely (claude uses its configured
+/// default); the others map to the stable CLI aliases.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelPreference {
+    /// Don't pass `--model`; claude picks its own default. Fail-open by
+    /// design — absence of a governance choice must not break spawns.
+    #[default]
+    Default,
+    Opus,
+    Sonnet,
+    Haiku,
+}
+
+impl ModelPreference {
+    /// The `--model` CLI alias, or `None` for [`ModelPreference::Default`]
+    /// (which omits the flag). A closed alias set keeps an operator-set
+    /// value from ever reaching argv as an unvalidated string.
+    pub(crate) fn cli_alias(self) -> Option<&'static str> {
+        match self {
+            ModelPreference::Default => None,
+            ModelPreference::Opus => Some("opus"),
+            ModelPreference::Sonnet => Some("sonnet"),
+            ModelPreference::Haiku => Some("haiku"),
+        }
+    }
+}
+
 /// Per-principal sage runtime configuration. Written by sage's install
 /// hook on first run, by `handle_settings_set` thereafter. Read by
 /// `handle_spawn` at the top of the spawn pipeline. Crate-private so
 /// the canonical record never leaks across the capsule boundary.
 ///
 /// Wire shape is intentionally mirrored byte-for-byte with the
-/// `sage-install` crate's [`PrincipalConfig`] copy: all three fields
+/// `sage-install` crate's [`PrincipalConfig`] copy: all five fields
 /// carry `#[serde(default)]` so an empty `{}` envelope round-trips on
 /// both ends. The canonical fully-populated payload is asserted by the
-/// `WIRE_FORMAT_V1` test constant in both crates — keep the two
+/// `WIRE_FORMAT_V2` test constant in both crates — keep the two
 /// literals identical when bumping the schema.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct PrincipalConfig {
@@ -85,6 +118,17 @@ pub(crate) struct PrincipalConfig {
     /// Auth mode (see [`AuthMode`]).
     #[serde(default)]
     pub(crate) auth_mode: AuthMode,
+    /// Model tier `claude` runs under (see [`ModelPreference`]). Astrid
+    /// governance: pin a principal to a tier. Defaults to `Default`
+    /// (claude's own model, no `--model` flag), so an empty `{}` and
+    /// every pre-v2 record resolve fail-open to claude's default.
+    #[serde(default)]
+    pub(crate) model: ModelPreference,
+    /// Optional cap on claude's agentic turns per session, threaded to
+    /// `--max-turns`. `None` (the default) leaves it uncapped. Astrid
+    /// governance: bound a principal's per-session work.
+    #[serde(default)]
+    pub(crate) max_turns: Option<u32>,
     /// Schema version. Always [`SCHEMA_VERSION`] for records written by
     /// this version of sage.
     #[serde(default = "default_schema_version")]
@@ -104,6 +148,8 @@ impl Default for PrincipalConfig {
         Self {
             interaction_mode: InteractionMode::default(),
             auth_mode: AuthMode::default(),
+            model: ModelPreference::default(),
+            max_turns: None,
             schema_version: SCHEMA_VERSION,
         }
     }
@@ -126,6 +172,11 @@ impl PrincipalConfig {
                 "unsupported schema_version: got {}, supported {}",
                 self.schema_version, SCHEMA_VERSION
             )));
+        }
+        if self.max_turns == Some(0) {
+            return Err(SysError::ApiError(
+                "max_turns must be >= 1 when set; 0 would forbid all work".to_string(),
+            ));
         }
         Ok(())
     }
@@ -310,6 +361,8 @@ mod tests {
         let cfg = PrincipalConfig {
             interaction_mode: InteractionMode::Repl,
             auth_mode: AuthMode::Subscription,
+            model: ModelPreference::default(),
+            max_turns: None,
             schema_version: SCHEMA_VERSION,
         };
         let json = serde_json::to_string(&cfg).unwrap();
@@ -322,6 +375,8 @@ mod tests {
         let cfg = PrincipalConfig {
             interaction_mode: InteractionMode::Headless,
             auth_mode: AuthMode::Subscription,
+            model: ModelPreference::default(),
+            max_turns: None,
             schema_version: SCHEMA_VERSION,
         };
         let json = serde_json::to_string(&cfg).unwrap();
@@ -338,6 +393,8 @@ mod tests {
         let cfg = PrincipalConfig {
             interaction_mode: InteractionMode::Headless,
             auth_mode: AuthMode::ApiKey,
+            model: ModelPreference::default(),
+            max_turns: None,
             schema_version: u32::MAX,
         };
         assert!(cfg.validate().is_err());
@@ -368,6 +425,8 @@ mod tests {
             PrincipalConfig {
                 interaction_mode: patch_interaction.unwrap_or(current.interaction_mode),
                 auth_mode: patch_auth.unwrap_or(current.auth_mode),
+                model: ModelPreference::default(),
+                max_turns: None,
                 schema_version: SCHEMA_VERSION,
             }
         }
@@ -375,6 +434,8 @@ mod tests {
         let current = PrincipalConfig {
             interaction_mode: InteractionMode::Repl,
             auth_mode: AuthMode::ApiKey,
+            model: ModelPreference::default(),
+            max_turns: None,
             schema_version: SCHEMA_VERSION,
         };
 
@@ -447,30 +508,29 @@ mod tests {
         assert_eq!(cfg, PrincipalConfig::default());
     }
 
-    /// Canonical fully-populated wire payload for schema_version=1. The
+    /// Canonical fully-populated wire payload for schema_version=2. The
     /// `sage-install` crate's test module declares an identical literal
     /// — keep the two strings byte-for-byte equal. Bump alongside
     /// `SCHEMA_VERSION` when the wire shape changes.
-    const WIRE_FORMAT_V1: &str =
-        r#"{"interaction_mode":"headless","auth_mode":"api_key","schema_version":1}"#;
+    const WIRE_FORMAT_V2: &str = r#"{"interaction_mode":"headless","auth_mode":"api_key","model":"default","max_turns":null,"schema_version":2}"#;
 
     #[test]
-    fn default_serializes_to_wire_format_v1() {
+    fn default_serializes_to_wire_format_v2() {
         // Locks the canonical serialize output for the default record.
         // Field-order matters: serde emits struct fields in declaration
         // order, so the literal must follow the source order
-        // (interaction_mode, auth_mode, schema_version).
+        // (interaction_mode, auth_mode, model, max_turns, schema_version).
         let json = serde_json::to_string(&PrincipalConfig::default()).unwrap();
-        assert_eq!(json, WIRE_FORMAT_V1);
+        assert_eq!(json, WIRE_FORMAT_V2);
     }
 
     #[test]
-    fn wire_format_v1_round_trips_to_default() {
+    fn wire_format_v2_round_trips_to_default() {
         // Reciprocal: the canonical literal deserializes to the default
-        // record. Combined with `default_serializes_to_wire_format_v1`,
+        // record. Combined with `default_serializes_to_wire_format_v2`,
         // this pins the contract on both sides — any drift in field
         // names, ordering, or enum variants breaks one of the two.
-        let cfg: PrincipalConfig = serde_json::from_str(WIRE_FORMAT_V1).unwrap();
+        let cfg: PrincipalConfig = serde_json::from_str(WIRE_FORMAT_V2).unwrap();
         assert_eq!(cfg, PrincipalConfig::default());
     }
 
@@ -501,6 +561,8 @@ mod tests {
         let older = PrincipalConfig {
             interaction_mode: InteractionMode::Repl,
             auth_mode: AuthMode::Subscription,
+            model: ModelPreference::default(),
+            max_turns: None,
             schema_version: 0,
         };
         match classify(older) {
@@ -535,6 +597,8 @@ mod tests {
         let older = PrincipalConfig {
             interaction_mode: InteractionMode::Repl,
             auth_mode: AuthMode::Subscription,
+            model: ModelPreference::default(),
+            max_turns: None,
             schema_version: 0,
         };
         let patched = match classify(older) {
@@ -567,6 +631,8 @@ mod tests {
         let newer = PrincipalConfig {
             interaction_mode: InteractionMode::Headless,
             auth_mode: AuthMode::ApiKey,
+            model: ModelPreference::default(),
+            max_turns: None,
             schema_version: u32::MAX,
         };
         assert_eq!(classify(newer), LoadOutcome::Unknown(u32::MAX));
@@ -587,6 +653,8 @@ mod tests {
         let persisted_future = PrincipalConfig {
             interaction_mode: InteractionMode::Repl,
             auth_mode: AuthMode::Subscription,
+            model: ModelPreference::default(),
+            max_turns: None,
             schema_version: u32::MAX,
         };
         match classify(persisted_future) {

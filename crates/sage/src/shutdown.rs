@@ -433,6 +433,8 @@ fn respawn_one(
         identity_path: &identity_path,
         api_key: api_key.as_deref(),
         hook_token: &hook_token,
+        model: cfg.model,
+        max_turns: cfg.max_turns,
     })?;
 
     let now_ms = match time::now() {

@@ -173,6 +173,14 @@ pub(crate) struct SpawnInputs<'a> {
     /// ([`argv_hash_unchanged_across_auth_modes`]) requires argv stay
     /// independent of per-spawn secrets.
     pub hook_token: &'a str,
+    /// Model tier to run claude under (Astrid per-principal governance).
+    /// `Default` omits `--model`; the rest pass the CLI alias. Argv-
+    /// visible (and so in the `flags_hash`) by design — governance should
+    /// be auditable, unlike the per-spawn secret in `hook_token`.
+    pub model: crate::config::ModelPreference,
+    /// Optional per-session agentic-turn cap (Astrid governance).
+    /// `Some(n)` adds `--max-turns n`; `None` omits it. Argv-visible.
+    pub max_turns: Option<u32>,
 }
 
 /// Outcome of a successful spawn — the live process plus the audit
@@ -190,8 +198,13 @@ pub(crate) struct Spawned {
 }
 
 /// Build the hardened argv for `claude -p`.
-fn argv(session_id: &str, identity_path: &str) -> Vec<String> {
-    vec![
+fn argv(
+    session_id: &str,
+    identity_path: &str,
+    model: crate::config::ModelPreference,
+    max_turns: Option<u32>,
+) -> Vec<String> {
+    let mut args = vec![
         "-p".to_string(),
         "--input-format".to_string(),
         "stream-json".to_string(),
@@ -244,7 +257,22 @@ fn argv(session_id: &str, identity_path: &str) -> Vec<String> {
         identity_path.to_string(),
         "--session-id".to_string(),
         session_id.to_string(),
-    ]
+    ];
+    // Astrid per-principal governance, appended at a fixed position so
+    // the argv stays deterministic for the `flags_hash` fingerprint.
+    // Argv-visible by design — governance should be auditable, unlike the
+    // per-spawn secret in `hook_token` which must never reach argv. When
+    // both are at their defaults (`Default` model, `None` turns) NO flags
+    // are added, so the argv is byte-identical to the pre-governance form.
+    if let Some(alias) = model.cli_alias() {
+        args.push("--model".to_string());
+        args.push(alias.to_string());
+    }
+    if let Some(turns) = max_turns {
+        args.push("--max-turns".to_string());
+        args.push(turns.to_string());
+    }
+    args
 }
 
 /// Construct + spawn the `claude -p` background process. Returns a live
@@ -260,7 +288,12 @@ pub(crate) fn spawn_claude(inputs: &SpawnInputs<'_>) -> Result<Spawned, SysError
     crate::validate_id("principal_id", inputs.principal_id)?;
     crate::validate_id("session_id", inputs.session_id)?;
 
-    let args = argv(inputs.session_id, inputs.identity_path);
+    let args = argv(
+        inputs.session_id,
+        inputs.identity_path,
+        inputs.model,
+        inputs.max_turns,
+    );
 
     // Build the command. ANTHROPIC_API_KEY is conditional on auth_mode:
     // when the caller supplies `Some(key)` (api_key mode) we thread it
@@ -386,7 +419,7 @@ mod tests {
     fn argv_hash_unchanged_across_auth_modes() {
         let sid = "sid-stable";
         let path = "home://.claude/.sage-identity-sid-stable";
-        let args = argv(sid, path);
+        let args = argv(sid, path, crate::config::ModelPreference::Default, None);
         let hash_api_key = argv_hash(&args);
         let hash_subscription = argv_hash(&args);
         assert_eq!(hash_api_key, hash_subscription);
@@ -394,8 +427,37 @@ mod tests {
         // Belt-and-braces: also confirm that the argv builder itself is
         // not silently branching on something out-of-band — calling it
         // twice with the same inputs must produce byte-identical output.
-        let args_again = argv(sid, path);
+        let args_again = argv(sid, path, crate::config::ModelPreference::Default, None);
         assert_eq!(args, args_again);
+    }
+
+    /// Per-principal governance: a non-default model tier and a turn cap
+    /// append `--model <alias>` and `--max-turns <n>`; the defaults
+    /// (`Default` model, `None` turns) append neither, so the governed
+    /// argv is a strict superset (appended suffix) of the ungoverned one
+    /// and the `flags_hash` fingerprint differs — governance is auditable.
+    #[test]
+    fn argv_carries_governance_when_set() {
+        use crate::config::ModelPreference;
+        let base = argv("sid", "id", ModelPreference::Default, None);
+        assert!(!base.iter().any(|a| a == "--model"));
+        assert!(!base.iter().any(|a| a == "--max-turns"));
+
+        let governed = argv("sid", "id", ModelPreference::Opus, Some(20));
+        let mi = governed
+            .iter()
+            .position(|a| a == "--model")
+            .expect("--model present");
+        assert_eq!(governed[mi + 1], "opus");
+        let ti = governed
+            .iter()
+            .position(|a| a == "--max-turns")
+            .expect("--max-turns present");
+        assert_eq!(governed[ti + 1], "20");
+
+        assert_ne!(argv_hash(&base), argv_hash(&governed));
+        // Governance flags are appended, so base is a prefix of governed.
+        assert_eq!(&governed[..base.len()], &base[..]);
     }
 
     /// The argv must carry the two session-un-overridable enforcement
@@ -408,7 +470,12 @@ mod tests {
     /// pin their presence.
     #[test]
     fn argv_carries_tier_narrowing_enforcement() {
-        let args = argv("sid", "home://.claude/.sage-identity-sid");
+        let args = argv(
+            "sid",
+            "home://.claude/.sage-identity-sid",
+            crate::config::ModelPreference::Default,
+            None,
+        );
 
         // `--setting-sources local`: the value must be exactly `local`
         // (the scope of sage's authored settings.local.json). `user` or

@@ -540,7 +540,7 @@ mod tests {
         PrincipalConfig {
             interaction_mode: im,
             auth_mode: am,
-            schema_version: PrincipalConfig::SCHEMA_VERSION,
+            ..PrincipalConfig::default()
         }
     }
 

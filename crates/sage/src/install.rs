@@ -82,6 +82,10 @@ pub(crate) fn run() -> Result<(), SysError> {
     let cfg = config::PrincipalConfig {
         interaction_mode,
         auth_mode,
+        // Governance fields are not part of the install envelope; they
+        // default at install and are set later via settings.set.
+        model: config::ModelPreference::default(),
+        max_turns: None,
         schema_version: config::SCHEMA_VERSION,
     };
     cfg.validate()?;

@@ -128,6 +128,8 @@ pub(crate) fn apply(req: SettingsSetRequest) -> Result<(), SysError> {
             .interaction_mode
             .unwrap_or(previous.interaction_mode),
         auth_mode: req.auth_mode.unwrap_or(previous.auth_mode),
+        model: req.model.unwrap_or(previous.model),
+        max_turns: req.max_turns.or(previous.max_turns),
         schema_version: config::SCHEMA_VERSION,
     };
 

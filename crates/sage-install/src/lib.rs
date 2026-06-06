@@ -600,7 +600,17 @@ mod tests {
         );
         assert_eq!(
             v.pointer("/config/schema_version").and_then(|x| x.as_u64()),
-            Some(1)
+            Some(u64::from(PrincipalConfig::SCHEMA_VERSION))
+        );
+        assert_eq!(
+            v.pointer("/config/model").and_then(|x| x.as_str()),
+            Some("default")
+        );
+        assert!(
+            v.pointer("/config/max_turns")
+                .map(serde_json::Value::is_null)
+                .unwrap_or(false),
+            "default max_turns echoes as JSON null"
         );
     }
 }

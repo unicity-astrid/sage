@@ -219,11 +219,11 @@ pub struct SendRequest {
 
 /// `sage.v1.request.settings.set` payload.
 ///
-/// Partial-update semantics: both [`interaction_mode`] and [`auth_mode`]
-/// are `Option<...>`. Absent fields preserve the current persisted
-/// value; present fields overwrite it. The merged record is validated
-/// before persistence as a defence-in-depth gate against forged IPC
-/// input (the serde enum alphabet already rejects unknown variants).
+/// Partial-update semantics: every field is `Option<...>`. Absent fields
+/// preserve the current persisted value; present fields overwrite it. The
+/// merged record is validated before persistence as a defence-in-depth
+/// gate against forged IPC input (the serde enum alphabet already rejects
+/// unknown variants).
 ///
 /// [`interaction_mode`]: Self::interaction_mode
 /// [`auth_mode`]: Self::auth_mode
@@ -238,6 +238,14 @@ pub struct SettingsSetRequest {
     /// New auth mode. When `None` the persisted value is kept.
     #[serde(default)]
     pub auth_mode: Option<config::AuthMode>,
+    /// New model tier. When `None` the persisted value is kept.
+    #[serde(default)]
+    pub model: Option<config::ModelPreference>,
+    /// New per-session turn cap. `Some(n)` sets the cap; `None` keeps the
+    /// persisted value. (v0 limitation: a patch cannot clear a cap back to
+    /// uncapped — that takes a re-install. Set semantics, not unset.)
+    #[serde(default)]
+    pub max_turns: Option<u32>,
 }
 
 #[capsule]
@@ -520,6 +528,8 @@ impl Sage {
             identity_path: &identity_path,
             api_key: api_key.as_deref(),
             hook_token: &hook_token,
+            model: cfg.model,
+            max_turns: cfg.max_turns,
         }) {
             Ok(s) => s,
             Err(e) => {

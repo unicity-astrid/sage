@@ -150,6 +150,8 @@ fn repl_mode_short_circuits_spawn_with_rejection_payload() {
     let repl_cfg = config::PrincipalConfig {
         interaction_mode: InteractionMode::Repl,
         auth_mode: AuthMode::ApiKey,
+        model: config::ModelPreference::default(),
+        max_turns: None,
         schema_version: config::SCHEMA_VERSION,
     };
     let wire = serde_json::to_string(&repl_cfg).expect("config serializes");
