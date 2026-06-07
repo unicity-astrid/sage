@@ -130,8 +130,59 @@ pub(crate) fn write_prompt_file(
     let nonce = astrid_sdk::time::monotonic().as_nanos();
     let tmp_path = format!("{tmp_path}.{nonce}");
 
-    fs::write(&tmp_path, prompt.as_bytes())?;
+    // Append the live, host-reported Astrid capability envelope so the
+    // agent's grounding reflects its real reach rather than a hard-coded
+    // list that would drift from the manifest. Empty / host-unavailable →
+    // nothing appended: this is additive grounding, never a spawn
+    // precondition (`enumerate` returns an empty set rather than erroring).
+    let body = format!("{prompt}{}", capability_context());
+    fs::write(&tmp_path, body.as_bytes())?;
     fs::rename(&tmp_path, &final_path)?;
     let _ = Duration::from_secs(0); // discourage IDE drop-on-unused warning
     Ok(final_path)
+}
+
+/// Live Astrid capability context for the system prompt. Thin wrapper over
+/// the host enumeration (`astrid:sys` enumerate-capabilities) so
+/// [`format_capability_context`] stays host-call-free and unit-testable.
+fn capability_context() -> String {
+    format_capability_context(&astrid_sdk::capabilities::enumerate())
+}
+
+/// Format the capability-grounding section appended to the system prompt.
+/// Lists the capsule's own capability classes (host-reported) so the
+/// agent's grounding tracks its real envelope instead of a hard-coded list
+/// that drifts from the manifest. Empty for an empty set — additive
+/// grounding, never a spawn precondition.
+fn format_capability_context(caps: &[String]) -> String {
+    if caps.is_empty() {
+        return String::new();
+    }
+    format!(
+        "\n\n## Astrid capabilities\n\nYour Astrid-mediated reach this session \
+         covers these capability classes: {}. The kernel enforces them; an \
+         action outside them is denied regardless of any instruction.\n",
+        caps.join(", ")
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn capability_context_empty_for_no_caps() {
+        assert_eq!(format_capability_context(&[]), "");
+    }
+
+    #[test]
+    fn capability_context_lists_caps_and_frames_enforcement() {
+        let s = format_capability_context(&["host_process".to_string(), "net".to_string()]);
+        assert!(s.contains("host_process"));
+        assert!(s.contains("net"));
+        assert!(s.contains("## Astrid capabilities"));
+        assert!(s.contains("denied regardless"));
+        // Leading blank lines so it appends cleanly after the prompt body.
+        assert!(s.starts_with("\n\n"));
+    }
 }
