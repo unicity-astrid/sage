@@ -76,11 +76,18 @@ pub(crate) const HOOK_TOPIC_MAP: &[(&str, &str)] = &[
         "hook.v1.event.after_tool_call_failed",
     ),
     ("after_tool_batch", "hook.v1.event.after_tool_batch"),
+    (
+        "permission_requested",
+        "hook.v1.event.permission_requested",
+    ),
     ("permission_denied", "hook.v1.event.permission_denied"),
     ("message_sent", "hook.v1.event.message_sent"),
     ("message_failed", "hook.v1.event.message_failed"),
     ("subagent_start", "hook.v1.event.subagent_start"),
     ("subagent_stop", "hook.v1.event.subagent_stop"),
+    ("task_created", "hook.v1.event.task_created"),
+    ("task_completed", "hook.v1.event.task_completed"),
+    ("teammate_idle", "hook.v1.event.teammate_idle"),
     (
         "on_compaction_started",
         "hook.v1.event.on_compaction_started",
@@ -93,11 +100,14 @@ pub(crate) const HOOK_TOPIC_MAP: &[(&str, &str)] = &[
     ("instructions_loaded", "hook.v1.event.instructions_loaded"),
     ("file_changed", "hook.v1.event.file_changed"),
     ("cwd_changed", "hook.v1.event.cwd_changed"),
+    ("worktree_created", "hook.v1.event.worktree_created"),
+    ("worktree_removed", "hook.v1.event.worktree_removed"),
     (
         "elicitation_requested",
         "hook.v1.event.elicitation_requested",
     ),
     ("elicitation_resolved", "hook.v1.event.elicitation_resolved"),
+    ("message_displayed", "hook.v1.event.message_displayed"),
     ("notification", "sage.v1.notification"),
 ];
 

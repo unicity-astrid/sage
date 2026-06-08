@@ -229,23 +229,26 @@ const NATIVE_ALLOW: &[&str] = &[
 /// `hook.v1.event.*` (or sage-namespaced `sage.v1.notification`) topic.
 /// See [`HOOK_TOPIC_MAP`] for the per-event topic.
 ///
-/// The set spans Claude's session lifecycle (setup/start/end), the prompt
-/// and tool-call turns (incl. failures + batches + prompt expansion), the
-/// subagent lifecycle (start/stop), the compaction window (pre/post),
-/// config / instructions / filesystem observability, permission denials,
-/// and MCP elicitation. Every event name here is verified present in the
-/// shipped `claude` binary, and every event fires in headless `-p`. Each
-/// canonical target is a `hook.v1.event.<name>` topic (a wildcard publish,
-/// so widening the set needs no cross-capsule contract change). Events
-/// Claude reports as semantically distinct are kept distinct: `Stop` is a
-/// per-turn "assistant message sent" signal, NOT session end — `SessionEnd`
-/// is the real session terminator (see [`HOOK_TOPIC_MAP`]).
+/// The COMPLETE Claude hook event surface — every event name here is
+/// verified present in the shipped `claude` binary. We wire ALL of them,
+/// not just the headless-`-p` subset: the hooks block is authored
+/// identically in both interaction modes, and in repl mode (the user's own
+/// environment, full tool surface) the interactive-only events
+/// (`PermissionRequest`, `MessageDisplay`) and the tool-gated events
+/// (`Worktree*`, `Task*`, `TeammateIdle`) all fire. An event that does not
+/// fire in a given mode simply never triggers there — authoring it is
+/// harmless and keeps the plane complete across modes.
 ///
-/// Deliberately NOT wired: `PermissionRequest`/`MessageDisplay` (do not
-/// fire in headless `-p`), and `WorktreeCreate`/`WorktreeRemove`/
-/// `TaskCreated`/`TaskCompleted`/`TeammateIdle` (their tools are in
-/// `REQUIRED_DENIES`, so the hook can never fire — wire them with the
-/// slice that un-denies the tool).
+/// The set spans: session lifecycle (setup/start/end), prompt + tool-call
+/// turns (incl. failures, batches, prompt expansion, permission
+/// request/denial), the subagent + background-task + teammate lifecycle,
+/// the compaction window, config / instructions / filesystem / worktree
+/// observability, MCP elicitation, message display, and notifications. Each
+/// canonical target is a `hook.v1.event.<name>` topic (a wildcard publish,
+/// so widening needs no cross-capsule contract change). Semantically
+/// distinct events stay distinct: `Stop` is a per-turn "assistant message
+/// sent" signal, NOT session end — `SessionEnd` is the real terminator
+/// (see [`HOOK_TOPIC_MAP`]).
 const HOOK_EVENTS: &[&str] = &[
     "SessionStart",
     "SessionEnd",
@@ -256,19 +259,26 @@ const HOOK_EVENTS: &[&str] = &[
     "PostToolUse",
     "PostToolUseFailure",
     "PostToolBatch",
+    "PermissionRequest",
     "PermissionDenied",
     "Stop",
     "StopFailure",
     "SubagentStart",
     "SubagentStop",
+    "TaskCreated",
+    "TaskCompleted",
+    "TeammateIdle",
     "PreCompact",
     "PostCompact",
     "ConfigChange",
     "InstructionsLoaded",
     "FileChanged",
     "CwdChanged",
+    "WorktreeCreate",
+    "WorktreeRemove",
     "Elicitation",
     "ElicitationResult",
+    "MessageDisplay",
     "Notification",
 ];
 
@@ -301,19 +311,26 @@ const HOOK_TOPIC_MAP: &[(&str, &str)] = &[
     ("PostToolUse", "sage.v1.hook.after_tool_call"),
     ("PostToolUseFailure", "sage.v1.hook.after_tool_call_failed"),
     ("PostToolBatch", "sage.v1.hook.after_tool_batch"),
+    ("PermissionRequest", "sage.v1.hook.permission_requested"),
     ("PermissionDenied", "sage.v1.hook.permission_denied"),
     ("Stop", "sage.v1.hook.message_sent"),
     ("StopFailure", "sage.v1.hook.message_failed"),
     ("SubagentStart", "sage.v1.hook.subagent_start"),
     ("SubagentStop", "sage.v1.hook.subagent_stop"),
+    ("TaskCreated", "sage.v1.hook.task_created"),
+    ("TaskCompleted", "sage.v1.hook.task_completed"),
+    ("TeammateIdle", "sage.v1.hook.teammate_idle"),
     ("PreCompact", "sage.v1.hook.on_compaction_started"),
     ("PostCompact", "sage.v1.hook.on_compaction_completed"),
     ("ConfigChange", "sage.v1.hook.config_changed"),
     ("InstructionsLoaded", "sage.v1.hook.instructions_loaded"),
     ("FileChanged", "sage.v1.hook.file_changed"),
     ("CwdChanged", "sage.v1.hook.cwd_changed"),
+    ("WorktreeCreate", "sage.v1.hook.worktree_created"),
+    ("WorktreeRemove", "sage.v1.hook.worktree_removed"),
     ("Elicitation", "sage.v1.hook.elicitation_requested"),
     ("ElicitationResult", "sage.v1.hook.elicitation_resolved"),
+    ("MessageDisplay", "sage.v1.hook.message_displayed"),
     ("Notification", "sage.v1.hook.notification"),
 ];
 
