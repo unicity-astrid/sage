@@ -119,6 +119,10 @@ const DENIED_TOOLS: &[&str] = &[
     "Task",
     "Workflow",
     "SendMessage",
+    // Agent-roster + cross-agent messaging (current tool names + the
+    // `Brief`/`ListPeers` aliases fold into these).
+    "SendUserMessage",
+    "ListAgents",
     "TeamCreate",
     "TeamDelete",
     // Scheduling / control flow — queue a future prompt, reschedule a
@@ -141,6 +145,14 @@ const DENIED_TOOLS: &[&str] = &[
     "TaskStop",
     "TaskUpdate",
     "TaskOutput",
+    // Network egress — `WebFetch`/`WebSearch` are model-driven HTTP tools
+    // that do NOT traverse Claude's Bash sandbox, so the filesystem sandbox
+    // does not bound them: read-a-secret + POST-it-out is the one exfil
+    // path the sandbox misses. Egress is OFF by default (binding) until a
+    // controlled allow-list lands (host net policy / managed-tier domain
+    // allowlist). Re-enable deliberately, not by default.
+    "WebFetch",
+    "WebSearch",
     // External / exfiltration surfaces — off-host channels sage does not
     // mediate.
     "PushNotification",
@@ -153,10 +165,11 @@ const DENIED_TOOLS: &[&str] = &[
     "ReadMcpResourceTool",
     "ToolSearch",
     "WaitForMcpServers",
-    // Indirect-execution surfaces: a slash command or skill can fan out to
-    // other tools. Deferred to a later slice (skills-from-capsules) so the
-    // indirect path is governed before it opens. `SlashCommand` is the
-    // legacy `Skill` alias.
+    // Indirect-execution surface: a skill can fan out to other tools.
+    // Deferred to a later slice (skills-from-capsules) so the indirect path
+    // is governed before it opens. `SlashCommand` is NOT a live tool/alias
+    // in current builds (the slash surface is reached via `Skill`) — kept as
+    // a harmless forward/back-compat no-op.
     "Skill",
     "SlashCommand",
 ];
@@ -599,6 +612,9 @@ mod tests {
             "TaskList",
             "ListMcpResourcesTool",
             "ReadMcpResourceTool",
+            // Egress is denied by default (exfil path the fs sandbox misses).
+            "WebFetch",
+            "WebSearch",
         ] {
             assert!(
                 joined.split(' ').any(|t| t == tool),
@@ -607,10 +623,38 @@ mod tests {
         }
         // The native dev tools must NOT be denied — they are the whole
         // point of the native-tools model (sandbox-bounded, not removed).
-        for tool in ["Bash", "Read", "Write", "Edit", "Glob", "Grep", "WebFetch"] {
+        for tool in ["Bash", "Read", "Write", "Edit", "Glob", "Grep"] {
             assert!(
                 !joined.split(' ').any(|t| t == tool),
                 "native dev tool {tool} must NOT be in the deny list",
+            );
+        }
+    }
+
+    /// Escape vectors that inject agents / plugins / extra dir-scope are
+    /// argv flags, NOT tool names — the deny list cannot touch them. sage
+    /// owns the full argv and must NEVER emit them (it never forwards
+    /// user-controlled argv). Pin their absence so a future edit that adds
+    /// one trips the build.
+    #[test]
+    fn argv_never_emits_untool_gated_escape_flags() {
+        let args = argv(
+            "sid",
+            "home://.claude/.sage-identity-sid",
+            crate::config::ModelPreference::Opus,
+            Some(10),
+        );
+        for forbidden in [
+            "--agents",
+            "--plugin-dir",
+            "--plugin-url",
+            "--add-dir",
+            "--dangerously-skip-permissions",
+            "--permission-prompt-tool",
+        ] {
+            assert!(
+                !args.iter().any(|a| a == forbidden),
+                "argv must never emit {forbidden} — it is not tool-name-gated",
             );
         }
     }
@@ -676,6 +720,8 @@ mod tests {
             "Task",
             "Workflow",
             "SendMessage",
+            "SendUserMessage",
+            "ListAgents",
             "TeamCreate",
             "TeamDelete",
             "CronCreate",
@@ -692,6 +738,8 @@ mod tests {
             "TaskStop",
             "TaskUpdate",
             "TaskOutput",
+            "WebFetch",
+            "WebSearch",
             "PushNotification",
             "RemoteTrigger",
             "ShareOnboardingGuide",

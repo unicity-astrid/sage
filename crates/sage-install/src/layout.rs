@@ -115,17 +115,22 @@ pub(crate) fn sanitize_principal_id(id: &str) -> Result<String, SysError> {
 /// there) so a one-sided edit trips a test. Any change to one list must
 /// mirror to the other.
 ///
-/// Coverage strategy: entries fall into two groups.
-/// * Current surface — every tool in Claude's published tools reference
-///   that can act, spawn, schedule, message, read MCP resources, or load
-///   other tools. Inert read-only conveniences with no escape value
-///   (e.g. `AskUserQuestion`) are intentionally NOT listed; the argv gate
-///   is the real boundary and a deny here would only add churn.
-/// * Legacy aliases — older tool names (`Task`, `MultiEdit`, `BashOutput`,
-///   `KillShell`, `SlashCommand`) Claude has since renamed or folded into
-///   other tools. Denying a name Claude no longer ships is a harmless
-///   no-op, and keeps the gate intact for principals pinned to an older
-///   `claude` build during the version-pin window.
+/// Coverage strategy: this list is NOT the boundary and is NOT claimed to
+/// be exhaustive. The real boundary is the closed `NATIVE_ALLOW` whitelist
+/// under `--permission-mode dontAsk`: any tool not on the allow-list is
+/// auto-denied whether or not it appears here (so a near-future Claude tool
+/// the list has not caught is denied by default, not allowed). This deny
+/// list is a defence-in-depth SNAPSHOT of the known escape / orchestration /
+/// exfil / raw-MCP / indirect-exec surface, hoisted into the binding CLI
+/// tier so those specific names cannot be re-allowed from an overridable
+/// settings file. Entries fall into two groups:
+/// * Current surface — known act/spawn/schedule/message/MCP-read/load
+///   tools. Inert read-only conveniences (e.g. `AskUserQuestion`) are not
+///   listed; the whitelist + dontAsk already deny them.
+/// * Legacy / forward-compat aliases — names current builds have renamed or
+///   do not ship (e.g. `Task`→`Agent`; `SlashCommand` has no live tool).
+///   Denying a name Claude no longer ships is a harmless no-op that keeps
+///   the gate intact across the version-pin window.
 ///
 /// Public-in-module so tests can both assert presence in the JSON and use
 /// it as a parameterised fixture.
@@ -140,6 +145,8 @@ const REQUIRED_DENIES: &[&str] = &[
     "Task",
     "Workflow",
     "SendMessage",
+    "SendUserMessage",
+    "ListAgents",
     "TeamCreate",
     "TeamDelete",
     // Scheduling / control flow — queue a future prompt, reschedule a loop,
@@ -160,6 +167,12 @@ const REQUIRED_DENIES: &[&str] = &[
     "TaskStop",
     "TaskUpdate",
     "TaskOutput",
+    // Network egress — `WebFetch`/`WebSearch` are model-driven HTTP tools
+    // that bypass Claude's Bash sandbox (the filesystem sandbox cannot bound
+    // them), so read-secret + POST-out is the one exfil path the sandbox
+    // misses. Egress OFF by default until a controlled allow-list lands.
+    "WebFetch",
+    "WebSearch",
     // External / exfiltration surfaces — off-host channels sage does not
     // mediate.
     "PushNotification",
@@ -171,9 +184,10 @@ const REQUIRED_DENIES: &[&str] = &[
     "ReadMcpResourceTool",
     "ToolSearch",
     "WaitForMcpServers",
-    // Indirect-execution surface — a skill / slash command can fan out to
-    // other tools; deferred until the indirect path is governed.
-    // `SlashCommand` is the legacy `Skill` alias.
+    // Indirect-execution surface — a skill can fan out to other tools;
+    // deferred until the indirect path is governed. `SlashCommand` is NOT a
+    // live tool/alias in current builds (the slash surface is reached via
+    // `Skill`) — kept as a harmless forward/back-compat no-op.
     "Skill",
     "SlashCommand",
 ];
@@ -185,6 +199,14 @@ const REQUIRED_DENIES: &[&str] = &[
 /// auto-denied. `mcp__sage__*` keeps the registered sage MCP server
 /// reachable for Astrid-specific operations. Bounds on what these tools can
 /// DO come from the sandbox (Astrid host + Claude inner), not this list.
+///
+/// Deliberately ABSENT: `WebFetch`/`WebSearch` (egress is off by default —
+/// the one exfil path the filesystem sandbox does not bound; see
+/// [`REQUIRED_DENIES`]); and the background-task tools `Monitor` /
+/// `BashOutput` / `KillShell` — in current Claude builds `BashOutput` /
+/// `KillShell` fold into the `TaskOutput` / `TaskStop` family that the deny
+/// list blocks, so they would be non-functional anyway. v1 is foreground
+/// `Bash` only; background tasks ride the later background-task slice.
 const NATIVE_ALLOW: &[&str] = &[
     "Bash",
     "Read",
@@ -194,12 +216,7 @@ const NATIVE_ALLOW: &[&str] = &[
     "NotebookEdit",
     "Glob",
     "Grep",
-    "WebFetch",
-    "WebSearch",
     "LSP",
-    "Monitor",
-    "BashOutput",
-    "KillShell",
     "TodoWrite",
     "mcp__sage__*",
 ];
@@ -411,6 +428,11 @@ pub(crate) fn settings_json(cfg: &PrincipalConfig) -> serde_json::Value {
             "sandbox".to_string(),
             serde_json::json!({
                 "enabled": true,
+                // Fail CLOSED if Claude's sandbox cannot initialise (e.g.
+                // nested under the host bwrap/seatbelt): refuse to start
+                // rather than silently run Bash unsandboxed-by-Claude. Set
+                // explicitly, not relying on Claude's default-injection.
+                "failIfUnavailable": true,
                 "allowUnsandboxedCommands": false,
                 "filesystem": { "allowWrite": ["./", "$TMPDIR"] }
             }),
@@ -981,6 +1003,8 @@ mod tests {
             "Task",
             "Workflow",
             "SendMessage",
+            "SendUserMessage",
+            "ListAgents",
             "TeamCreate",
             "TeamDelete",
             "CronCreate",
@@ -997,6 +1021,8 @@ mod tests {
             "TaskStop",
             "TaskUpdate",
             "TaskOutput",
+            "WebFetch",
+            "WebSearch",
             "PushNotification",
             "RemoteTrigger",
             "ShareOnboardingGuide",
