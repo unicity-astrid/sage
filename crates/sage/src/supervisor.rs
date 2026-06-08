@@ -25,7 +25,6 @@ use crate::state::{
 use astrid_sdk::prelude::*;
 use serde_json::Value;
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::time::Duration;
 use uuid::Uuid;
 
@@ -38,10 +37,10 @@ pub(crate) const TICK_INTERVAL: Duration = Duration::from_millis(50);
 /// `Ok(())` even if individual sessions hit errors — errors are
 /// surfaced as IPC events, never bubbled up to abort the tick.
 pub(crate) fn tick(sessions: &Sessions) -> Result<(), SysError> {
-    // First-tick recovery: any persisted records whose Process handle
-    // is gone are publish-then-deleted as `capsule_reload` exits.
+    // First-tick reconcile: persisted records with no live handle are
+    // re-attached by process_id — survivors resume, dead children exit.
     if sessions.take_reload_recovered_flag()? {
-        reload_recover(sessions)?;
+        reload_reconcile(sessions)?;
     }
 
     // Collect session ids without holding the lock across the per-
@@ -61,7 +60,7 @@ pub(crate) fn tick(sessions: &Sessions) -> Result<(), SysError> {
 /// INVARIANT: NO host calls under the Sessions lock. Mirrors the
 /// Phase-1/Phase-2 pattern in [`crate::tooling::result::handle_tool_result`]:
 ///
-/// 1. Phase 1a (under lock): clone the `Arc<Process>` handle and
+/// 1. Phase 1a (under lock): clone the `PersistentProcess` handle and
 ///    snapshot the principal_id.
 /// 2. Phase 2 (lock released): call `process.read_logs()` — a host
 ///    call that may block and could re-enter the bus drain.
@@ -70,14 +69,15 @@ pub(crate) fn tick(sessions: &Sessions) -> Result<(), SysError> {
 ///    `partial_tool_inputs` / `pending_tool_calls` stay coherent.
 ///
 /// Holding the sessions mutex across the host call would serialise the
-/// whole supervisor loop and risks deadlock; cloning the `Arc<Process>`
-/// is cheap and `read_logs` only needs `&Process`.
+/// whole supervisor loop and risks deadlock; cloning the
+/// `PersistentProcess` is cheap (it is just an id wrapper) and `read_logs`
+/// only needs `&self`.
 fn drive_session(sessions: &Sessions, session_id: &str) -> Result<(), SysError> {
     // Phase 1a: clone what we need out from under the lock.
     let prep = sessions.with(|map| -> Option<DrivePrep> {
         let session = map.get(session_id)?;
         Some(DrivePrep {
-            process: Arc::clone(&session.process),
+            process: session.process.clone(),
             principal_id: session.record.principal_id.clone(),
         })
     })?;
@@ -162,10 +162,11 @@ enum DriveOutcome {
 
 /// Hand-off package collected under `Sessions::with` and consumed
 /// outside the lock by [`drive_session`]. Carries the cloned
-/// `Arc<Process>` handle so the host `read_logs` runs with the sessions
-/// mutex released — mirrors the pattern in [`crate::tooling::result`].
+/// [`PersistentProcess`](process::PersistentProcess) handle so the host
+/// `read_logs` runs with the sessions mutex released — mirrors the pattern
+/// in [`crate::tooling::result`].
 struct DrivePrep {
-    process: Arc<process::Process>,
+    process: process::PersistentProcess,
     principal_id: String,
 }
 
@@ -476,15 +477,26 @@ fn evict(sessions: &Sessions, session_id: &str) -> Result<(), SysError> {
     Ok(())
 }
 
-/// First-tick recovery: anything in KV but not in the runtime map is
-/// an orphan from the previous capsule incarnation.
-fn reload_recover(sessions: &Sessions) -> Result<(), SysError> {
+/// First-tick reconcile: every persisted record with no live runtime
+/// session is an orphan from the previous capsule incarnation. Because the
+/// `claude -p` child runs on the PERSISTENT tier it usually OUTLIVED the
+/// reload — only the in-memory handle died — so we re-[`attach`] by the
+/// recorded [`process_id`](SessionRecord::process_id) and reconcile:
+///
+/// * still running → REBUILD the runtime session and keep driving the same
+///   child (the conversation is unbroken). Emit `…​.resumed`; keep the
+///   record + hook token (same child, same `ASTRID_HOOK_TOKEN`).
+/// * already exited (within `exit_retention`) → publish the REAL exit,
+///   `release` the id, drop the record + token.
+/// * reaped / unknown / pre-durable record (no `process_id`) → unattachable;
+///   publish a synthetic exit and drop the record + token.
+fn reload_reconcile(sessions: &Sessions) -> Result<(), SysError> {
     let live_ids: HashMap<String, ()> =
         sessions.with(|map| map.keys().cloned().map(|k| (k, ())).collect())?;
     let records: Vec<SessionRecord> = match list_all_records() {
         Ok(r) => r,
         Err(e) => {
-            log::warn(format!("sage: reload-recovery list failed: {e}"));
+            log::warn(format!("sage: reload-reconcile list failed: {e}"));
             return Ok(());
         }
     };
@@ -492,30 +504,215 @@ fn reload_recover(sessions: &Sessions) -> Result<(), SysError> {
         if live_ids.contains_key(&rec.session_id) {
             continue;
         }
-        // Defense in depth: refuse to format!() an unvalidated id into
-        // an IPC topic, even when it came from our own KV store. A
-        // stale record from before validation was deployed (or a future
-        // bug that writes a tainted id) shouldn't be able to publish on
-        // an attacker-chosen topic. Drop the orphan record either way.
+        // Defense in depth: refuse to format!() an unvalidated id into an
+        // IPC topic, even from our own KV store. A stale record from before
+        // validation was deployed (or a future bug that writes a tainted id)
+        // must not publish on an attacker-chosen topic. Drop it either way.
         if crate::validate_id("session_id", &rec.session_id).is_err() {
-            log::warn("sage: reload-recovery dropping record with invalid session_id");
+            log::warn("sage: reload-reconcile dropping record with invalid session_id");
             let _ = delete_record(&rec.session_id);
-            // Even when the session_id is malformed, the matching hook
-            // token (if any) is keyed by the same id; best-effort sweep.
+            // The matching hook token is keyed by the same id; sweep it.
             let _ = crate::hooks::forget_token(&rec.principal_id, &rec.session_id);
             continue;
         }
-        publish_exit(&rec.session_id, "capsule_reload", None, None);
-        let _ = delete_record(&rec.session_id);
-        // Sweep any hook token left over from the prior capsule
-        // incarnation. Without this, tokens stranded by a reload would
-        // remain in KV until a fresh spawn at the same session_id
-        // overwrote them — leaving a stale credential live on the bus.
-        let _ = crate::hooks::forget_token(&rec.principal_id, &rec.session_id);
+
+        // Probe the recorded id (a pre-durable record has none), then let
+        // the pure decision table choose the action — see
+        // [`reconcile_decision`]. Attaching is a cheap id-wrapper; `status`
+        // is the only host round-trip.
+        let proc = if rec.process_id.is_empty() {
+            None
+        } else {
+            Some(process::attach(rec.process_id.clone()))
+        };
+        let probe = match &proc {
+            Some(p) => match p.status() {
+                Ok(info) => Probe::Known(info.exit.map(|e| (e.exit_code, e.signal))),
+                Err(_) => Probe::Unresolved,
+            },
+            None => Probe::NoId,
+        };
+
+        match reconcile_decision(probe) {
+            // The child outlived the reload — keep driving it.
+            Reconcile::Resume => {
+                if let Some(p) = proc {
+                    resume_session(sessions, rec, p)?;
+                }
+            }
+            // Exited during the reload gap (still retained) → truthful exit,
+            // then free the host slot (a `PersistentProcess` never reaps on
+            // drop).
+            Reconcile::Exited { code, signal } => {
+                if let Some(p) = proc
+                    && let Err(e) = p.release()
+                {
+                    log::warn(format!(
+                        "sage: reconcile release({}) failed: {e:?}",
+                        rec.session_id
+                    ));
+                }
+                abandon_orphan(&rec, "exited", code, signal);
+            }
+            // Unattachable (reaped TTL / unknown / pre-durable) — synthetic
+            // exit, nothing to release.
+            Reconcile::Abandon { reason } => abandon_orphan(&rec, reason, None, None),
+        }
     }
     Ok(())
 }
 
+/// Outcome of probing an orphan record's recorded persistent id.
+enum Probe {
+    /// No id on the record (a pre-durable incarnation) — nothing to attach.
+    NoId,
+    /// The host could not resolve the id — reaped by a TTL, or unknown.
+    Unresolved,
+    /// The id resolved; the inner value is the recorded exit `(code, signal)`
+    /// — `None` while the child is still running.
+    Known(Option<(Option<i32>, Option<i32>)>),
+}
+
+/// Reconcile verdict for one orphan. Factored out of the host calls in
+/// [`reload_reconcile`] so the decision table is unit-testable without a
+/// live persistent process.
+#[derive(Debug, PartialEq, Eq)]
+enum Reconcile {
+    /// Child is alive — rebuild the runtime session and resume.
+    Resume,
+    /// Child has terminated — publish this real exit and free the slot.
+    Exited {
+        code: Option<i32>,
+        signal: Option<i32>,
+    },
+    /// Nothing to resume — publish a synthetic exit under `reason`.
+    Abandon { reason: &'static str },
+}
+
+/// Pure decision table for [`reload_reconcile`]. A resolved id with no
+/// recorded exit is a live child → [`Resume`](Reconcile::Resume); a resolved
+/// id WITH an exit is reconciled to that real exit; an unresolved id is
+/// `lost`; a record carrying no id is a pre-durable orphan reported as the
+/// legacy `capsule_reload`.
+fn reconcile_decision(probe: Probe) -> Reconcile {
+    match probe {
+        Probe::Known(None) => Reconcile::Resume,
+        Probe::Known(Some((code, signal))) => Reconcile::Exited { code, signal },
+        Probe::Unresolved => Reconcile::Abandon { reason: "lost" },
+        Probe::NoId => Reconcile::Abandon {
+            reason: "capsule_reload",
+        },
+    }
+}
+
+/// Rebuild the in-memory [`RuntimeSession`] for a child that survived the
+/// reload, re-attaching by id. The record + hook token are kept untouched:
+/// it is the SAME running child under the same `ASTRID_HOOK_TOKEN`, so its
+/// in-flight `astrid-emit` hooks keep validating. The codec + in-flight
+/// tool-call maps start empty — the supervisor picks up cleanly from the
+/// next decoded line. KNOWN LIMITATION: a tool call that was awaiting a
+/// result across the reload is dropped (its `pending_tool_calls` entry was
+/// in-memory), so claude surfaces it as a tool timeout (~60 s) instead of
+/// hanging — the conversation itself continues. Likewise a stream-json line
+/// straddling the reload boundary can be lost under the draining `read_logs`
+/// path. Persisting the tool-call bookkeeping and moving to cursor-addressed
+/// `read_since` close both gaps (follow-up).
+fn resume_session(
+    sessions: &Sessions,
+    rec: SessionRecord,
+    process: process::PersistentProcess,
+) -> Result<(), SysError> {
+    let session_id = rec.session_id.clone();
+    let principal_id = rec.principal_id.clone();
+    let process_id = rec.process_id.clone();
+    sessions.with(|map| {
+        map.insert(
+            session_id.clone(),
+            RuntimeSession {
+                record: rec,
+                process,
+                codec: crate::codec::LineDecoder::default(),
+                pending_tool_calls: HashMap::new(),
+                partial_tool_inputs: HashMap::new(),
+            },
+        );
+    })?;
+    let _ = ipc::publish_json(
+        &format!("sage.v1.event.{session_id}.resumed"),
+        &serde_json::json!({
+            "principal_id": principal_id,
+            "process_id": process_id,
+            "reason": "capsule_reload",
+        }),
+    );
+    log::info(format!(
+        "sage: resumed session {session_id} after capsule reload (re-attached {process_id})"
+    ));
+    Ok(())
+}
+
+/// Publish a terminal `exited` event for an orphan we cannot keep, then drop
+/// its persisted record and hook token. Sweeping the token closes the window
+/// where a forged `sage.v1.hook.*` arriving after the session is gone could
+/// still pass the validator lookup.
+fn abandon_orphan(rec: &SessionRecord, reason: &str, code: Option<i32>, sig: Option<i32>) {
+    publish_exit(&rec.session_id, reason, code, sig);
+    let _ = delete_record(&rec.session_id);
+    let _ = crate::hooks::forget_token(&rec.principal_id, &rec.session_id);
+}
+
 fn now_ms() -> u64 {
     u64::try_from(astrid_sdk::time::monotonic().as_millis()).unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reconcile_resumes_a_running_child() {
+        // Resolved id, no recorded exit → the child outlived the reload.
+        assert_eq!(reconcile_decision(Probe::Known(None)), Reconcile::Resume);
+    }
+
+    #[test]
+    fn reconcile_reports_the_real_exit() {
+        // Resolved id WITH an exit → publish that exit, not a synthetic one.
+        assert_eq!(
+            reconcile_decision(Probe::Known(Some((Some(137), Some(9))))),
+            Reconcile::Exited {
+                code: Some(137),
+                signal: Some(9),
+            }
+        );
+        // A clean exit carries through too (code 0, no signal).
+        assert_eq!(
+            reconcile_decision(Probe::Known(Some((Some(0), None)))),
+            Reconcile::Exited {
+                code: Some(0),
+                signal: None,
+            }
+        );
+    }
+
+    #[test]
+    fn reconcile_marks_an_unresolved_id_lost() {
+        // Host could not resolve the id (reaped by a TTL during the gap).
+        assert_eq!(
+            reconcile_decision(Probe::Unresolved),
+            Reconcile::Abandon { reason: "lost" }
+        );
+    }
+
+    #[test]
+    fn reconcile_treats_a_pre_durable_record_as_capsule_reload() {
+        // No id to attach to → keep the legacy reason so existing consumers
+        // of `capsule_reload` still see it for un-upgradable records.
+        assert_eq!(
+            reconcile_decision(Probe::NoId),
+            Reconcile::Abandon {
+                reason: "capsule_reload",
+            }
+        );
+    }
 }

@@ -15,6 +15,13 @@ type = "executable"
 
 [capabilities]
 host_process = ["claude"]
+# Persistent-tier sub-grant (astrid#873): `spawn-persistent` requires this
+# in ADDITION to `host_process`. Sage spawns `claude -p` on the persistent
+# tier so the child outlives a sage capsule reload — the supervisor re-
+# `attach`es by ProcessId and keeps driving the same conversation instead of
+# abandoning it. Without this grant the host denies `spawn-persistent` with
+# `capability-denied` and no session could be spawned.
+allow_persistent = true
 kv = []
 # The `home://` scheme resolves dynamically at check time against the
 # per-invocation principal's home root (`~/.astrid/home/<principal>/` in
@@ -91,7 +98,7 @@ api_key = { type = "secret", request = "Anthropic API key (leave blank for subsc
 [publish]
 # Streamed events from a `claude -p` subprocess. Both 4-segment
 # (e.g. `sage.v1.event.session_rejected`) and 5-segment session-scoped
-# topics (e.g. `sage.v1.event.<sid>.spawned|exited|error|respawned|
+# topics (e.g. `sage.v1.event.<sid>.spawned|exited|resumed|error|respawned|
 # tool_timeout|text|tool_use|result|usage|done|init`) are published.
 "sage.v1.event.*" = {}
 "sage.v1.event.*.*" = {}

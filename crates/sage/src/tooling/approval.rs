@@ -10,7 +10,6 @@
 
 use astrid_sdk::prelude::*;
 use serde::Deserialize;
-use std::sync::Arc;
 
 use crate::state::Sessions;
 use crate::topic_tail;
@@ -140,7 +139,7 @@ pub(crate) fn route_approvals(
 
     // INVARIANT: NO host calls under the Sessions lock. Phase 1 (under
     // lock): match correlation ids to sessions, evict the marker,
-    // encode the verdict frame, and clone the `Arc<Process>` handle.
+    // encode the verdict frame, and clone the `PersistentProcess` handle.
     // Phase 2 (lock released): issue every `write_stdin` and any
     // failure publish.
     let mut pending = sessions.with(|map| -> Vec<ApprovalPrepared> {
@@ -155,7 +154,7 @@ pub(crate) fn route_approvals(
                     out.push(ApprovalPrepared {
                         session_id: sid.clone(),
                         correlation_id: corr_id.clone(),
-                        process: Some(Arc::clone(&session.process)),
+                        process: Some(session.process.clone()),
                         line: frame,
                     });
                     break;
@@ -223,7 +222,7 @@ pub(crate) fn register_pending_approval(
 struct ApprovalPrepared {
     session_id: String,
     correlation_id: String,
-    process: Option<Arc<process::Process>>,
+    process: Option<process::PersistentProcess>,
     line: String,
 }
 
@@ -237,7 +236,7 @@ impl ApprovalPrepared {
         }
     }
 
-    fn process_opt(&self) -> Option<(&Arc<process::Process>, &str)> {
+    fn process_opt(&self) -> Option<(&process::PersistentProcess, &str)> {
         self.process.as_ref().map(|p| (p, self.line.as_str()))
     }
 }

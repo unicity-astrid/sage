@@ -3,7 +3,7 @@
 //! Both entry points share an invariant: NO host calls are issued
 //! while holding the `Sessions` lock. Phase 1 (under lock) prepares
 //! the encoded frame, evicts the pending entry, and clones the
-//! `Arc<Process>` handle. Phase 2 (lock released) does every
+//! `PersistentProcess` handle. Phase 2 (lock released) does every
 //! `write_stdin` and bus publish. Holding the sessions mutex across a
 //! host call would serialise the whole supervisor loop and risks
 //! deadlock if the host call re-enters the bus drain.
@@ -11,7 +11,7 @@
 use astrid_sdk::prelude::*;
 use serde::Deserialize;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 
 use crate::state::Sessions;
 use crate::{TOOL_CALL_DEADLINE, ToolCallMeta};
@@ -67,7 +67,7 @@ pub(crate) fn handle_tool_result(
 
     // INVARIANT: NO host calls under the Sessions lock. Phase 1: find
     // the session, pop the pending entry, encode the line, clone the
-    // `Arc<Process>` handle out. Phase 2 (below): issue the host write.
+    // `PersistentProcess` handle out. Phase 2 (below): issue the host write.
     let prepared = sessions.with(|map| -> Option<PreparedWrite> {
         for (sid, session) in map.iter_mut() {
             if let Some(pending) = session.pending_tool_calls.remove(&event.call_id) {
@@ -82,7 +82,7 @@ pub(crate) fn handle_tool_result(
                 );
                 return Some(PreparedWrite {
                     session_id: sid.clone(),
-                    process: Arc::clone(&session.process),
+                    process: session.process.clone(),
                     line,
                 });
             }
@@ -159,7 +159,7 @@ pub(crate) fn enforce_deadlines(
     // INVARIANT: NO host calls under the Sessions lock — write_stdin is
     // a host call that can block. Phase 1 (under lock): identify every
     // expired call, evict its pending entry, encode the timeout frame,
-    // and clone the `Arc<Process>` handle. Phase 2 (lock released):
+    // and clone the `PersistentProcess` handle. Phase 2 (lock released):
     // issue all stdin writes and the meta-lookup + ipc::publish back-
     // channel.
     let pending = sessions.with(|map| -> Vec<TimeoutPrepared> {
@@ -194,7 +194,7 @@ pub(crate) fn enforce_deadlines(
                 out.push(TimeoutPrepared {
                     session_id: sid.clone(),
                     call_id: call_id.clone(),
-                    process: Arc::clone(&session.process),
+                    process: session.process.clone(),
                     line,
                 });
             }
@@ -258,11 +258,11 @@ enum WriteOutcome {
 
 /// Hand-off package collected under `Sessions::with` and consumed
 /// outside the lock by [`handle_tool_result`]. Carries the cloned
-/// `Arc<Process>` handle so the host `write_stdin` can run with the
+/// `PersistentProcess` handle so the host `write_stdin` can run with the
 /// sessions mutex released.
 struct PreparedWrite {
     session_id: String,
-    process: Arc<process::Process>,
+    process: process::PersistentProcess,
     line: String,
 }
 
@@ -271,7 +271,7 @@ struct PreparedWrite {
 struct TimeoutPrepared {
     session_id: String,
     call_id: String,
-    process: Arc<process::Process>,
+    process: process::PersistentProcess,
     line: String,
 }
 

@@ -38,7 +38,7 @@ use astrid_sdk::prelude::*;
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 use std::time::Duration;
 use uuid::Uuid;
 
@@ -551,6 +551,7 @@ impl Sage {
             identity_path,
             started_at_ms,
             os_pid: spawned.os_pid,
+            process_id: spawned.process_id,
         };
         save_record(&record)?;
 
@@ -559,7 +560,7 @@ impl Sage {
                 session_id.clone(),
                 RuntimeSession {
                     record: record.clone(),
-                    process: Arc::new(spawned.process),
+                    process: spawned.process,
                     codec: codec::LineDecoder::new(),
                     pending_tool_calls: Default::default(),
                     partial_tool_inputs: Default::default(),
@@ -803,7 +804,7 @@ impl Sage {
 /// kernel-side back-pressure and could re-enter the bus drain. Holding
 /// the `Sessions` mutex across it would serialise the entire supervisor
 /// loop and risks deadlock. The pattern here — encode + clone the
-/// `Arc<Process>` handle under the lock, drop the guard, then write —
+/// `PersistentProcess` handle under the lock, drop the guard, then write —
 /// is the canonical lock-discipline shape mirrored by every callsite
 /// in [`tooling`].
 fn send_user_turn(sessions: &Sessions, session_id: &str, text: &str) -> Result<(), SysError> {

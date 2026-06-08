@@ -22,8 +22,39 @@
 
 use astrid_sdk::prelude::*;
 use sha2::{Digest, Sha256};
+use std::time::Duration;
 
 const CLAUDE_BIN: &str = "claude";
+
+// ---- Persistent-tier spawn knobs --------------------------------------
+//
+// `claude -p` runs on the PERSISTENT process tier so it outlives a sage
+// capsule reload; the supervisor re-`attach`es by ProcessId rather than
+// abandoning the conversation. These tune the host-side child lifecycle
+// (see `astrid_sdk::process::Command`).
+
+/// Idle-reap backstop: a persistent child with NO read/write/wait/signal
+/// for this long is reaped by the host. A SUPERVISED session never idles —
+/// the supervisor reads its stdout every ~50 ms (see
+/// [`crate::supervisor::TICK_INTERVAL`]) — so this only catches a child
+/// sage permanently ABANDONED (e.g. the capsule fails to reload and never
+/// re-attaches). Set far above any plausible reload gap (seconds) so a
+/// healthy child is never reaped mid-reload. NO `max_lifetime` is set: a
+/// legitimate agent task can run arbitrarily long and a wall-clock ceiling
+/// would SIGKILL a healthy session.
+const IDLE_REAP: Duration = Duration::from_secs(30 * 60);
+
+/// Post-exit retention: after `claude` exits the host keeps the id + drained
+/// log tail this long before auto-reaping. Sized to outlast a reload so a
+/// child that exits DURING the reload gap is still observable (exit code +
+/// tail) when the reconcile attaches — letting sage publish a truthful
+/// `exited` instead of a vague `lost`.
+const EXIT_RETENTION: Duration = Duration::from_secs(5 * 60);
+
+/// Per-stream stdout/stderr ring capacity. Sized to comfortably hold the
+/// stdout a streaming `claude -p` emits across a reload gap so the reconcile
+/// loses no buffered output (host-clamped to the profile ceiling).
+const LOG_RING_BYTES: u32 = 4 * 1024 * 1024;
 
 /// Built-in Claude tools denied at the CLI-args tier.
 ///
@@ -183,10 +214,15 @@ pub(crate) struct SpawnInputs<'a> {
     pub max_turns: Option<u32>,
 }
 
-/// Outcome of a successful spawn — the live process plus the audit
-/// fingerprint of the argv we used so the spawn event can record it.
+/// Outcome of a successful spawn — the live persistent process plus the
+/// audit fingerprint of the argv we used so the spawn event can record it.
 pub(crate) struct Spawned {
-    pub process: process::Process,
+    pub process: process::PersistentProcess,
+    /// The host-owned persistent id (`== process.id()`), captured here so
+    /// the caller can persist it into the [`SessionRecord`] before the
+    /// handle is moved into the runtime map. This is what a later capsule
+    /// incarnation re-`attach`es to across a reload.
+    pub process_id: String,
     pub os_pid: u32,
     /// Deterministic SHA-256 digest of the full argv, formatted as
     /// `"sha256:<hex>"`. Computed by [`argv_hash`] with a NUL byte
@@ -317,18 +353,32 @@ pub(crate) fn spawn_claude(inputs: &SpawnInputs<'_>) -> Result<Spawned, SysError
         .env("ASTRID_PRINCIPAL_ID", inputs.principal_id)
         .env("ASTRID_SESSION_ID", inputs.session_id)
         .env("ASTRID_HOOK_TOKEN", inputs.hook_token)
-        .cwd(inputs.home_path);
+        .cwd(inputs.home_path)
+        // Persistent tier: keep the stdin pipe open so the supervisor can
+        // write user turns / tool results across pooled-instance resets AND
+        // re-attach after a sage capsule reload. `label` surfaces the
+        // session in `process::list`; the lifecycle knobs are documented on
+        // their consts above.
+        .keep_stdin_open(true)
+        .label(format!("sage:{}", inputs.session_id))
+        .idle_timeout(IDLE_REAP)
+        .exit_retention(EXIT_RETENTION)
+        .log_ring_bytes(LOG_RING_BYTES);
     if let Some(key) = inputs.api_key {
         cmd = cmd.env("ANTHROPIC_API_KEY", key);
     }
 
-    let proc = cmd.spawn_background()?;
-    let os_pid = proc.os_pid().unwrap_or(0);
+    let proc = cmd.spawn_persistent()?;
+    let process_id = proc.id().as_str().to_string();
+    // os_pid is observability-only (audit correlation); a status miss right
+    // after spawn is non-fatal, so fall back to 0 rather than failing spawn.
+    let os_pid = proc.status().ok().and_then(|s| s.os_pid).unwrap_or(0);
 
     let flags_hash = argv_hash(&args);
 
     Ok(Spawned {
         process: proc,
+        process_id,
         os_pid,
         flags_hash,
     })

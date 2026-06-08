@@ -18,7 +18,6 @@
 
 use astrid_sdk::prelude::*;
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
 use std::time::Duration;
 
 use crate::config::{AuthMode, load_or_default as load_principal_config};
@@ -109,7 +108,7 @@ pub(crate) fn stop_session(
     // can block on back-pressure; holding the mutex across them would
     // serialise the whole supervisor loop and risks deadlock if the
     // host call re-enters the bus drain. Phase 3a (under lock): evict
-    // the entry and clone the `Arc<Process>` out into a `PreparedKill`
+    // the entry and clone the `PersistentProcess` out into a `PreparedKill`
     // hand-off. Phase 3b (lock released): issue the host kill/drain.
     //
     // We discriminate three outcomes:
@@ -121,30 +120,43 @@ pub(crate) fn stop_session(
     let prepared = sessions.with(|map| -> Option<PreparedKill> {
         let session = map.remove(session_id)?;
         Some(PreparedKill {
-            process: Arc::clone(&session.process),
+            process: session.process.clone(),
             principal_id: session.record.principal_id.clone(),
         })
     })?;
 
     let final_exit = prepared.map(|p| {
         let mut summary = ExitSummary::default();
-        if !exited_clean {
-            match p.process.kill() {
-                Ok(kr) => {
-                    summary.exit_code = kr.exit.and_then(|e| e.exit_code);
-                    summary.signal = kr.exit.and_then(|e| e.signal);
-                    summary.stdout_tail = trailing(&kr.stdout);
-                    summary.stderr_tail = trailing(&kr.stderr);
-                }
-                Err(e) => {
-                    summary.detail = Some(format!("kill failed: {e:?}"));
-                }
-            }
-        } else if let Ok(logs) = p.process.read_logs() {
+        // Drain the final tail FIRST: both `stop` and `release` discard the
+        // buffered tail, and — unlike the ephemeral `Process` whose `Drop`
+        // reaps — dropping a `PersistentProcess` never reaps, so the host
+        // slot must be freed explicitly below (`release` if already exited,
+        // `stop` otherwise).
+        if let Ok(logs) = p.process.read_logs() {
             summary.exit_code = logs.exit.and_then(|e| e.exit_code);
             summary.signal = logs.exit.and_then(|e| e.signal);
             summary.stdout_tail = trailing(&logs.stdout);
             summary.stderr_tail = trailing(&logs.stderr);
+        }
+        if exited_clean {
+            // Exited inside the grace window — just release the id (frees the
+            // slot + drops the retained tail we already captured above).
+            if let Err(e) = p.process.release() {
+                summary.detail = Some(format!("release failed: {e:?}"));
+            }
+        } else {
+            // Still running after the grace window: SIGTERM -> grace ->
+            // SIGKILL and REMOVE the id. `stop` returns the real exit, which
+            // supersedes whatever `read_logs` reported above.
+            match p.process.stop(None) {
+                Ok(exit) => {
+                    summary.exit_code = exit.exit_code;
+                    summary.signal = exit.signal;
+                }
+                Err(e) => {
+                    summary.detail = Some(format!("stop failed: {e:?}"));
+                }
+            }
         }
         (summary, p.principal_id)
     });
@@ -451,6 +463,7 @@ fn respawn_one(
         identity_path,
         started_at_ms: now_ms,
         os_pid: spawned.os_pid,
+        process_id: spawned.process_id,
     };
     state::save_record(&record)?;
 
@@ -459,7 +472,7 @@ fn respawn_one(
             s.session_id.clone(),
             RuntimeSession {
                 record,
-                process: Arc::new(spawned.process),
+                process: spawned.process,
                 codec: crate::codec::LineDecoder::default(),
                 pending_tool_calls: std::collections::HashMap::new(),
                 partial_tool_inputs: std::collections::HashMap::new(),
@@ -517,12 +530,12 @@ struct ExitSummary {
 
 /// Hand-off package collected under `Sessions::with` in
 /// [`stop_session`]'s phase 3a and consumed in phase 3b outside the
-/// lock. Carries the cloned `Arc<Process>` handle so the host
-/// `kill` / `read_logs` calls can run with the sessions mutex released
-/// — same shape and rationale as
+/// lock. Carries the cloned [`PersistentProcess`](process::PersistentProcess)
+/// handle so the host `read_logs` / `stop` / `release` calls can run with
+/// the sessions mutex released — same shape and rationale as
 /// [`crate::tooling::result::PreparedWrite`].
 struct PreparedKill {
-    process: Arc<process::Process>,
+    process: process::PersistentProcess,
     /// Snapshotted under the lock in phase 3a so phase 3b can build the
     /// `sage.hook_token.<principal>.<session>` KV key without re-locking
     /// the sessions map. Required for hook-token cleanup on session end
@@ -540,7 +553,7 @@ struct PreparedKill {
 /// host call that crosses the kernel resource boundary. Holding the
 /// `Sessions` mutex across it would serialise every other handler and
 /// risks deadlock if the host call re-enters the bus drain. Clone the
-/// `Arc<Process>` handle under the lock, drop the guard, then read.
+/// `PersistentProcess` handle under the lock, drop the guard, then read.
 fn wait_for_exit(sessions: &Sessions, session_id: &str, grace: Duration) -> bool {
     let deadline = time::monotonic() + grace;
     while time::monotonic() < deadline {
