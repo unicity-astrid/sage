@@ -502,33 +502,41 @@ pub(crate) fn settings_json(cfg: &PrincipalConfig) -> serde_json::Value {
 
 /// `.claude/.mcp.json` body for the given principal config.
 ///
-/// * [`InteractionMode::Headless`]: register the `sage` MCP server as
-///   `astrid mcp serve --principal <principal_id>` — the stdio MCP server
-///   that fronts the sage-mcp broker (unicity-astrid/astrid#880). claude
-///   loads exactly this file via `--strict-mcp-config --mcp-config
-///   .claude/.mcp.json` (see `sage::spawn`), does the native MCP
-///   handshake, and discovers the `mcp__sage__*` tools from `tools/list`.
-///   `principal_id` is the sanitised invoking principal, baked in so the
-///   spawned server stamps the right identity on its broker requests:
-///   `astrid mcp serve` does NOT infer it — absent `--principal` it falls
-///   back to the active/default principal, which would mis-scope tools.
-/// * [`InteractionMode::Repl`]: no sage-spawned `claude` subprocess
-///   exists, so emit an empty `mcpServers` object. Users wiring native
-///   MCP servers in repl mode edit this file themselves; sage doesn't
-///   fight them.
-pub(crate) fn mcp_json(cfg: &PrincipalConfig, principal_id: &str) -> serde_json::Value {
-    match cfg.interaction_mode {
-        InteractionMode::Headless => serde_json::json!({
-            "mcpServers": {
-                "sage": {
-                    "command": "astrid",
-                    "args": ["mcp", "serve", "--principal", principal_id],
-                    "env": {}
-                }
+/// Registered identically in BOTH modes: the `sage` MCP server as
+/// `astrid mcp serve --principal <principal_id>` — the stdio MCP server
+/// that fronts the daemon's sage-mcp broker (unicity-astrid/astrid#880).
+/// `principal_id` is the sanitised invoking principal, baked in so the
+/// server stamps the right identity on its broker requests (`astrid mcp
+/// serve` does NOT infer it — absent `--principal` it falls back to the
+/// active/default principal, mis-scoping tools).
+///
+/// * [`InteractionMode::Headless`]: claude loads exactly this file via
+///   `--strict-mcp-config --mcp-config .claude/.mcp.json` (see
+///   `sage::spawn`), does the native MCP handshake, and discovers the
+///   `mcp__sage__*` tools.
+/// * [`InteractionMode::Repl`]: the operator drives `claude` interactively
+///   in this folder; auto-discovered `.claude/.mcp.json` registers the same
+///   Astrid server, so the REPL session is "on Astrid" with the capsule
+///   tool surface available. The operator may add more servers; sage only
+///   guarantees the Astrid one is present.
+pub(crate) fn mcp_json(_cfg: &PrincipalConfig, principal_id: &str) -> serde_json::Value {
+    // Register the Astrid MCP server in BOTH modes. This is what makes a
+    // session "on Astrid": `astrid mcp serve` is the stdio shim onto the
+    // daemon's sage-mcp broker, so Claude — headless OR the interactive
+    // REPL the operator drives in this folder — discovers and calls the
+    // capsule tool surface (`mcp__sage__*`). The principal is baked in so
+    // the daemon scopes tool execution to this identity. The operator can
+    // still add their own MCP servers to this file in repl mode; sage only
+    // guarantees the Astrid server is present.
+    serde_json::json!({
+        "mcpServers": {
+            "sage": {
+                "command": "astrid",
+                "args": ["mcp", "serve", "--principal", principal_id],
+                "env": {}
             }
-        }),
-        InteractionMode::Repl => serde_json::json!({ "mcpServers": {} }),
-    }
+        }
+    })
 }
 
 #[cfg(test)]
@@ -993,16 +1001,26 @@ mod tests {
     }
 
     #[test]
-    fn mcp_repl_mode_is_empty() {
+    fn mcp_repl_mode_also_registers_sage_server() {
+        // The interactive REPL must be "on Astrid" too: it auto-discovers
+        // this `.mcp.json` and gets the same Astrid MCP server headless does.
         for am in [AuthMode::ApiKey, AuthMode::Subscription] {
             let v = mcp_json(&cfg(InteractionMode::Repl, am), "alice");
-            let servers = v
-                .pointer("/mcpServers")
-                .and_then(|x| x.as_object())
-                .expect("mcpServers must be a JSON object");
-            assert!(
-                servers.is_empty(),
-                "repl ({am:?}): mcpServers must be empty (user wires their own)"
+            assert_eq!(
+                v.pointer("/mcpServers/sage/command")
+                    .and_then(|x| x.as_str()),
+                Some("astrid"),
+                "repl ({am:?}): the Astrid MCP server must be registered"
+            );
+            let args: Vec<&str> = v
+                .pointer("/mcpServers/sage/args")
+                .and_then(|x| x.as_array())
+                .map(|a| a.iter().filter_map(|x| x.as_str()).collect())
+                .unwrap_or_default();
+            assert_eq!(
+                args,
+                vec!["mcp", "serve", "--principal", "alice"],
+                "repl ({am:?}): server must be `astrid mcp serve --principal <id>`"
             );
         }
     }
