@@ -85,21 +85,24 @@ pub(crate) fn sanitize_principal_id(id: &str) -> Result<String, SysError> {
     Ok(id.to_string())
 }
 
-/// Source-of-truth deny list for the headless mode — every built-in
-/// Claude tool that must be blocked so `mcp__sage__*` is the SOLE tool
-/// surface. The rule is exhaustive by design: any built-in that can act
-/// (file/shell/web), spawn agents, schedule or drive control flow, read
-/// MCP resources, or surface other tools is denied, so a session cannot
-/// reach around the sandbox via a tool the list forgot.
+/// Source-of-truth deny list for the headless NATIVE-TOOLS model — the
+/// ESCAPE / orchestration surface that stays blocked even though Claude's
+/// own dev tools (Bash / Read / Write / Edit / Glob / Grep / Web*) are now
+/// ALLOWED and sandboxed. Denied: a second shell (`PowerShell`), sub-agent
+/// spawn / teaming, scheduling + control-flow transitions, Astrid's OWN
+/// task surface, off-host exfiltration channels, raw MCP resource /
+/// tool-loading surfaces, and the indirect-execution skill surface — each
+/// a governance axis that does not belong to a single supervised session.
 ///
 /// Defence-in-depth caveat: this list lives in `settings.local.json`,
 /// Claude's WEAKEST, fully session-overridable settings tier — a capable
 /// session can edit any of these denies away. The BINDING tool gate is
-/// the spawn argv (`--tools ""` + `--allowed-tools mcp__sage__*` +
-/// `--disallowedTools <this list>`, see `sage::spawn::argv` /
-/// `sage::spawn::DENIED_TOOLS`), which sits above every on-disk file tier
-/// in Claude's precedence order. This file copy is a redundant second
-/// layer, not the primary enforcement boundary.
+/// the spawn argv (`--permission-mode dontAsk` — anything not in
+/// `permissions.allow` is auto-denied — plus `--disallowedTools <this
+/// list>`, see `sage::spawn::argv` / `sage::spawn::DENIED_TOOLS`), which
+/// sits above every on-disk file tier in Claude's precedence order; and
+/// the Astrid HOST sandbox bounds whatever does run. This file copy is a
+/// redundant second layer, not the primary enforcement boundary.
 ///
 /// SYNC (load-bearing): every name here MUST also appear in
 /// `sage::spawn::DENIED_TOOLS` (sage/src/spawn.rs), the copy hoisted into
@@ -127,35 +130,20 @@ pub(crate) fn sanitize_principal_id(id: &str) -> Result<String, SysError> {
 /// Public-in-module so tests can both assert presence in the JSON and use
 /// it as a parameterised fixture.
 const REQUIRED_DENIES: &[&str] = &[
-    // File / shell / web — the core action surface.
-    "Bash",
+    // A second shell on its own tool name — the native shell is `Bash`
+    // (now allowed, sandboxed); the redundant shell surface stays closed.
     "PowerShell",
-    "Read",
-    "Write",
-    "Edit",
-    "NotebookEdit",
-    "WebFetch",
-    "WebSearch",
-    "Glob",
-    "Grep",
-    "LSP",
-    // Background command execution: `Monitor` runs a command in the
-    // background under Bash-equivalent semantics; denying `Bash` does not
-    // cover it because it is a distinct tool name.
-    "Monitor",
-    // Agent / sub-agent spawning and orchestration — the highest-value
-    // escape: a spawned agent or workflow runs its own tool calls and
-    // could reach a capability this session is denied. `Agent` is the
-    // current name; `Task` is the legacy alias for the same surface.
+    // Sub-agent spawn / teaming — a spawned agent runs its OWN tool calls
+    // and is a separate principal-scoping question. `Task` is the legacy
+    // `Agent` alias.
     "Agent",
     "Task",
     "Workflow",
     "SendMessage",
     "TeamCreate",
     "TeamDelete",
-    // Scheduling / control flow — anything that can queue a future prompt,
-    // reschedule a loop, or drive plan-mode transitions outside sage's
-    // run loop.
+    // Scheduling / control flow — queue a future prompt, reschedule a loop,
+    // or drive plan-mode / worktree transitions outside sage's run loop.
     "CronCreate",
     "CronDelete",
     "CronList",
@@ -164,41 +152,56 @@ const REQUIRED_DENIES: &[&str] = &[
     "ExitPlanMode",
     "EnterWorktree",
     "ExitWorktree",
-    // Task-list surface — created/queried/stopped tasks are control flow
-    // that bypasses sage's loop; deny the whole family.
+    // Astrid's OWN task surface — these are ASTRID's tools, not Claude's;
+    // the supervised session must not drive Astrid's control plane.
     "TaskCreate",
     "TaskGet",
     "TaskList",
     "TaskStop",
     "TaskUpdate",
     "TaskOutput",
-    "TodoWrite",
-    // External / exfiltration surfaces — push notifications, remote
-    // routine triggers on claude.ai, and the onboarding-guide upload all
-    // reach off-host channels sage does not mediate.
+    // External / exfiltration surfaces — off-host channels sage does not
+    // mediate.
     "PushNotification",
     "RemoteTrigger",
     "ShareOnboardingGuide",
     // MCP resource + tool-loading surfaces: reading raw MCP resources or
-    // loading deferred tools is a way back to a capability the curated
-    // `mcp__sage__*` allow list does not expose. `ListMcpResourcesTool`
-    // and `ReadMcpResourceTool` carry the `Tool` suffix in the current
-    // reference.
+    // loading deferred tools reaches a tool around the gated surface.
     "ListMcpResourcesTool",
     "ReadMcpResourceTool",
     "ToolSearch",
     "WaitForMcpServers",
-    // Skill subsystem: a skill can run shell / arbitrary tools.
-    // `disableSkillShellExecution` blunts the shell path, but deny the
-    // tool itself too. `SlashCommand` is the legacy alias for the same
-    // indirect-execution surface.
+    // Indirect-execution surface — a skill / slash command can fan out to
+    // other tools; deferred until the indirect path is governed.
+    // `SlashCommand` is the legacy `Skill` alias.
     "Skill",
     "SlashCommand",
-    // Legacy file-edit / shell-control aliases — folded into other tools
-    // in current builds; kept as harmless no-ops for older `claude` pins.
+];
+
+/// Native dev-tool surface auto-approved under the headless native-tools
+/// model. With `--permission-mode dontAsk` (binding via argv) only tools
+/// matched here — or read-only sandboxed Bash — run without a prompt;
+/// everything else, including the [`REQUIRED_DENIES`] escape surface, is
+/// auto-denied. `mcp__sage__*` keeps the registered sage MCP server
+/// reachable for Astrid-specific operations. Bounds on what these tools can
+/// DO come from the sandbox (Astrid host + Claude inner), not this list.
+const NATIVE_ALLOW: &[&str] = &[
+    "Bash",
+    "Read",
+    "Write",
+    "Edit",
     "MultiEdit",
+    "NotebookEdit",
+    "Glob",
+    "Grep",
+    "WebFetch",
+    "WebSearch",
+    "LSP",
+    "Monitor",
     "BashOutput",
     "KillShell",
+    "TodoWrite",
+    "mcp__sage__*",
 ];
 
 /// The Claude hook events sage declares in `settings.local.json`. Each
@@ -318,11 +321,12 @@ fn hooks_block() -> serde_json::Value {
 ///
 /// The BINDING tool/permission gate is the spawn argv, which sits above
 /// every on-disk file tier (only Managed, a fixed SYSTEM-path tier sage
-/// cannot author, outranks it). See `sage::spawn::argv`: `--tools ""`
-/// disables the built-in surface, `--allowed-tools mcp__sage__*` pins the
-/// only reachable tools, `--strict-mcp-config` + `--mcp-config` register
-/// exactly the `astrid mcp serve` MCP server (whose sage-mcp broker
-/// enforces capability checks server-side), and `--no-session-persistence`
+/// cannot author, outranks it). See `sage::spawn::argv`: `--permission-mode
+/// dontAsk` auto-denies any tool not allow-listed (fail-secure, no prompt),
+/// `--sandbox` bounds Claude's native tools (under the Astrid host
+/// sandbox), `--disallowedTools <REQUIRED_DENIES>` binds the escape-surface
+/// deny, `--strict-mcp-config` + `--mcp-config` register the `astrid mcp
+/// serve` MCP server for Astrid-specific ops, and `--no-session-persistence`
 /// suppresses Claude's own JSONL. Those flags cannot be overridden from
 /// within the session.
 ///
@@ -339,9 +343,11 @@ fn hooks_block() -> serde_json::Value {
 /// Branching is driven by the two axes in [`PrincipalConfig`]:
 ///
 /// * [`InteractionMode::Headless`]: sage drives the loop. The allow list
-///   is pinned to `mcp__sage__*`, every built-in tool in
-///   [`REQUIRED_DENIES`] is denied, and `disableSkillShellExecution` is
-///   set so the skill subsystem cannot shell out around the sandbox.
+///   is [`NATIVE_ALLOW`] (Claude's dev tools + the sage MCP surface), the
+///   escape surface in [`REQUIRED_DENIES`] is denied, `permissions.defaultMode`
+///   is `dontAsk` (auto-deny the rest, no prompt), the `sandbox` block bounds
+///   Claude's native tools, and `disableSkillShellExecution` blocks the skill
+///   shell path.
 /// * [`InteractionMode::Repl`]: the user drives `claude` directly. Allow
 ///   and deny lists are empty (user owns their full Claude environment)
 ///   and `disableSkillShellExecution` is omitted.
@@ -367,36 +373,57 @@ fn hooks_block() -> serde_json::Value {
 /// equivalent today). The `astrid-capsule-hook-bridge` WASM capsule
 /// already maps lifecycle events to semantic hooks on the bus side.
 pub(crate) fn settings_json(cfg: &PrincipalConfig) -> serde_json::Value {
-    let (allow, deny, skill_shell): (Vec<&str>, Vec<&str>, Option<bool>) = match cfg
-        .interaction_mode
-    {
-        InteractionMode::Headless => (
-            vec!["mcp__sage__*"],
-            REQUIRED_DENIES.to_vec(),
-            Some(true),
-        ),
-        InteractionMode::Repl => (vec![], vec![], None),
+    let (allow, deny, headless): (Vec<&str>, Vec<&str>, bool) = match cfg.interaction_mode {
+        InteractionMode::Headless => (NATIVE_ALLOW.to_vec(), REQUIRED_DENIES.to_vec(), true),
+        InteractionMode::Repl => (vec![], vec![], false),
     };
 
+    let mut permissions = serde_json::json!({
+        "allow": allow,
+        "deny": deny,
+    });
+    if headless {
+        // Fail-secure headless posture: a tool not in `allow` (and not a
+        // read-only sandboxed Bash command) is auto-DENIED, never prompted
+        // — a prompt would hang the terminal-less `-p` session. Mirrors the
+        // binding `--permission-mode dontAsk` argv flag.
+        permissions["defaultMode"] = serde_json::json!("dontAsk");
+    }
+
     let mut root = serde_json::json!({
-        "permissions": {
-            "allow": allow,
-            "deny": deny,
-        },
+        "permissions": permissions,
         "hooks": hooks_block(),
         "cleanupPeriodDays": 30,
     });
     let obj = root
         .as_object_mut()
         .expect("settings root literal is a JSON object");
-    if let Some(b) = skill_shell {
-        obj.insert("disableSkillShellExecution".to_string(), serde_json::json!(b));
+
+    if headless {
+        // Claude's own Bash/file sandbox — a best-effort INNER layer under
+        // the Astrid host sandbox. Writes are bounded to the working dir
+        // (cwd = the principal HOME); `allowUnsandboxedCommands:false` stops
+        // a command opting out. Network egress + sensitive-read denials
+        // belong in the (un-overridable) managed tier; this overridable copy
+        // only ever narrows, and if Claude's sandbox cannot initialise
+        // nested inside the host sandbox the host sandbox still binds.
+        obj.insert(
+            "sandbox".to_string(),
+            serde_json::json!({
+                "enabled": true,
+                "allowUnsandboxedCommands": false,
+                "filesystem": { "allowWrite": ["./", "$TMPDIR"] }
+            }),
+        );
+        // The skill subsystem can fan out to shell; `Skill` is denied, but
+        // block its shell path defensively too.
+        obj.insert(
+            "disableSkillShellExecution".to_string(),
+            serde_json::json!(true),
+        );
     }
     if matches!(cfg.auth_mode, AuthMode::ApiKey) {
-        obj.insert(
-            "apiKeyHelper".to_string(),
-            serde_json::json!("/bin/false"),
-        );
+        obj.insert("apiKeyHelper".to_string(), serde_json::json!("/bin/false"));
     }
     root
 }
@@ -552,13 +579,26 @@ mod tests {
     }
 
     fn assert_headless_shape(v: &serde_json::Value) {
+        // Native-tools allow surface: the dev tools + the sage MCP server,
+        // exactly NATIVE_ALLOW.
         let allow = v
             .pointer("/permissions/allow")
             .and_then(|x| x.as_array())
             .expect("permissions.allow must be a JSON array");
-        assert_eq!(allow.len(), 1, "headless: only one allow entry permitted");
-        assert_eq!(allow[0], serde_json::json!("mcp__sage__*"));
+        for required in NATIVE_ALLOW {
+            assert!(
+                allow.iter().any(|a| a == required),
+                "headless: allow list missing native tool '{required}'"
+            );
+        }
+        assert_eq!(
+            allow.len(),
+            NATIVE_ALLOW.len(),
+            "headless: allow list must be exactly NATIVE_ALLOW"
+        );
 
+        // The escape surface stays denied, exactly REQUIRED_DENIES — and a
+        // native dev tool must never appear on BOTH lists.
         let deny = v
             .pointer("/permissions/deny")
             .and_then(|x| x.as_array())
@@ -566,13 +606,37 @@ mod tests {
         for required in REQUIRED_DENIES {
             assert!(
                 deny.iter().any(|d| d == required),
-                "headless: deny list missing built-in tool '{required}' — claude could call it directly"
+                "headless: deny list missing escape tool '{required}'"
             );
         }
         assert_eq!(
             deny.len(),
             REQUIRED_DENIES.len(),
-            "headless: deny list must contain exactly the required built-in tools"
+            "headless: deny list must contain exactly the escape surface"
+        );
+        for allowed in NATIVE_ALLOW {
+            assert!(
+                !deny.iter().any(|d| d == allowed),
+                "headless: native tool '{allowed}' must not also be denied"
+            );
+        }
+
+        // Fail-secure permission mode + Claude's inner sandbox, both pinned.
+        assert_eq!(
+            v.pointer("/permissions/defaultMode").and_then(|x| x.as_str()),
+            Some("dontAsk"),
+            "headless: permission defaultMode must be dontAsk (fail-secure)"
+        );
+        assert_eq!(
+            v.pointer("/sandbox/enabled").and_then(|x| x.as_bool()),
+            Some(true),
+            "headless: Claude's sandbox must be enabled"
+        );
+        assert_eq!(
+            v.pointer("/sandbox/allowUnsandboxedCommands")
+                .and_then(|x| x.as_bool()),
+            Some(false),
+            "headless: a command must not be able to opt out of the sandbox"
         );
 
         assert_eq!(
@@ -599,6 +663,16 @@ mod tests {
         assert!(
             v.pointer("/disableSkillShellExecution").is_none(),
             "repl: disableSkillShellExecution must be omitted"
+        );
+        // Repl is the user's own environment — sage imposes no native-tools
+        // posture: no dontAsk mode, no sandbox object.
+        assert!(
+            v.pointer("/permissions/defaultMode").is_none(),
+            "repl: permission defaultMode must be omitted"
+        );
+        assert!(
+            v.pointer("/sandbox").is_none(),
+            "repl: sandbox object must be omitted"
         );
     }
 
@@ -902,18 +976,7 @@ mod tests {
         // sage::spawn::tests::denied_tools_equal_canonical_required_denies
         // (sage/src/spawn.rs) exactly.
         const CANONICAL: &[&str] = &[
-            "Bash",
             "PowerShell",
-            "Read",
-            "Write",
-            "Edit",
-            "NotebookEdit",
-            "WebFetch",
-            "WebSearch",
-            "Glob",
-            "Grep",
-            "LSP",
-            "Monitor",
             "Agent",
             "Task",
             "Workflow",
@@ -934,7 +997,6 @@ mod tests {
             "TaskStop",
             "TaskUpdate",
             "TaskOutput",
-            "TodoWrite",
             "PushNotification",
             "RemoteTrigger",
             "ShareOnboardingGuide",
@@ -944,9 +1006,6 @@ mod tests {
             "WaitForMcpServers",
             "Skill",
             "SlashCommand",
-            "MultiEdit",
-            "BashOutput",
-            "KillShell",
         ];
 
         // Compare as sets so a pure reordering of either list (no semantic
