@@ -205,6 +205,39 @@ pub(crate) fn handle_mcp_call(payload: Value) -> Result<(), SysError> {
         return Ok(());
     }
 
+    // Argument-level policy gate — the binding PDP. Evaluated in-process
+    // at THIS chokepoint (the one capsule-space point holding parsed
+    // `(name, arguments)` before fan-out), so a supervised Claude cannot
+    // route around it the way it could strip a settings-tier PreToolUse
+    // hook. DENY → reply `isError` + never dispatch. The gate only ever
+    // NARROWS: no matching rule, no policy configured, or a policy-load
+    // failure all return `Allow`, leaving the host's execution-time
+    // capability enforcement as the live boundary — degrade-to-PEP, never
+    // "anything goes". The reason surfaced back is the operator's static
+    // rule id, never a reflected argument. See [`crate::policy`].
+    if let crate::policy::Decision::Deny { reason } =
+        crate::policy::evaluate(&crate::policy::load_rules(), &req.name, &req.arguments)
+    {
+        log::info(format!(
+            "sage-mcp: policy denied tool '{}' (req_id '{}'): {reason}",
+            req.name, req.req_id
+        ));
+        let _ = ipc::publish_json(
+            "sage.v1.audit.policy_deny",
+            &serde_json::json!({ "tool": req.name, "rule": reason }),
+        );
+        let reply = json!({
+            "kind": "tool.call",
+            "req_id": req.req_id,
+            "content": mcp_content(Value::String(format!(
+                "sage-mcp: tool call denied by policy (rule: {reason})"
+            ))),
+            "isError": true,
+        });
+        publish_reply(&reply_topic, &reply);
+        return Ok(());
+    }
+
     // The execute core wants a `call_id` for result correlation on the
     // shared `tool.v1.execute.<bare>.result` topic. The broker's
     // `req_id` doubles as that correlation token — it is already

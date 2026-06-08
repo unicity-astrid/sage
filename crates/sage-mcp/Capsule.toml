@@ -28,6 +28,19 @@ kv = []
 # this — it only exposes the public tool surface.
 [env]
 trusted_ingress_ids = { type = "string", default = "", request = "Comma-separated UUIDs of trusted ingress capsules allowed to drive MCP tool calls (e.g. the cli proxy capsule UUID)" }
+# Per-principal argument-level policy rules — a JSON array of
+# { id, effect:"deny"|"allow", tool:"<glob>", when:[{pointer,op,value}] }.
+# Evaluated IN-PROCESS at the broker chokepoint (`policy::evaluate`,
+# read via `env::var_opt("policy_rules")`, so it resolves the invoking
+# principal's overlay — per-principal with no cross-capsule KV write,
+# mirroring `trusted_ingress_ids`). The PDP only NARROWS: unset / empty /
+# malformed → no policy → the host's exec-time capability enforcement
+# remains the boundary (degrade-to-PEP + a loud `sage.v1.audit.policy_*`
+# audit). DENY rules over free-form strings are best-effort (the kernel
+# resolves `home://` host-side; a raw-literal path/command deny is
+# evadable) — the robust shapes are allowlist-style eq/prefix. See
+# `crate::policy`.
+policy_rules = { type = "string", default = "", request = "Per-principal policy rules as a JSON array (leave blank for none); see sage-mcp policy docs" }
 
 # sage-mcp describes the tool surface Claude sees by querying the tool
 # registry and reshaping into MCP tool descriptors, and brokers tool
@@ -77,6 +90,12 @@ trusted_ingress_ids = { type = "string", default = "", request = "Comma-separate
 
 [publish]
 "sage.v1.tools.list" = {}
+# Policy-gate audits emitted by `crate::policy` at the broker chokepoint:
+# `sage.v1.audit.policy_deny` (a tool call refused by a rule) and
+# `sage.v1.audit.policy_load_failed` (rules unset/unparseable/over-cap →
+# policy degraded to the exec-time capability PEP). Single `*` covers the
+# 4-segment `sage.v1.audit.<name>` topics.
+"sage.v1.audit.*" = {}
 # Broker reply channel. Both broker handlers reply on
 # `astrid.v1.response.<req_id>`; the `req_id` is a single clean segment
 # (UUID-ish, validated in `broker::reply_topic`) so the egress topic is

@@ -81,6 +81,7 @@ mod broker;
 mod cache;
 mod discovery;
 mod execute;
+mod policy;
 
 use astrid_sdk::prelude::*;
 
