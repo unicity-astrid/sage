@@ -244,10 +244,10 @@ impl Sage {
         //     settings).
         //
         // Missing / malformed records still fall back fail-secure to
-        // the default `{Headless, ApiKey, schema_version=1}` via the
-        // `Current` arm of `load_status` — preserves current behaviour
-        // for any principal that hasn't run sage's `#[astrid::install]`
-        // hook yet.
+        // the default `{Headless, ApiKey}` at the current `SCHEMA_VERSION`
+        // via the `Current` arm of `load_status` — preserves current
+        // behaviour for any principal that hasn't run sage's
+        // `#[astrid::install]` hook yet.
         let cfg = match load_principal_config_status() {
             LoadOutcome::Current(cfg) => cfg,
             LoadOutcome::NeedsMigration {

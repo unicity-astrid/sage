@@ -204,9 +204,16 @@ impl PrincipalConfig {
 ///   spawn-rejection rather than silently demoting to default, which
 ///   would overwrite operator-persisted settings on a binary downgrade.
 ///
-/// Today [`SCHEMA_VERSION`] is `1`, so neither the `NeedsMigration` nor
-/// `Unknown` branch is hot in production — the structure exists so the
-/// next schema bump is painless.
+/// [`SCHEMA_VERSION`] is `2` today, so the `NeedsMigration` branch IS
+/// live: a record persisted at schema 1 migrates forward on its next
+/// spawn, publishing `sage.v1.install.relink`. That relink and the
+/// install-driven artifact reconcile in sage-install can BOTH rewrite the
+/// same `.claude/` files on a single spawn — which is safe, because both
+/// write the identical patched-headless shape via atomic rename. The
+/// `Unknown` branch stays cold until some binary persists a
+/// strictly-newer schema. (schema_version tracks the CONFIG shape,
+/// independently of sage-install's `artifact_version` for the on-disk
+/// FILE shape — a file change can ship without a schema bump.)
 ///
 /// [`Current`]: LoadOutcome::Current
 /// [`NeedsMigration`]: LoadOutcome::NeedsMigration
@@ -555,9 +562,8 @@ mod tests {
         // observed value so the caller can audit the migration.
         //
         // We construct an artificially-older record by setting
-        // schema_version=0 manually. SCHEMA_VERSION is 1 today so this
-        // is the only available "older" value; the test exists so the
-        // branch is exercised once the schema bumps.
+        // schema_version=0 manually — strictly below the current
+        // SCHEMA_VERSION (2), so it classifies as NeedsMigration.
         let older = PrincipalConfig {
             interaction_mode: InteractionMode::Repl,
             auth_mode: AuthMode::Subscription,
@@ -626,8 +632,8 @@ mod tests {
         // Strictly-newer schema_version → Unknown(v). The caller (i.e.
         // handle_spawn) is expected to reject the spawn rather than
         // silently demote to default — a binary downgrade would
-        // otherwise overwrite an operator's schema_version=2 record
-        // with our schema_version=1 default.
+        // otherwise overwrite an operator's newer record with this
+        // (older) binary's default schema_version.
         let newer = PrincipalConfig {
             interaction_mode: InteractionMode::Headless,
             auth_mode: AuthMode::ApiKey,

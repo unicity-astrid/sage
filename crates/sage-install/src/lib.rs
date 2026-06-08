@@ -18,7 +18,12 @@
 //!    `~/.astrid/home/<principal>/`).
 //! 3. Checks the KV idempotency marker `sage.install.complete.<id>` —
 //!    short-circuits to a cached `sage.v1.install.complete` event
-//!    unless `force=true`.
+//!    unless `force=true`. On a cache-hit whose marker records an older
+//!    `artifact_version` than this binary writes, the `.claude/` files
+//!    are reconciled in place ONCE (headless only) before the
+//!    short-circuit, so a pre-existing principal picks up a changed file
+//!    shape (e.g. the registered `astrid mcp serve` `.mcp.json`) without
+//!    a manual `--force`. See [`ARTIFACT_VERSION`].
 //! 4. Creates `.claude/` and `.claude/projects/`.
 //! 5. Atomically writes `.claude/settings.local.json` for the principal,
 //!    shaped by the `PrincipalConfig` threaded over the IPC envelope.
@@ -96,7 +101,7 @@ mod settings;
 use astrid_sdk::prelude::*;
 use serde::{Deserialize, Serialize};
 
-use crate::config::PrincipalConfig;
+use crate::config::{InteractionMode, PrincipalConfig};
 use crate::layout::{
     claude_dir, install_complete_key, principal_home, projects_dir, sanitize_principal_id,
 };
@@ -174,11 +179,49 @@ struct InstallMarker {
     installed_at: u64,
     version: String,
     home_path: String,
+    /// Shape-version of the authored `.claude/` artifact set — NOT the
+    /// crate version. Bumped whenever the files [`write_configs`] writes
+    /// change shape (e.g. `.mcp.json` stub → registered `astrid mcp serve`
+    /// server) so the cache-hit path can detect a pre-existing principal
+    /// whose on-disk files predate the current authoring logic and
+    /// reconcile them once. Legacy markers written before this field
+    /// existed deserialize to 0 via `#[serde(default)]`, so they read as
+    /// stale and trigger exactly one reconcile. See [`ARTIFACT_VERSION`].
+    #[serde(default)]
+    artifact_version: u32,
 }
 
 const STATUS_TOPIC: &str = "sage.v1.install.status";
 const COMPLETE_TOPIC: &str = "sage.v1.install.complete";
 const CAPSULE_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Current shape-version of the authored `.claude/` artifact set. Bump
+/// this — and document the shape change below — whenever the files
+/// [`write_configs`] writes change shape, so a pre-existing principal
+/// reconciles its on-disk files on the next install/spawn instead of
+/// silently running the stale shape until a manual `--force`.
+///
+/// This axis is INDEPENDENT of sage's `PrincipalConfig::schema_version`:
+/// a `.claude/` file-shape change (e.g. the `.mcp.json` stub → registered
+/// `astrid mcp serve` switch) can ship WITHOUT a config-schema bump, so a
+/// principal that reads as schema-`Current` — which sage's
+/// `NeedsMigration` relink never touches — can still hold stale files.
+/// That gap is exactly what this field closes, so bump it for ANY
+/// authored-file shape change regardless of whether schema_version moves.
+///
+/// History — bump in lockstep with each shape change:
+/// - v0 (legacy markers, no `artifact_version` field): `.mcp.json` was a non-functional stub; sage parsed tool calls inline from claude's stream-json.
+/// - v1: `.mcp.json` registers the `sage` MCP server (`astrid mcp serve --principal <id>`); claude executes `mcp__sage__*` tools directly against it.
+const ARTIFACT_VERSION: u32 = 1;
+
+/// True when a cache-hit marker's recorded artifact shape predates the
+/// current [`ARTIFACT_VERSION`], so the on-disk `.claude/` files must be
+/// reconciled. A strictly-newer shape (a downgraded binary reading a
+/// forward marker) is NOT stale — never rewrite forward artifacts
+/// backward. Pure so it is unit-testable without the bus / fs.
+fn artifact_is_stale(marker_version: u32) -> bool {
+    marker_version < ARTIFACT_VERSION
+}
 
 /// sage-install provisioner.
 #[derive(Default)]
@@ -324,6 +367,26 @@ fn run_install(req: &InstallRequest, cfg: PrincipalConfig) -> Result<String, Sys
     if !req.force
         && let Some(marker) = kv::get_json_opt::<InstallMarker>(&install_complete_key(&sanitized))?
     {
+        // Artifact reconcile: when this principal was provisioned by an
+        // older sage-install whose authored file SHAPES differ from this
+        // binary's (e.g. the pre-MCP-server `.mcp.json` stub), rewrite the
+        // `.claude/` files in place — exactly once — so the principal
+        // picks up the current shape without a manual `--force`. Without
+        // this, a stale `.mcp.json` would leave the spawned claude with no
+        // `sage` MCP server registered and therefore zero tools.
+        //
+        // Headless ONLY. In repl mode sage does not own `.mcp.json` — the
+        // user wires their own MCP servers there — so reconciling would
+        // clobber their edits. Repl artifacts never needed the registered
+        // server anyway (no sage-spawned claude), so there is nothing to
+        // reconcile. In steady state (versions equal) this is a pure
+        // cache-hit with no fs writes.
+        if cfg.interaction_mode == InteractionMode::Headless
+            && artifact_is_stale(marker.artifact_version)
+        {
+            reconcile_artifacts(&sanitized, &cfg, &marker.home_path)?;
+        }
+
         publish_status(&sanitized, "already_installed", "skipping install");
         // Audit the install-time choices on the cache-hit path. The
         // emit is best-effort (no propagated error) — the install
@@ -384,6 +447,7 @@ fn run_install(req: &InstallRequest, cfg: PrincipalConfig) -> Result<String, Sys
         installed_at: epoch_secs(),
         version: CAPSULE_VERSION.to_string(),
         home_path: resolved_home.clone(),
+        artifact_version: ARTIFACT_VERSION,
     };
     kv::set_json(&install_complete_key(&sanitized), &marker)?;
 
@@ -428,6 +492,54 @@ fn run_relink(req: &RelinkRequest, cfg: PrincipalConfig) -> Result<String, SysEr
 
     publish_status(&sanitized, "relink_complete", "configs rewritten");
     Ok(resolved_home)
+}
+
+/// Rewrite a pre-existing principal's `.claude/` artifacts in place to
+/// the current [`ARTIFACT_VERSION`] shape, then bump the marker so the
+/// next install is a pure cache-hit again. Reached ONLY from the
+/// cache-hit branch of [`run_install`], for a headless principal whose
+/// marker [`artifact_is_stale`].
+///
+/// Mirrors [`run_relink`]'s write discipline: provision dirs (nuke-safe),
+/// scrub stale temp siblings, then atomically rewrite the three config
+/// files; a write failure scrubs and propagates so a spawn never proceeds
+/// on a half-written `.mcp.json`. The marker bump is best-effort — the
+/// files are already current, so a KV write failure only costs a
+/// redundant (idempotent) reconcile on the next spawn, never a failed one.
+fn reconcile_artifacts(
+    sanitized_id: &str,
+    cfg: &PrincipalConfig,
+    home_path: &str,
+) -> Result<(), SysError> {
+    publish_status(sanitized_id, "reconcile", "rewriting stale .claude/ artifacts");
+
+    provision_dirs(sanitized_id)?;
+    atomic::cleanup_temp(&layout::settings_path());
+    atomic::cleanup_temp(&layout::mcp_path());
+    atomic::cleanup_temp(&claude_md::claude_md_path());
+
+    if let Err(e) = write_configs(sanitized_id, cfg) {
+        atomic::cleanup_temp(&layout::settings_path());
+        atomic::cleanup_temp(&layout::mcp_path());
+        return Err(e);
+    }
+
+    // Bump the marker to the current artifact_version so the next spawn
+    // short-circuits cleanly. home_path is preserved verbatim — reconcile
+    // does not re-canonicalize; the principal home is unchanged.
+    let bumped = InstallMarker {
+        installed_at: epoch_secs(),
+        version: CAPSULE_VERSION.to_string(),
+        home_path: home_path.to_string(),
+        artifact_version: ARTIFACT_VERSION,
+    };
+    if let Err(e) = kv::set_json(&install_complete_key(sanitized_id), &bumped) {
+        log::warn(format!(
+            "sage-install: reconcile for {sanitized_id} rewrote configs but failed to \
+             bump the marker ({e:?}); the next spawn will reconcile again (idempotent)"
+        ));
+    }
+    Ok(())
 }
 
 fn provision_dirs(sanitized_id: &str) -> Result<(), SysError> {
@@ -613,5 +725,54 @@ mod tests {
                 .unwrap_or(false),
             "default max_turns echoes as JSON null"
         );
+    }
+
+    /// A marker persisted before the `artifact_version` field existed
+    /// (the legacy `.mcp.json`-stub era) deserializes with the field at 0
+    /// via `#[serde(default)]` and is detected as stale — the property
+    /// that makes a pre-existing principal reconcile exactly once on its
+    /// next install/spawn instead of running the stale shape forever.
+    #[test]
+    fn legacy_marker_defaults_artifact_version_to_zero_and_is_stale() {
+        let payload = r#"{"installed_at":1,"version":"0.1.0","home_path":"/home/alice"}"#;
+        let marker: InstallMarker =
+            serde_json::from_str(payload).expect("legacy marker must deserialize");
+        assert_eq!(
+            marker.artifact_version, 0,
+            "absent artifact_version must default to 0, not a deserialize error"
+        );
+        assert!(
+            artifact_is_stale(marker.artifact_version),
+            "a v0 (legacy) marker must read as stale against the current ARTIFACT_VERSION"
+        );
+    }
+
+    /// The current shape is not stale (no needless rewrite in steady
+    /// state), and a strictly-newer shape — a downgraded binary reading a
+    /// forward marker — is not stale either: we never rewrite forward
+    /// artifacts backward.
+    #[test]
+    fn current_and_future_artifact_versions_are_not_stale() {
+        assert!(!artifact_is_stale(ARTIFACT_VERSION));
+        assert!(!artifact_is_stale(ARTIFACT_VERSION + 1));
+    }
+
+    /// A freshly-written marker round-trips the current `artifact_version`
+    /// so the very next spawn is a pure cache-hit (not a re-reconcile).
+    #[test]
+    fn fresh_marker_round_trips_current_artifact_version() {
+        let marker = InstallMarker {
+            installed_at: 1,
+            version: CAPSULE_VERSION.to_string(),
+            home_path: "/home/alice".into(),
+            artifact_version: ARTIFACT_VERSION,
+        };
+        let v: serde_json::Value = serde_json::to_value(&marker).unwrap();
+        assert_eq!(
+            v.get("artifact_version").and_then(serde_json::Value::as_u64),
+            Some(u64::from(ARTIFACT_VERSION))
+        );
+        let back: InstallMarker = serde_json::from_value(v).unwrap();
+        assert!(!artifact_is_stale(back.artifact_version));
     }
 }
