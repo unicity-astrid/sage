@@ -13,31 +13,30 @@
 //! descriptors, caches them, and serves the assembled list on
 //! `sage.v1.tools.list`.
 //!
-//! Two front doors, ONE set of discovery/execute internals:
+//! Tool DISCOVERY is shared; tool EXECUTION flows through ONE door.
 //!
-//! ### Agent-runner surface (`sage.v1.*`)
+//! ### Discovery (cache-feeding, used by the broker)
 //!
 //! * `sage.v1.tools.describe` -> [`SageMcp::describe_tools`]:
 //!   on-demand fan-out + cache replace + republish.
 //! * `tool.v1.response.describe.*` -> [`SageMcp::collect_tool_descriptors`]:
 //!   event-driven cache merge.
-//! * `sage.v1.tool.call.<call_id>` -> [`SageMcp::handle_tool_call`]:
-//!   live execute bridge — strips the `mcp__sage__` prefix, fans out
-//!   to `tool.v1.execute.<bare_name>`, drains
-//!   `tool.v1.execute.<bare_name>.result`, reshapes into the
-//!   `sage.v1.tool.result.<call_id>` envelope that
-//!   `sage::tooling::result::handle_tool_result` consumes. The bridge
-//!   owns the response invariant: every accepted call publishes
-//!   exactly one result, success or failure, so sage's
-//!   `pending_tool_calls` slot retires cleanly without waiting on the
-//!   60 s deadline sweeper.
 //!
-//! ### Broker surface (`astrid.v1.*`)
+//! ### Broker surface (`astrid.v1.*`) — the live execution door
 //!
-//! A second front door for a generic third-party MCP client behind a
-//! shim/proxy. Runs the SAME describe-collect and execute-dispatch
-//! internals; the shim only ever touches the sanitized `astrid.v1.*`
-//! surface and NEVER sees `tool.v1.*`.
+//! The front door for an MCP client behind a shim/proxy. `astrid mcp
+//! serve` (the rmcp stdio shim, unicity-astrid/astrid#880) is that
+//! client: the supervised `claude -p` subprocess registers it via
+//! `--mcp-config` and calls `mcp__sage__*` tools against it DIRECTLY over
+//! MCP. The shim only ever touches the sanitized `astrid.v1.*` surface
+//! and NEVER sees `tool.v1.*`.
+//!
+//! There is no longer a `sage.v1.tool.call.*` agent-runner execution leg:
+//! the sage supervisor used to dispatch tool calls inline on that topic,
+//! but that double-executed every tool once the registered MCP server was
+//! in play (claude executes against the broker AND sage would re-execute
+//! on the bus). The inline leg was retired; the broker is the sole
+//! execution path.
 //!
 //! * `astrid.v1.request.mcp.tools.list` -> [`SageMcp::handle_mcp_list`]:
 //!   describe-collect snapshot, RAW MCP descriptors, reply on
@@ -117,24 +116,6 @@ impl SageMcp {
         Ok(())
     }
 
-    /// `sage.v1.tool.call.<call_id>` — live execute bridge.
-    ///
-    /// Strips the `mcp__sage__` MCP prefix off the inbound `tool_name`,
-    /// publishes `tool.v1.execute.<bare>` with the SDK-canonical
-    /// `ToolExecuteRequest` shape, drains
-    /// `tool.v1.execute.<bare>.result` for the matching `call_id`, and
-    /// publishes `sage.v1.tool.result.<call_id>` with the result
-    /// reshaped into the `{ call_id, content, isError }` envelope
-    /// `sage::tooling::result::handle_tool_result` expects. Every
-    /// failure path (unknown prefix, invalid name, subscribe / publish
-    /// error, 50 s drain timeout) writes back an `isError:true`
-    /// envelope so the sage-side `pending_tool_calls` slot retires
-    /// cleanly. See `execute` for the wire-shape and timeout details.
-    #[astrid::interceptor("handle_tool_call")]
-    pub fn handle_tool_call(&self, payload: serde_json::Value) -> Result<(), SysError> {
-        execute::handle_tool_call(payload)
-    }
-
     /// `astrid.v1.request.mcp.tools.list` — broker front door.
     ///
     /// Runs the same describe-collect snapshot as [`Self::describe_tools`],
@@ -149,9 +130,9 @@ impl SageMcp {
 
     /// `astrid.v1.request.mcp.tool.call` — broker front door.
     ///
-    /// Runs the same execute-dispatch core as [`Self::handle_tool_call`]
-    /// (charset/topic-segment hardening, 50 s bounded drain, `call_id`
-    /// filtering) and replies on `astrid.v1.response.<req_id>` with
+    /// Runs the shared execute-dispatch core ([`execute::dispatch_with_approval`])
+    /// — charset/topic-segment hardening, 50 s bounded drain, `call_id`
+    /// filtering — and replies on `astrid.v1.response.<req_id>` with
     /// `{ kind:"tool.call", req_id, content:[...], isError:bool }`. Every
     /// failure path reshapes into `isError:true` so the proxy never
     /// hangs.

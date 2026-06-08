@@ -29,20 +29,21 @@ kv = []
 [env]
 trusted_ingress_ids = { type = "string", default = "", request = "Comma-separated UUIDs of trusted ingress capsules allowed to drive MCP tool calls (e.g. the cli proxy capsule UUID)" }
 
-# sage-mcp picks up tool-call requests from `sage` (claude -p emitted
-# a tool call), dispatches them via tool.v1 bus protocol, and returns
-# results. It also describes the tool surface Claude sees by querying
-# the tool registry and reshaping into MCP tool descriptors.
+# sage-mcp describes the tool surface Claude sees by querying the tool
+# registry and reshaping into MCP tool descriptors, and brokers tool
+# execution over the `astrid.v1.*` MCP surface (dispatched via the
+# tool.v1 bus protocol). Tool calls arrive ONLY through that broker front
+# door — `astrid mcp serve` is the registered MCP server the supervised
+# `claude -p` calls directly; there is no `sage.v1.tool.call.*`
+# agent-runner leg (it would double-execute against the broker).
 [subscribe]
-"sage.v1.tool.call.*" = { handler = "handle_tool_call" }
 "sage.v1.tools.describe" = { handler = "describe_tools" }
 "tool.v1.response.describe.*" = { handler = "collect_tool_descriptors" }
-# Broker front door: the sanitized `astrid.v1.*` MCP surface for a
-# generic third-party MCP client behind a shim/proxy. Same
-# discovery/execute internals as the `sage.v1.*` agent-runner path; the
-# shim never sees `tool.v1.*`. Both are exact (segment-arity-fixed)
-# topics — the proxy carries the correlation token in the body, not the
-# topic, so no wildcard suffix is needed here.
+# Broker front door: the sanitized `astrid.v1.*` MCP surface for an MCP
+# client behind a shim/proxy (`astrid mcp serve`). The shim never sees
+# `tool.v1.*`. Both are exact (segment-arity-fixed) topics — the proxy
+# carries the correlation token in the body, not the topic, so no
+# wildcard suffix is needed here.
 "astrid.v1.request.mcp.tools.list" = { handler = "handle_mcp_list" }
 "astrid.v1.request.mcp.tool.call" = { handler = "handle_mcp_call" }
 # Elicitation/approval bridge (broker side). The shim forwards Claude's
@@ -60,11 +61,11 @@ trusted_ingress_ids = { type = "string", default = "", request = "Comma-separate
 # fixed topic must be declared here even though there is no static handler
 # — the subscription is drained inline inside `dispatch_with_approval`.
 "astrid.v1.approval" = {}
-# Dynamic-subscribe pattern: `execute::handle_tool_call` calls
-# `ipc::subscribe("tool.v1.execute.<bare>.result")` per call. The kernel
-# gates runtime subscribes against this list, so the pattern must be
-# declared here even though there is no static handler — the
-# subscription is drained inline inside `handle_tool_call`.
+# Dynamic-subscribe pattern: `execute::dispatch_with_approval` calls
+# `ipc::subscribe("tool.v1.execute.<bare>.result")` per broker call. The
+# kernel gates runtime subscribes against this list, so the pattern must
+# be declared here even though there is no static handler — the
+# subscription is drained inline inside `dispatch_with_approval`.
 #
 # Kernel `topic_matches` treats `*` as a single-segment wildcard, so a
 # one-pattern declaration cannot cover both flat names ("read_file") and
@@ -75,8 +76,6 @@ trusted_ingress_ids = { type = "string", default = "", request = "Comma-separate
 "tool.v1.execute.*.*.result" = {}
 
 [publish]
-# Reshaped result envelope consumed by `sage::tooling::result::handle_tool_result`.
-"sage.v1.tool.result.*" = {}
 "sage.v1.tools.list" = {}
 # Broker reply channel. Both broker handlers reply on
 # `astrid.v1.response.<req_id>`; the `req_id` is a single clean segment
@@ -94,7 +93,7 @@ trusted_ingress_ids = { type = "string", default = "", request = "Comma-separate
 # routable decision and a multi-segment id is rejected before the wire.
 "astrid.v1.approval.response.*" = {}
 "tool.v1.request.describe" = { wit = "@unicity-astrid/wit/tool/describe-request" }
-# Execute fan-out from `handle_tool_call` — the bridge strips the
+# Execute fan-out from `dispatch_with_approval` — the broker strips the
 # `mcp__sage__` MCP prefix and forwards to the bare tool topic.
 # Two patterns because the kernel `*` is single-segment: the first
 # matches one-segment tool names ("read_file"), the second matches

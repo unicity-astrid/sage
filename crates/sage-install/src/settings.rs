@@ -19,14 +19,16 @@ pub(crate) fn write_settings(cfg: &PrincipalConfig) -> Result<(), SysError> {
 }
 
 /// Write the `.claude/.mcp.json` for the invoking principal, shaped by
-/// `cfg`. In headless mode the body is the documented `/bin/false`
-/// stub (keeps `claude`'s `--allowed-tools mcp__sage__*` resolving
-/// while real tool dispatch happens via sage parsing claude's
-/// stream-json tool_use blocks). In repl mode the body is an empty
-/// `mcpServers` object (the user wires native servers themselves).
-pub(crate) fn write_mcp(cfg: &PrincipalConfig) -> Result<(), SysError> {
+/// `cfg`. In headless mode it registers the `sage` MCP server (`astrid mcp
+/// serve --principal <principal_id>`) that claude loads via
+/// `--strict-mcp-config --mcp-config` and discovers `mcp__sage__*` from;
+/// in repl mode the body is an empty `mcpServers` object (the user wires
+/// native servers themselves). `principal_id` is baked into the headless
+/// server's argv so the spawned server scopes broker requests to the right
+/// identity (it does not infer the principal).
+pub(crate) fn write_mcp(cfg: &PrincipalConfig, principal_id: &str) -> Result<(), SysError> {
     let path = layout::mcp_path();
-    let body = serde_json::to_vec_pretty(&layout::mcp_json(cfg))?;
+    let body = serde_json::to_vec_pretty(&layout::mcp_json(cfg, principal_id))?;
     atomic::write_atomic(&path, &body)
 }
 

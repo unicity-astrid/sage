@@ -22,7 +22,6 @@
 //! "isError":...}}`. Omitting the wrapper triggers a 60 s CLI timeout —
 //! one of the load-bearing footguns of the protocol.
 
-use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 /// Hard ceiling on the in-progress line buffer. Claude's stream-json lines
@@ -54,44 +53,15 @@ impl core::fmt::Display for CodecError {
 // ---------- encode ----------
 
 /// An outbound frame from host -> claude stdin.
+///
+/// Sage only ever writes USER TURNS now — tool results no longer flow
+/// through here. Tool execution is owned by the registered `astrid mcp
+/// serve` MCP server (claude calls it directly), so the inline
+/// tool-result / control-response write-back is gone.
 pub(crate) enum Outbound<'a> {
     /// A user-turn message. Encoded as
     /// `{"type":"user","message":{"role":"user","content":[{"type":"text","text":...}]}}`.
     UserTurn { text: &'a str },
-    /// Reply to an SDK control request carrying an MCP tool result.
-    /// The `mcp_response` wrapper is mandatory. `request_id` MUST echo
-    /// claude's original `sdk_control_request.request_id`, never sage's
-    /// internal `call_id`.
-    ControlResponseToolResult {
-        request_id: &'a str,
-        content: Vec<ContentBlock>,
-        is_error: bool,
-    },
-    /// Reply to an assistant `tool_use` content block. Encoded as a
-    /// `user`-role envelope with a single `tool_result` content block
-    /// keyed by `tool_use_id`. This path is distinct from
-    /// `ControlResponseToolResult` — that one is for MCP control
-    /// requests, this one for assistant tool_use blocks. Mixing them
-    /// strands claude waiting on a response it can't match.
-    UserToolResult {
-        tool_use_id: &'a str,
-        content: Vec<ContentBlock>,
-        is_error: bool,
-    },
-    /// Reply to an SDK control request indicating protocol-level failure.
-    ControlResponseError {
-        request_id: &'a str,
-        message: &'a str,
-    },
-}
-
-/// One MCP-style content block (mirrors the JSON-RPC `content` array
-/// element shape Claude expects in tool results).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub(crate) enum ContentBlock {
-    /// Plain text result.
-    Text { text: String },
 }
 
 /// Encode one outbound frame into a single newline-terminated JSON line.
@@ -102,50 +72,6 @@ pub(crate) fn encode(frame: &Outbound<'_>) -> String {
             "message": {
                 "role": "user",
                 "content": [{ "type": "text", "text": text }],
-            },
-        }),
-        Outbound::ControlResponseToolResult {
-            request_id,
-            content,
-            is_error,
-        } => json!({
-            "type": "control_response",
-            "response": {
-                "subtype": "success",
-                "request_id": request_id,
-                "response": {
-                    "mcp_response": {
-                        "content": content,
-                        "isError": is_error,
-                    },
-                },
-            },
-        }),
-        Outbound::UserToolResult {
-            tool_use_id,
-            content,
-            is_error,
-        } => json!({
-            "type": "user",
-            "message": {
-                "role": "user",
-                "content": [{
-                    "type": "tool_result",
-                    "tool_use_id": tool_use_id,
-                    "content": content,
-                    "is_error": is_error,
-                }],
-            },
-        }),
-        Outbound::ControlResponseError {
-            request_id,
-            message,
-        } => json!({
-            "type": "control_response",
-            "response": {
-                "subtype": "error",
-                "request_id": request_id,
-                "error": message,
             },
         }),
     };
@@ -166,16 +92,11 @@ pub(crate) fn encode(frame: &Outbound<'_>) -> String {
 /// raw `assistant.message.content[]` array.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum AssistantBlock {
-    /// A `{type:"text",text:...}` block.
+    /// A `{type:"text",text:...}` block. `tool_use` blocks are dropped at
+    /// decode: claude executes `mcp__sage__*` tools directly against the
+    /// registered `astrid mcp serve` MCP server, so sage never sees or
+    /// dispatches them (the only assistant content sage relays is text).
     Text { text: String },
-    /// First sight of a `{type:"tool_use",id,name,input}` block. `input`
-    /// is the partial JSON if Claude inlined a fully-formed object; for
-    /// streamed tool use it's `None` and deltas arrive separately.
-    ToolUseStart {
-        id: String,
-        name: String,
-        input_partial: Option<String>,
-    },
 }
 
 /// One decoded inbound frame.
@@ -187,16 +108,8 @@ pub(crate) enum Decoded {
         model: String,
     },
     /// `{type:"assistant",message:{content:[...]}}`. Each call carries
-    /// the full content array as separate typed blocks.
+    /// the full content array as separate typed blocks (text only).
     Assistant { content_blocks: Vec<AssistantBlock> },
-    /// `{type:"stream_event",event:{type:"content_block_delta",
-    /// delta:{type:"input_json_delta",partial_json}}}` for a tool_use
-    /// block. Caller accumulates `partial_json` per `id` until the
-    /// matching [`Decoded::ToolUseStop`].
-    ToolUseDelta { id: String, partial_json: String },
-    /// `{type:"stream_event",event:{type:"content_block_stop",index}}`
-    /// for a tool_use block. Caller flushes the accumulated input JSON.
-    ToolUseStop { id: String },
     /// `{type:"user",...tool_result...}` — the CLI's own echo of a
     /// tool_result it injected back into the conversation. Forward-only
     /// observability hook; supervisor doesn't usually need to act.
@@ -340,40 +253,18 @@ fn decode_assistant(value: &Value) -> Result<Decoded, CodecError> {
     let mut blocks = Vec::with_capacity(content.len());
     for block in content {
         let bty = block.get("type").and_then(Value::as_str).unwrap_or("");
-        match bty {
-            "text" => {
-                let text = block
-                    .get("text")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_string();
-                blocks.push(AssistantBlock::Text { text });
-            }
-            "tool_use" => {
-                let id = block
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_string();
-                let name = block
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_string();
-                // If the model emitted the full input inline (non-stream
-                // mode), serialize it so the supervisor can forward it
-                // without re-parsing.
-                let input_partial = block.get("input").map(ToString::to_string);
-                blocks.push(AssistantBlock::ToolUseStart {
-                    id,
-                    name,
-                    input_partial,
-                });
-            }
-            // Skip thinking blocks and anything else structurally — they
-            // ride through via StreamEvent when --include-partial-messages
-            // is on, and supervisor doesn't need them as a typed event.
-            _ => {}
+        // Only `text` blocks are relayed. `tool_use` blocks are
+        // intentionally dropped: claude executes them against the
+        // registered MCP server, so sage never sees or dispatches them.
+        // Thinking and any other block types ride through via StreamEvent
+        // when --include-partial-messages is on.
+        if bty == "text" {
+            let text = block
+                .get("text")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            blocks.push(AssistantBlock::Text { text });
         }
     }
     Ok(Decoded::Assistant {
@@ -404,76 +295,16 @@ fn decode_user(value: &Value) -> Decoded {
 }
 
 fn decode_stream_event(value: &Value) -> Decoded {
-    let event = match value.get("event") {
-        Some(e) => e,
-        None => return Decoded::Unknown(value.clone()),
-    };
-    let event_type = event.get("type").and_then(Value::as_str).unwrap_or("");
-
-    match event_type {
-        "content_block_delta" => {
-            let delta = event.get("delta");
-            let delta_type = delta
-                .and_then(|d| d.get("type"))
-                .and_then(Value::as_str)
-                .unwrap_or("");
-            if delta_type == "input_json_delta" {
-                let id = locate_tool_use_id(value).unwrap_or_default();
-                let partial_json = delta
-                    .and_then(|d| d.get("partial_json"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_string();
-                return Decoded::ToolUseDelta { id, partial_json };
-            }
-            Decoded::StreamEvent {
-                event: event.clone(),
-            }
-        }
-        "content_block_stop" => {
-            // Only flag a Stop for tool_use blocks — text blocks also
-            // emit content_block_stop and we don't want to confuse the
-            // caller into thinking a phantom tool_use ended.
-            if let Some(id) = locate_tool_use_id(value) {
-                Decoded::ToolUseStop { id }
-            } else {
-                Decoded::StreamEvent {
-                    event: event.clone(),
-                }
-            }
-        }
-        _ => Decoded::StreamEvent {
+    // Token-level events are passed through verbatim as StreamEvent (the
+    // supervisor relays them on `.partial`). tool_use delta/stop framing is
+    // no longer special-cased — tool calls execute on the registered MCP
+    // server, off this stream.
+    match value.get("event") {
+        Some(event) => Decoded::StreamEvent {
             event: event.clone(),
         },
+        None => Decoded::Unknown(value.clone()),
     }
-}
-
-/// Look up the `tool_use.id` for a stream_event referring to an
-/// indexed content block. The CLI carries it on a sibling
-/// `content_block.id` (on `content_block_start`) — for delta/stop
-/// events, the supervisor's accumulator already knows the index ->
-/// id mapping. To keep the codec stateless we inspect the message
-/// envelope for an embedded `id` hint; if absent, the supervisor must
-/// resolve via its own state.
-fn locate_tool_use_id(value: &Value) -> Option<String> {
-    value
-        .get("event")
-        .and_then(|e| e.get("content_block"))
-        .and_then(|cb| {
-            if cb.get("type").and_then(Value::as_str) == Some("tool_use") {
-                cb.get("id").and_then(Value::as_str).map(String::from)
-            } else {
-                None
-            }
-        })
-        .or_else(|| {
-            // Some CLI versions hoist the id directly onto the event.
-            value
-                .get("event")
-                .and_then(|e| e.get("id"))
-                .and_then(Value::as_str)
-                .map(String::from)
-        })
 }
 
 fn decode_control_request(value: &Value) -> Decoded {
@@ -538,89 +369,6 @@ mod tests {
         assert_eq!(v["message"]["content"][0]["text"], "Hello");
     }
 
-    #[test]
-    fn encode_tool_result_wraps_with_mcp_response() {
-        let line = encode(&Outbound::ControlResponseToolResult {
-            request_id: "req_1",
-            content: vec![ContentBlock::Text {
-                text: "11".into(),
-            }],
-            is_error: false,
-        });
-        let v: Value = serde_json::from_str(line.trim_end()).unwrap();
-        assert_eq!(v["type"], "control_response");
-        assert_eq!(v["response"]["subtype"], "success");
-        assert_eq!(v["response"]["request_id"], "req_1");
-        // The mandatory wrapper — omitting it triggers a 60 s CLI hang.
-        let mcp = &v["response"]["response"]["mcp_response"];
-        assert!(mcp.is_object(), "mcp_response wrapper missing");
-        assert_eq!(mcp["isError"], false);
-        assert_eq!(mcp["content"][0]["type"], "text");
-        assert_eq!(mcp["content"][0]["text"], "11");
-    }
-
-    #[test]
-    fn encode_tool_result_error_flag_propagates() {
-        let line = encode(&Outbound::ControlResponseToolResult {
-            request_id: "req_2",
-            content: vec![ContentBlock::Text {
-                text: "boom".into(),
-            }],
-            is_error: true,
-        });
-        let v: Value = serde_json::from_str(line.trim_end()).unwrap();
-        assert_eq!(v["response"]["response"]["mcp_response"]["isError"], true);
-    }
-
-    #[test]
-    fn encode_user_tool_result_keys_by_tool_use_id() {
-        // The assistant tool_use path replies with a `user`-role
-        // envelope, NOT a control_response. The tool_use_id (not sage's
-        // call_id, not claude's request_id) is what claude uses to
-        // match the result back to the outstanding tool_use block.
-        let line = encode(&Outbound::UserToolResult {
-            tool_use_id: "toolu_abc",
-            content: vec![ContentBlock::Text {
-                text: "result".into(),
-            }],
-            is_error: false,
-        });
-        let v: Value = serde_json::from_str(line.trim_end()).unwrap();
-        assert_eq!(v["type"], "user");
-        assert_eq!(v["message"]["role"], "user");
-        let block = &v["message"]["content"][0];
-        assert_eq!(block["type"], "tool_result");
-        assert_eq!(block["tool_use_id"], "toolu_abc");
-        assert_eq!(block["is_error"], false);
-        assert_eq!(block["content"][0]["type"], "text");
-        assert_eq!(block["content"][0]["text"], "result");
-    }
-
-    #[test]
-    fn encode_user_tool_result_error_flag_propagates() {
-        let line = encode(&Outbound::UserToolResult {
-            tool_use_id: "toolu_err",
-            content: vec![ContentBlock::Text {
-                text: "boom".into(),
-            }],
-            is_error: true,
-        });
-        let v: Value = serde_json::from_str(line.trim_end()).unwrap();
-        assert_eq!(v["message"]["content"][0]["is_error"], true);
-    }
-
-    #[test]
-    fn encode_control_error_shape() {
-        let line = encode(&Outbound::ControlResponseError {
-            request_id: "req_3",
-            message: "bad request",
-        });
-        let v: Value = serde_json::from_str(line.trim_end()).unwrap();
-        assert_eq!(v["response"]["subtype"], "error");
-        assert_eq!(v["response"]["request_id"], "req_3");
-        assert_eq!(v["response"]["error"], "bad request");
-    }
-
     // ---- decode: framing ----
 
     #[test]
@@ -664,13 +412,11 @@ mod tests {
         let r2: Vec<_> = dec.feed(&bytes[split..]).collect();
         assert_eq!(r2.len(), 1);
         match &r2[0] {
-            Ok(Decoded::Assistant { content_blocks }) => match &content_blocks[0] {
-                AssistantBlock::Text { text } => {
-                    assert_eq!(text, "price: \u{20ac}5");
-                    assert!(!text.contains('\u{FFFD}'), "boundary split corrupted into U+FFFD");
-                }
-                other => panic!("expected Text block, got {other:?}"),
-            },
+            Ok(Decoded::Assistant { content_blocks }) => {
+                let AssistantBlock::Text { text } = &content_blocks[0];
+                assert_eq!(text, "price: \u{20ac}5");
+                assert!(!text.contains('\u{FFFD}'), "boundary split corrupted into U+FFFD");
+            }
             other => panic!("expected Assistant, got {other:?}"),
         }
     }
@@ -743,60 +489,10 @@ mod tests {
         match &r[0] {
             Ok(Decoded::Assistant { content_blocks }) => {
                 assert_eq!(content_blocks.len(), 1);
-                match &content_blocks[0] {
-                    AssistantBlock::Text { text } => assert_eq!(text, "hi"),
-                    other => panic!("wrong block: {other:?}"),
-                }
+                let AssistantBlock::Text { text } = &content_blocks[0];
+                assert_eq!(text, "hi");
             }
             other => panic!("expected Assistant, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn decode_assistant_tool_use_inline_input() {
-        let mut dec = LineDecoder::new();
-        let line = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_1","name":"fs_read","input":{"path":"/a"}}]}}"#;
-        let r: Vec<_> = dec.feed(format!("{line}\n").as_bytes()).collect();
-        match &r[0] {
-            Ok(Decoded::Assistant { content_blocks }) => match &content_blocks[0] {
-                AssistantBlock::ToolUseStart {
-                    id,
-                    name,
-                    input_partial,
-                } => {
-                    assert_eq!(id, "toolu_1");
-                    assert_eq!(name, "fs_read");
-                    assert_eq!(input_partial.as_deref(), Some(r#"{"path":"/a"}"#));
-                }
-                other => panic!("expected ToolUseStart, got {other:?}"),
-            },
-            other => panic!("expected Assistant, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn decode_tool_use_delta_via_stream_event() {
-        let mut dec = LineDecoder::new();
-        // CLI variant where the event hoists `id` directly.
-        let line = r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"id":"toolu_1","delta":{"type":"input_json_delta","partial_json":"{\"a\":1"}}}"#;
-        let r: Vec<_> = dec.feed(format!("{line}\n").as_bytes()).collect();
-        match &r[0] {
-            Ok(Decoded::ToolUseDelta { id, partial_json }) => {
-                assert_eq!(id, "toolu_1");
-                assert_eq!(partial_json, "{\"a\":1");
-            }
-            other => panic!("expected ToolUseDelta, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn decode_tool_use_stop_via_content_block_start_carrier() {
-        let mut dec = LineDecoder::new();
-        let line = r#"{"type":"stream_event","event":{"type":"content_block_stop","index":0,"content_block":{"type":"tool_use","id":"toolu_1"}}}"#;
-        let r: Vec<_> = dec.feed(format!("{line}\n").as_bytes()).collect();
-        match &r[0] {
-            Ok(Decoded::ToolUseStop { id }) => assert_eq!(id, "toolu_1"),
-            other => panic!("expected ToolUseStop, got {other:?}"),
         }
     }
 

@@ -102,7 +102,7 @@ pub(crate) fn stop_session(
 
     // Phase 3: SIGKILL fallback + final drain, then publish + evict.
     //
-    // INVARIANT (mirrors lib.rs::send_user_turn / tooling/result.rs):
+    // INVARIANT (mirrors lib.rs::send_user_turn / supervisor::drive_session):
     // NO host calls under the Sessions lock. `process.kill()` and
     // `process.read_logs()` both cross the kernel resource boundary and
     // can block on back-pressure; holding the mutex across them would
@@ -474,8 +474,6 @@ fn respawn_one(
                 record,
                 process: spawned.process,
                 codec: crate::codec::LineDecoder::default(),
-                pending_tool_calls: std::collections::HashMap::new(),
-                partial_tool_inputs: std::collections::HashMap::new(),
             },
         );
     })?;
@@ -532,8 +530,8 @@ struct ExitSummary {
 /// [`stop_session`]'s phase 3a and consumed in phase 3b outside the
 /// lock. Carries the cloned [`PersistentProcess`](process::PersistentProcess)
 /// handle so the host `read_logs` / `stop` / `release` calls can run with
-/// the sessions mutex released — same shape and rationale as
-/// [`crate::tooling::result::PreparedWrite`].
+/// the sessions mutex released — same lock-discipline shape as the
+/// supervisor's `read_logs` drain in [`crate::supervisor`].
 struct PreparedKill {
     process: process::PersistentProcess,
     /// Snapshotted under the lock in phase 3a so phase 3b can build the

@@ -247,9 +247,22 @@ fn argv(
         "--output-format".to_string(),
         "stream-json".to_string(),
         "--verbose".to_string(),
-        // No `.mcp.json` from disk — sage parses tool_use directly out
-        // of the stream, the .mcp.json on disk is a documented stub.
+        // Register EXACTLY sage's own MCP server and nothing else.
+        // `--strict-mcp-config` makes claude ignore every auto-discovered
+        // `.mcp.json`; `--mcp-config` then points it at the single file
+        // sage-install authored under the principal's HOME, whose `sage`
+        // server is `astrid mcp serve` (the rmcp stdio shim onto the
+        // sage-mcp broker — unicity-astrid/astrid#880). claude does the
+        // native MCP handshake against it and discovers the `mcp__sage__*`
+        // tools from `tools/list`, then executes them DIRECTLY against that
+        // server over MCP — sage never sees or dispatches the calls. The
+        // path is cwd-relative (cwd = HOME, set below) so the argv stays
+        // byte-identical across principals — the per-principal identity
+        // rides inside the file's argv, not here, to keep the `flags_hash`
+        // fingerprint stable.
         "--strict-mcp-config".to_string(),
+        "--mcp-config".to_string(),
+        ".claude/.mcp.json".to_string(),
         // Constrain which on-disk setting tiers load to `local` only —
         // the scope of the `settings.local.json` sage-install authors
         // (`local` = `.claude/settings.local.json`, which under the HOME
@@ -266,8 +279,8 @@ fn argv(
         "--setting-sources".to_string(),
         "local".to_string(),
         // Disable every built-in tool. Tool surface is exclusively
-        // mcp__sage__* (which sage parses inline; claude only sees the
-        // tool names through --append-system-prompt for now).
+        // mcp__sage__*, discovered and executed against the registered
+        // `astrid mcp serve` MCP server.
         "--tools".to_string(),
         String::new(),
         "--allowed-tools".to_string(),
@@ -282,10 +295,13 @@ fn argv(
         // from the model's context entirely. See [`DENIED_TOOLS`].
         "--disallowedTools".to_string(),
         DENIED_TOOLS.join(" "),
-        // Permission prompts route through an MCP tool — sage-mcp
-        // handles them on the bus.
-        "--permission-prompt-tool".to_string(),
-        "mcp__sage__approve".to_string(),
+        // No `--permission-prompt-tool`: tools execute against the
+        // registered `astrid mcp serve` MCP server, and the sage-mcp
+        // broker enforces capability checks server-side on the bus. The
+        // `--allowedTools mcp__sage__*` allow-list above is what gates the
+        // surface in headless `-p` mode; a claude-side permission prompt
+        // tool would be redundant with (and weaker than) the broker's
+        // cryptographic capability enforcement.
         // -p only: skip writing claude's own session JSONL. Source of
         // truth for the conversation is the bus + sage's KV records.
         "--no-session-persistence".to_string(),

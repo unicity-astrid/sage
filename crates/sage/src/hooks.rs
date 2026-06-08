@@ -280,13 +280,11 @@ fn publish_spoof_audit(
 
 /// Run-loop drain helper for `sage.v1.hook.*` events.
 ///
-/// Mirrors the shape of [`crate::tooling::approval::route_approvals`]
-/// but is single-phase — no `Sessions` lock is involved, only a KV
-/// lookup and a bus republish. Per message:
+/// Single-phase — no `Sessions` lock is involved, only a KV lookup and a
+/// bus republish. Per message:
 ///
-/// 1. Parse the envelope. On parse failure, warn and continue (same
-///    pattern as approval routing: a malformed payload is logged but
-///    never crashes the run loop).
+/// 1. Parse the envelope. On parse failure, warn and continue (a
+///    malformed payload is logged but never crashes the run loop).
 /// 2. Sanity-check the topic tail equals the envelope's `hook` field.
 ///    A mismatch means the producer is malformed or actively
 ///    adversarial — audit and drop.

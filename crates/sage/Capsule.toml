@@ -75,17 +75,15 @@ api_key = { type = "secret", request = "Anthropic API key (leave blank for subsc
 "sage.v1.request.settings.set" = { handler = "handle_settings_set" }
 # Send a user message into an existing session's stream-json stdin.
 "sage.v1.request.send.*" = { handler = "handle_send" }
-# Tool-call result coming back from sage-mcp, routed into the
-# correct session's stdin.
-"sage.v1.tool.result.*" = { handler = "handle_tool_result" }
 # Dynamic subscribes opened inside `#[astrid::run]`. Listed here so
 # the kernel admits them; no handler key — the run loop polls them.
+# NB: tool-call and approval routing are deliberately absent — claude
+# drives `mcp__sage__*` tools directly against the registered
+# `astrid mcp serve` MCP server (which owns its own approval/timeout
+# handling), so sage never sees tool calls, results, or approvals.
 "sage.v1.request.stop.*" = {}
-"sage.v1.audit.tool_call" = {}
 "sage.v1.install.complete" = {}
 "tool.v1.execute.save_identity.result" = {}
-"approval.v1.request" = {}
-"approval.v1.response.*" = {}
 # Hook validator drain: `astrid-emit` (astrid#814) publishes
 # per-Claude-hook envelopes here with a per-session token. Sage's
 # run loop verifies the token, then republishes on `hook.v1.event.*`
@@ -99,14 +97,10 @@ api_key = { type = "secret", request = "Anthropic API key (leave blank for subsc
 # Streamed events from a `claude -p` subprocess. Both 4-segment
 # (e.g. `sage.v1.event.session_rejected`) and 5-segment session-scoped
 # topics (e.g. `sage.v1.event.<sid>.spawned|exited|resumed|error|respawned|
-# tool_timeout|text|tool_use|result|usage|done|init`) are published.
+# text|result|partial|done|init`) are published.
 "sage.v1.event.*" = {}
 "sage.v1.event.*.*" = {}
-# Tool-call request emitted when Claude wants to call an MCP tool;
-# sage-mcp picks these up, executes via capsule IPC, replies on
-# `sage.v1.tool.result.<call-id>`.
-"sage.v1.tool.call.*" = {}
-# Audit events: `sage.v1.audit.spawn`, `sage.v1.audit.tool_call`,
+# Audit events: `sage.v1.audit.spawn`,
 # `sage.v1.audit.identity_fallback`, `sage.v1.audit.respawn_abandoned`.
 # hook validator: republish + audit
 #   `sage.v1.audit.hook_spoof_attempt` — token mismatch on an
@@ -127,10 +121,6 @@ api_key = { type = "secret", request = "Anthropic API key (leave blank for subsc
 # notifications on a sage-namespaced topic. Forward-compatible: once a
 # canonical `notification.v1.*` topic lands, the validator switches.
 "sage.v1.notification" = {}
-# Approval request emitted when claude wants to call a tool that
-# requires explicit user verdict. sage-mcp / a UI capsule answers on
-# `approval.v1.response.<request_id>`.
-"approval.v1.request" = {}
 # Install-trigger published by `ensure_install` when no completion
 # marker is in KV. sage-install consumes it and replies on
 # `sage.v1.install.complete`.

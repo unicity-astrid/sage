@@ -7,18 +7,22 @@
 //!
 //! Supervises one `claude -p --input-format stream-json --output-format
 //! stream-json` subprocess per principal session. Streams the user's
-//! turns in, parses Claude's stream-json events out, dispatches tool-
-//! call events to the bus where `sage-mcp` picks them up, feeds tool-
-//! call results back in. The subprocess is long-lived so Anthropic-
-//! side prompt caching stays warm turn-to-turn.
+//! turns in, parses Claude's stream-json events out, and relays the
+//! conversation onto `sage.v1.event.<sid>.*`. The subprocess is long-
+//! lived so Anthropic-side prompt caching stays warm turn-to-turn.
+//!
+//! Tool execution is NOT sage's job. Claude is configured with the
+//! registered `astrid mcp serve` MCP server (`--mcp-config`), so it
+//! invokes `mcp__sage__*` tools directly against that server over the
+//! MCP protocol. Sage never sees, dispatches, or writes back tool calls
+//! — doing so on top of the registered server would double-execute every
+//! tool. The supervisor relays only conversation text / lifecycle events.
 //!
 //! Bills against the user's Anthropic Agent SDK credit (per Anthropic's
 //! June 15, 2026 billing model). For per-turn API completion mode that
 //! bypasses the SDK credit, see the sibling crate `sage-completion`.
 //!
-//! # S6 wiring
-//!
-//! S6 lands the three core lifecycle paths:
+//! # Lifecycle paths
 //!
 //! * `handle_spawn` — provision a `claude -p` subprocess, fetch identity
 //!   from spark with fallback, write the system-prompt file, spawn with
@@ -27,28 +31,18 @@
 //!   it to the session's stdin in one call.
 //! * `#[astrid::run]` — supervisor tick at `supervisor::TICK_INTERVAL`
 //!   cadence driving `supervisor::tick`: drain stdout, decode stream-
-//!   json, publish `sage.v1.event.<sid>.*` for text / init / tool_use /
-//!   result, detect crash / buffer-overflow / capsule-reload, emit
-//!   `sage.v1.tool.call.<call_id>` for each tool dispatch.
-//!
-//! `handle_tool_result` write-back, 60 s deadline enforcement, and
-//! approval routing live in `tooling` (shipped in S7's slice).
+//!   json, publish `sage.v1.event.<sid>.*` for init / text / result /
+//!   partial, and detect crash / buffer-overflow / capsule-reload.
 
 use astrid_sdk::prelude::*;
 use serde::Deserialize;
 use serde_json::Value;
-use std::collections::HashMap;
-use std::sync::Mutex;
 use std::time::Duration;
 use uuid::Uuid;
 
-// `codec` exposes wire scaffolding for stream-json frames. The
-// `Outbound::ControlResponseError` variant is reserved for the
-// protocol-failure write-back path; the active code uses
-// `ControlResponseToolResult` with `is_error: true` for tool-side
-// failures and reserves `ControlResponseError` for SDK-protocol-level
-// errors handled by the supervisor in a follow-up slice.
-#[allow(dead_code)]
+// `codec` — stream-json wire encode/decode. Outbound is just the user
+// turn now; tool-result / control-response write-back is gone because
+// claude drives tools against the registered MCP server, off this stream.
 mod codec;
 // `config` is purely additive plumbing in this slice — the
 // `PrincipalConfig` type and KV helpers (`load_or_default`, `save`)
@@ -79,7 +73,6 @@ mod shutdown;
 mod spawn;
 mod state;
 mod supervisor;
-mod tooling;
 
 use codec::{Outbound, encode};
 // The `handle_spawn` interceptor consumes `AuthMode`,
@@ -92,12 +85,6 @@ use config::{AuthMode, InteractionMode, LoadOutcome, load_status as load_princip
 use state::{
     MAX_SESSIONS_PER_PRINCIPAL, RuntimeSession, SessionRecord, Sessions, save_record,
 };
-
-/// 60 s per-tool-call deadline. Matches the sage-mcp dispatch timeout
-/// so `claude -p` never sits on a tool call that's been abandoned on
-/// the bus. Re-exported here so [`tooling::enforce_deadlines`] can
-/// reference it without a circular module dependency.
-pub(crate) const TOOL_CALL_DEADLINE: Duration = Duration::from_secs(60);
 
 /// Graceful-shutdown grace before falling back to SIGKILL.
 /// [`shutdown::stop_session`] reads this.
@@ -162,35 +149,9 @@ pub(crate) fn validate_id(field: &str, id: &str) -> Result<(), SysError> {
 /// metadata still rides in KV per-session via `state::SessionRecord`;
 /// the runtime map is rebuilt on reload by the supervisor's first-tick
 /// recovery sweep.
-///
-/// `tool_call_meta` is a sidecar index keyed by the supervisor-minted
-/// `call_id` (UUIDv4). The supervisor publishes
-/// `sage.v1.audit.tool_call{call_id,tool_name,session_id}` on every
-/// dispatch; the run-loop drains that subscription into this map so
-/// `tooling::enforce_deadlines` can surface the real `tool_name` in
-/// `sage.v1.event.<sid>.tool_timeout` instead of `"unknown"`. Entries
-/// are removed on tool-result write-back or on deadline expiry; the
-/// map is hard-capped at `tooling::MAX_TOOL_CALL_META` entries to bound
-/// memory under upstream-bug pathological cases.
 #[derive(Default)]
 pub struct Sage {
     pub(crate) sessions: Sessions,
-    pub(crate) tool_call_meta: Mutex<HashMap<String, ToolCallMeta>>,
-}
-
-/// Sidecar metadata per outstanding tool call. Mirrors the supervisor's
-/// `sage.v1.audit.tool_call` payload (the subset we need).
-#[derive(Debug, Clone)]
-pub(crate) struct ToolCallMeta {
-    /// Session that dispatched the call. Captured for future scope-
-    /// limited cleanup paths (e.g. evicting outstanding tool calls
-    /// when a session exits). Currently only `tool_name` is consumed
-    /// by `tooling::enforce_deadlines`; the field is preserved so the
-    /// audit-ingest contract doesn't lose information.
-    #[allow(dead_code)]
-    pub session_id: String,
-    /// Tool name lifted from the supervisor's audit publish.
-    pub tool_name: String,
 }
 
 /// `sage.v1.request.spawn` payload.
@@ -562,8 +523,6 @@ impl Sage {
                     record: record.clone(),
                     process: spawned.process,
                     codec: codec::LineDecoder::new(),
-                    pending_tool_calls: Default::default(),
-                    partial_tool_inputs: Default::default(),
                 },
             );
         })?;
@@ -639,17 +598,6 @@ impl Sage {
         send_user_turn(&self.sessions, &req.session_id, &req.text)
     }
 
-    /// Tool-result write-back. Topic `sage.v1.tool.result.<call_id>`.
-    /// Delegates to `tooling::handle_tool_result` which encodes a
-    /// stream-json `control_response` (with the mandatory `mcp_response`
-    /// wrapper) and pushes it to the matching session's stdin. After a
-    /// successful match, drops the matching `tool_call_meta` sidecar
-    /// entry so the index doesn't grow unbounded.
-    #[astrid::interceptor("handle_tool_result")]
-    pub fn handle_tool_result(&self, payload: serde_json::Value) -> Result<(), SysError> {
-        tooling::handle_tool_result(&self.sessions, &self.tool_call_meta, payload)
-    }
-
     /// Settings-set handler. Topic `sage.v1.request.settings.set`.
     /// Applies a partial patch to the per-principal
     /// `config::PrincipalConfig`, persists, and publishes — in order —
@@ -668,30 +616,21 @@ impl Sage {
     ///    matching sessions ([`shutdown::stop_session`]).
     /// 3. Drains `tool.v1.execute.save_identity.result` for identity-
     ///    refresh teardown ([`shutdown::handle_identity_refresh`]).
-    /// 4. Drains `sage.v1.audit.tool_call` into the sidecar
-    ///    `tool_call_meta` index so [`tooling::enforce_deadlines`] can
-    ///    surface real tool names on timeout events.
-    /// 5. Drains `approval.v1.request` and registers each as a pending
-    ///    approval against the matching session
-    ///    ([`tooling::register_pending_approval_from_request`]).
-    /// 6. Drains `approval.v1.response.*` and forwards verdicts.
-    /// 7. Sweeps `pending_tool_calls` for 60 s deadlines.
-    /// 8. Sweeps the `sage.pending_restart.*` KV markers and respawns
+    /// 4. Drains `sage.v1.hook.*`, validates each per-session hook token
+    ///    against KV, and republishes on the canonical
+    ///    `hook.v1.event.<name>` ([`crate::hooks::validate_and_route`]).
+    /// 5. Sweeps the `sage.pending_restart.*` KV markers and respawns
     ///    each torn-down session with a fresh identity prompt
     ///    ([`shutdown::respawn_pending`]).
+    ///
+    /// Tool dispatch and approval routing are deliberately absent: claude
+    /// drives `mcp__sage__*` tools against the registered `astrid mcp
+    /// serve` MCP server, and that server owns its own approval / timeout
+    /// handling — sage would only double-execute if it intervened.
     #[astrid::run]
     fn run(&self) -> Result<(), SysError> {
         let stop_sub = ipc::subscribe("sage.v1.request.stop.*")?;
         let identity_sub = ipc::subscribe("tool.v1.execute.save_identity.result")?;
-        let approval_response_sub = ipc::subscribe("approval.v1.response.*")?;
-        // S6's supervisor publishes the request on a fixed topic with
-        // the request_id in the payload; we self-subscribe so the
-        // approval-routing path is end-to-end functional without
-        // touching supervisor.rs.
-        let approval_request_sub = ipc::subscribe("approval.v1.request")?;
-        // Sidecar feed: supervisor's audit publish carries call_id +
-        // tool_name + session_id. Drained into self.tool_call_meta.
-        let tool_audit_sub = ipc::subscribe("sage.v1.audit.tool_call")?;
         // Hook validator (sage-as-CA): `astrid-emit` (shipping in core
         // via astrid#814) stamps a per-session token onto every Claude
         // hook fire and publishes on `sage.v1.hook.<name>`.
@@ -738,31 +677,8 @@ impl Sage {
                 }
             }
 
-            // Audit-tool-call sidecar update. Must happen BEFORE
-            // enforce_deadlines so the first sweep already has names
-            // for any call_id that just landed.
-            if let Ok(poll) = tool_audit_sub.poll()
-                && let Err(e) = tooling::record_tool_call_meta(&self.tool_call_meta, poll.messages)
-            {
-                log::warn(format!("sage: tool_call audit ingest failed: {e:?}"));
-            }
-
-            // Approval request register — wires the sentinel into the
-            // session's partial_tool_inputs so the matching
-            // approval.v1.response can be routed back to stdin.
-            if let Ok(poll) = approval_request_sub.poll()
-                && let Err(e) = tooling::register_pending_approval_from_request(
-                    &self.sessions,
-                    poll.messages,
-                )
-            {
-                log::warn(format!("sage: approval register failed: {e:?}"));
-            }
-
-            // Hook validator drain — runs BEFORE approval_response_sub
-            // to group it with the other "validate then route"
-            // subscribers. `validate_and_route` parses, looks up the
-            // per-session token in KV, strips the transport envelope
+            // Hook validator drain. `validate_and_route` parses, looks up
+            // the per-session token in KV, strips the transport envelope
             // (principal_id / session_id / token), and republishes on
             // `hook.v1.event.<name>` (canonical) or `sage.v1.notification`
             // (no canonical equivalent yet). Token mismatches drop the
@@ -771,18 +687,6 @@ impl Sage {
             // poll doesn't tear down the run loop.
             if let Ok(poll) = hook_sub.poll() {
                 let _ = crate::hooks::validate_and_route(poll.messages);
-            }
-
-            if let Ok(poll) = approval_response_sub.poll()
-                && let Err(e) = tooling::route_approvals(&self.sessions, poll.messages)
-            {
-                log::warn(format!("sage: approval routing failed: {e:?}"));
-            }
-
-            if let Err(e) =
-                tooling::enforce_deadlines(&self.sessions, &self.tool_call_meta)
-            {
-                log::warn(format!("sage: deadline sweep failed: {e:?}"));
             }
 
             if let Err(e) = shutdown::respawn_pending(&self.sessions) {
@@ -805,8 +709,8 @@ impl Sage {
 /// the `Sessions` mutex across it would serialise the entire supervisor
 /// loop and risks deadlock. The pattern here — encode + clone the
 /// `PersistentProcess` handle under the lock, drop the guard, then write —
-/// is the canonical lock-discipline shape mirrored by every callsite
-/// in [`tooling`].
+/// is the canonical lock-discipline shape mirrored by the supervisor's
+/// `read_logs` drain in [`supervisor::drive_session`].
 fn send_user_turn(sessions: &Sessions, session_id: &str, text: &str) -> Result<(), SysError> {
     let line = encode(&Outbound::UserTurn { text });
     if line.len() > 1024 * 1024 {
@@ -1034,8 +938,8 @@ fn publish_spawn_error(session_id: &str, principal_id: &str, reason: &str) {
 }
 
 /// Pull the trailing segment out of an IPC topic (the bit after the
-/// last `.`). Used by [`tooling::route_approvals`] to recover the
-/// `correlation_id` from a wildcard-subscription envelope.
+/// last `.`). Used by the run loop to recover the `session_id` from a
+/// `sage.v1.request.stop.<sid>` wildcard-subscription envelope.
 pub(crate) fn topic_tail(topic: &str) -> Option<&str> {
     topic.rsplit('.').next().filter(|s| !s.is_empty())
 }

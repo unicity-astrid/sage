@@ -9,24 +9,19 @@
 //! 3. Detects process crash / buffer overflow / capsule reload and
 //!    publishes synthetic `exited` events so consumers don't hang.
 //!
-//! Tool dispatch: on a complete `ToolUseStart` (inline `input`) or a
-//! `ToolUseStop` (after partial accumulation) the supervisor mints a
-//! fresh `call_id` (UUIDv4), persists it as a pending entry, and
-//! publishes `sage.v1.tool.call.<call_id>`. `sage-mcp` picks that up,
-//! runs the tool through the bus, and replies on
-//! `sage.v1.tool.result.<call_id>`, which `lib.rs::handle_tool_result`
-//! turns back into a stream-json frame on the claude stdin.
+//! Tool execution is NOT sage's job. Claude calls the registered `astrid
+//! mcp serve` MCP server directly over the MCP protocol, so tool calls
+//! never round-trip through the supervisor. The supervisor only relays
+//! the conversation stream (init / text / done / partial) onto the
+//! `sage.v1.event.<sid>.*` topics; `tool_use` blocks and control requests
+//! are observe-only.
 
 use crate::codec::{AssistantBlock, CodecError, Decoded};
-use crate::state::{
-    Correlation, PartialTool, PendingCall, RuntimeSession, SessionRecord, Sessions, delete_record,
-    list_all_records,
-};
+use crate::state::{RuntimeSession, SessionRecord, Sessions, delete_record, list_all_records};
 use astrid_sdk::prelude::*;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::time::Duration;
-use uuid::Uuid;
 
 /// Supervisor tick cadence. Conservative enough to keep idle-capsule
 /// CPU near zero, fast enough that interactive token streams from the
@@ -57,16 +52,14 @@ pub(crate) fn tick(sessions: &Sessions) -> Result<(), SysError> {
 
 /// Pull new stdout from one session and dispatch its events.
 ///
-/// INVARIANT: NO host calls under the Sessions lock. Mirrors the
-/// Phase-1/Phase-2 pattern in [`crate::tooling::result::handle_tool_result`]:
+/// INVARIANT: NO host calls under the Sessions lock. The drain runs in
+/// three phases around the single blocking host call:
 ///
-/// 1. Phase 1a (under lock): clone the `PersistentProcess` handle and
-///    snapshot the principal_id.
+/// 1. Phase 1a (under lock): clone the `PersistentProcess` handle.
 /// 2. Phase 2 (lock released): call `process.read_logs()` — a host
 ///    call that may block and could re-enter the bus drain.
-/// 3. Phase 1b (re-lock): feed the bytes into the codec, decode any
-///    completed lines, and run `collect_events` so the mutations to
-///    `partial_tool_inputs` / `pending_tool_calls` stay coherent.
+/// 3. Phase 1b (re-lock): feed the bytes into the session's codec and
+///    decode any completed lines into conversation events.
 ///
 /// Holding the sessions mutex across the host call would serialise the
 /// whole supervisor loop and risks deadlock; cloning the
@@ -78,7 +71,6 @@ fn drive_session(sessions: &Sessions, session_id: &str) -> Result<(), SysError> 
         let session = map.get(session_id)?;
         Some(DrivePrep {
             process: session.process.clone(),
-            principal_id: session.record.principal_id.clone(),
         })
     })?;
 
@@ -106,9 +98,7 @@ fn drive_session(sessions: &Sessions, session_id: &str) -> Result<(), SysError> 
             let decoded = session.codec.feed(logs.stdout.as_bytes()).collect::<Vec<_>>();
             for item in decoded {
                 match item {
-                    Ok(d) => {
-                        collect_events(session, &prep.principal_id, session_id, d, &mut events)
-                    }
+                    Ok(d) => collect_events(session_id, d, &mut events),
                     Err(CodecError::LineTooLong) => {
                         buffer_overflow = true;
                     }
@@ -163,11 +153,9 @@ enum DriveOutcome {
 /// Hand-off package collected under `Sessions::with` and consumed
 /// outside the lock by [`drive_session`]. Carries the cloned
 /// [`PersistentProcess`](process::PersistentProcess) handle so the host
-/// `read_logs` runs with the sessions mutex released — mirrors the pattern
-/// in [`crate::tooling::result`].
+/// `read_logs` runs with the sessions mutex released.
 struct DrivePrep {
     process: process::PersistentProcess,
-    principal_id: String,
 }
 
 /// IPC events queued while the session lock is held; published after
@@ -186,15 +174,10 @@ impl PendingEvent {
 }
 
 /// Translate one [`Decoded`] envelope into the corresponding
-/// `sage.v1.event.<sid>.*` payloads, updating in-flight tool-call
-/// bookkeeping along the way.
-fn collect_events(
-    session: &mut RuntimeSession,
-    principal_id: &str,
-    session_id: &str,
-    decoded: Decoded,
-    out: &mut Vec<PendingEvent>,
-) {
+/// `sage.v1.event.<sid>.*` conversation payloads. Tool calls and approvals
+/// no longer flow through here — claude drives those against the registered
+/// MCP server — so this only relays init / text / done / partial events.
+fn collect_events(session_id: &str, decoded: Decoded, out: &mut Vec<PendingEvent>) {
     match decoded {
         Decoded::SystemInit { model, .. } => {
             out.push(PendingEvent {
@@ -203,159 +186,19 @@ fn collect_events(
             });
         }
         Decoded::Assistant { content_blocks } => {
+            // Tool execution is owned by the registered `astrid mcp serve`
+            // MCP server — claude calls it directly over MCP, so sage never
+            // dispatches `mcp__sage__*` tool calls itself (doing so would
+            // double-execute). Here sage only relays the assistant's text;
+            // tool_use blocks are observe-only and dropped at decode.
             for block in content_blocks {
-                match block {
-                    AssistantBlock::Text { text } => {
-                        out.push(PendingEvent {
-                            topic: format!("sage.v1.event.{session_id}.text"),
-                            payload: serde_json::json!({ "delta": text }),
-                        });
-                    }
-                    AssistantBlock::ToolUseStart {
-                        id,
-                        name,
-                        input_partial,
-                    } => {
-                        if let Some(json_str) = input_partial {
-                            // Inline-input variant: dispatch immediately.
-                            let arguments = serde_json::from_str::<Value>(&json_str)
-                                .unwrap_or(Value::Null);
-                            dispatch_tool_call(
-                                session,
-                                principal_id,
-                                session_id,
-                                &id,
-                                &name,
-                                arguments,
-                                out,
-                            );
-                        } else {
-                            // Streamed: stash the buffer so deltas can
-                            // append.
-                            session.partial_tool_inputs.insert(
-                                id,
-                                PartialTool {
-                                    name,
-                                    input_json: String::new(),
-                                },
-                            );
-                        }
-                    }
-                }
-            }
-        }
-        Decoded::ToolUseDelta { id, partial_json } => {
-            if let Some(pt) = session.partial_tool_inputs.get_mut(&id) {
-                pt.input_json.push_str(&partial_json);
-            } else {
-                // Delta with no prior start — accept defensively.
-                session.partial_tool_inputs.insert(
-                    id,
-                    PartialTool {
-                        name: String::new(),
-                        input_json: partial_json,
-                    },
-                );
-            }
-        }
-        Decoded::ToolUseStop { id } => {
-            if let Some(pt) = session.partial_tool_inputs.remove(&id) {
-                let arguments = if pt.input_json.is_empty() {
-                    Value::Object(Default::default())
-                } else {
-                    serde_json::from_str::<Value>(&pt.input_json).unwrap_or(Value::Null)
-                };
-                dispatch_tool_call(
-                    session,
-                    principal_id,
-                    session_id,
-                    &id,
-                    &pt.name,
-                    arguments,
-                    out,
-                );
-            }
-        }
-        Decoded::ControlRequest {
-            request_id,
-            subtype,
-            payload,
-        } => match subtype.as_str() {
-            "mcp_message" => {
-                // Extract the tools/call from the wrapped JSON-RPC.
-                let params = payload
-                    .get("message")
-                    .and_then(|m| m.get("params"))
-                    .cloned()
-                    .unwrap_or(Value::Null);
-                let name = params
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_string();
-                let arguments = params.get("arguments").cloned().unwrap_or(Value::Null);
-                let call_id = Uuid::new_v4().to_string();
-                session.pending_tool_calls.insert(
-                    call_id.clone(),
-                    PendingCall {
-                        started_ms: now_ms(),
-                        // Captured here at dispatch time so
-                        // `handle_tool_result` can echo claude's
-                        // original `request_id` back — NOT sage's
-                        // internal `call_id`, which claude never saw.
-                        correlation: Correlation::McpControl {
-                            claude_request_id: request_id.clone(),
-                        },
-                    },
-                );
+                let AssistantBlock::Text { text } = block;
                 out.push(PendingEvent {
-                    topic: format!("sage.v1.tool.call.{call_id}"),
-                    payload: serde_json::json!({
-                        // `call_id` is also mirrored into the payload so
-                        // sage-mcp can recover it from the body alone —
-                        // interceptor dispatch only delivers the action
-                        // name and payload bytes, not the source topic,
-                        // so the topic-suffix call_id is invisible to the
-                        // handler unless echoed here.
-                        "call_id": call_id,
-                        "session_id": session_id,
-                        "principal_id": principal_id,
-                        "tool_name": name,
-                        "arguments": arguments,
-                        // tag for handle_tool_result so it writes back
-                        // a control_response (with mcp_response wrapper)
-                        // on the matching slot.
-                        "via_mcp_control": true,
-                        "claude_request_id": request_id,
-                    }),
-                });
-                out.push(PendingEvent {
-                    topic: "sage.v1.audit.tool_call".to_string(),
-                    payload: serde_json::json!({
-                        "principal_id": principal_id,
-                        "session_id": session_id,
-                        "call_id": call_id,
-                        "tool_name": name,
-                    }),
+                    topic: format!("sage.v1.event.{session_id}.text"),
+                    payload: serde_json::json!({ "delta": text }),
                 });
             }
-            "permission_request" => {
-                out.push(PendingEvent {
-                    topic: "approval.v1.request".to_string(),
-                    payload: serde_json::json!({
-                        "session_id": session_id,
-                        "principal_id": principal_id,
-                        "request_id": request_id,
-                        "payload": payload,
-                    }),
-                });
-            }
-            other => {
-                log::warn(format!(
-                    "sage: unknown sdk_control_request subtype '{other}' on {session_id}"
-                ));
-            }
-        },
+        }
         Decoded::Result {
             subtype,
             is_error,
@@ -381,8 +224,13 @@ fn collect_events(
                 payload: serde_json::json!({ "event": event }),
             });
         }
-        Decoded::UserToolResultEcho { .. } | Decoded::Ping => {
-            // No-op: echoes are observability-only, ping is keepalive.
+        Decoded::ControlRequest { .. }
+        | Decoded::UserToolResultEcho { .. }
+        | Decoded::Ping => {
+            // No-op. Control requests (permission gating, MCP transport)
+            // are handled by claude itself against the registered MCP
+            // server, never by sage; tool_result echoes are
+            // observability-only; ping is keepalive.
         }
         Decoded::Unknown(value) => {
             log::warn(format!(
@@ -394,53 +242,6 @@ fn collect_events(
             ));
         }
     }
-}
-
-fn dispatch_tool_call(
-    session: &mut RuntimeSession,
-    principal_id: &str,
-    session_id: &str,
-    tool_use_id: &str,
-    name: &str,
-    arguments: Value,
-    out: &mut Vec<PendingEvent>,
-) {
-    let call_id = Uuid::new_v4().to_string();
-    session.pending_tool_calls.insert(
-        call_id.clone(),
-        PendingCall {
-            started_ms: now_ms(),
-            // The `tool_use_id` from the assistant's tool_use block is
-            // what the response envelope must carry; claude matches the
-            // result back via that id, not sage's `call_id`.
-            correlation: Correlation::ToolUse {
-                tool_use_id: tool_use_id.to_string(),
-            },
-        },
-    );
-    out.push(PendingEvent {
-        topic: format!("sage.v1.tool.call.{call_id}"),
-        payload: serde_json::json!({
-            // Mirror `call_id` into the body so sage-mcp's interceptor
-            // can recover it (the dispatcher only delivers payload bytes
-            // and the action name, not the source topic).
-            "call_id": call_id,
-            "session_id": session_id,
-            "principal_id": principal_id,
-            "tool_name": name,
-            "arguments": arguments,
-            "tool_use_id": tool_use_id,
-        }),
-    });
-    out.push(PendingEvent {
-        topic: "sage.v1.audit.tool_call".to_string(),
-        payload: serde_json::json!({
-            "principal_id": principal_id,
-            "session_id": session_id,
-            "call_id": call_id,
-            "tool_name": name,
-        }),
-    });
 }
 
 fn publish_exit(session_id: &str, reason: &str, exit_code: Option<i32>, signal: Option<i32>) {
@@ -608,15 +409,13 @@ fn reconcile_decision(probe: Probe) -> Reconcile {
 /// Rebuild the in-memory [`RuntimeSession`] for a child that survived the
 /// reload, re-attaching by id. The record + hook token are kept untouched:
 /// it is the SAME running child under the same `ASTRID_HOOK_TOKEN`, so its
-/// in-flight `astrid-emit` hooks keep validating. The codec + in-flight
-/// tool-call maps start empty — the supervisor picks up cleanly from the
-/// next decoded line. KNOWN LIMITATION: a tool call that was awaiting a
-/// result across the reload is dropped (its `pending_tool_calls` entry was
-/// in-memory), so claude surfaces it as a tool timeout (~60 s) instead of
-/// hanging — the conversation itself continues. Likewise a stream-json line
-/// straddling the reload boundary can be lost under the draining `read_logs`
-/// path. Persisting the tool-call bookkeeping and moving to cursor-addressed
-/// `read_since` close both gaps (follow-up).
+/// in-flight `astrid-emit` hooks keep validating. The codec starts empty —
+/// the supervisor picks up cleanly from the next decoded line. KNOWN
+/// LIMITATION: a stream-json line straddling the reload boundary can be lost
+/// under the draining `read_logs` path; moving to cursor-addressed
+/// `read_since` closes that gap (follow-up). Tool calls survive the reload on
+/// their own — claude owns them against the registered MCP server, off this
+/// stream entirely.
 fn resume_session(
     sessions: &Sessions,
     rec: SessionRecord,
@@ -632,8 +431,6 @@ fn resume_session(
                 record: rec,
                 process,
                 codec: crate::codec::LineDecoder::default(),
-                pending_tool_calls: HashMap::new(),
-                partial_tool_inputs: HashMap::new(),
             },
         );
     })?;
@@ -659,10 +456,6 @@ fn abandon_orphan(rec: &SessionRecord, reason: &str, code: Option<i32>, sig: Opt
     publish_exit(&rec.session_id, reason, code, sig);
     let _ = delete_record(&rec.session_id);
     let _ = crate::hooks::forget_token(&rec.principal_id, &rec.session_id);
-}
-
-fn now_ms() -> u64 {
-    u64::try_from(astrid_sdk::time::monotonic().as_millis()).unwrap_or(0)
 }
 
 #[cfg(test)]

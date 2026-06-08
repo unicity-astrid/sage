@@ -33,10 +33,11 @@
 //!    binary lands (see `crate::layout::settings_json` for the
 //!    dual-mode contract).
 //! 6. Atomically writes `.claude/.mcp.json`. In `headless` mode the
-//!    body is the documented `/bin/false` stub (sage parses `tool_use`
-//!    blocks directly out of claude's stream-json — the stub keeps
-//!    `--allowed-tools mcp__sage__*` resolving). In `repl` mode the
-//!    body is an empty `mcpServers` object — users wire native MCP
+//!    body registers the `sage` MCP server as
+//!    `astrid mcp serve --principal <id>` — the stdio server claude does
+//!    the native MCP handshake against and calls `mcp__sage__*` tools
+//!    against directly (see `crate::layout::mcp_json`). In `repl` mode
+//!    the body is an empty `mcpServers` object — users wire native MCP
 //!    servers themselves.
 //! 7. Records `sage.install.complete.<id>` in KV and publishes
 //!    `sage.v1.install.complete{success:true, home_path}`.
@@ -439,8 +440,8 @@ fn provision_dirs(sanitized_id: &str) -> Result<(), SysError> {
 fn write_configs(sanitized_id: &str, cfg: &PrincipalConfig) -> Result<(), SysError> {
     publish_status(sanitized_id, "write_settings", "writing settings.local.json");
     settings::write_settings(cfg)?;
-    publish_status(sanitized_id, "write_mcp", "writing .mcp.json stub");
-    settings::write_mcp(cfg)?;
+    publish_status(sanitized_id, "write_mcp", "writing .mcp.json (sage MCP server)");
+    settings::write_mcp(cfg, sanitized_id)?;
     publish_status(sanitized_id, "write_claude_md", "writing CLAUDE.md");
     settings::write_claude_md(cfg)?;
     Ok(())
