@@ -1,0 +1,18 @@
+{
+  "name": "astrid",
+  "displayName": "Astrid",
+  "version": "0.1.0",
+  "description": "Run Claude Code as an Astrid agent — capsule tools over MCP, governed by the Astrid runtime. Installing this plugin turns a vanilla `claude` REPL into an Astrid-integrated session.",
+  "author": { "name": "Unicity Labs", "email": "info@unicity-labs.com" },
+  "homepage": "https://github.com/unicity-astrid/astrid",
+  "license": "MIT OR Apache-2.0",
+  "keywords": ["astrid", "mcp", "agent", "runtime", "capsule"],
+  "mcpServers": "./.mcp.json",
+  "userConfig": {
+    "principal": {
+      "type": "string",
+      "title": "Astrid principal",
+      "description": "The Astrid principal this Claude Code session acts as. Scopes tool execution and capability checks to this identity. Leave blank to use the active/default principal."
+    }
+  }
+}

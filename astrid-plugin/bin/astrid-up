@@ -1,0 +1,34 @@
+#!/usr/bin/env sh
+# Ensure the Astrid daemon is up, then become the MCP stdio server.
+#
+# Bundled with the Astrid Claude Code plugin so installing the plugin needs
+# no separate `astrid start` — the daemon comes up the first time Claude
+# Code launches the MCP server. A plugin cannot spawn a long-lived host
+# daemon directly; this wrapper closes that gap from inside the plugin.
+#
+# stdout DISCIPLINE: the MCP transport owns stdout — only the JSON-RPC
+# stream produced by `astrid mcp serve` may go there. Everything this
+# wrapper emits goes to stderr, and the daemon-start output is silenced, so
+# a stray line can never corrupt the protocol framing.
+set -eu
+
+# Resolve the astrid binary: PATH first, then the default install location.
+ASTRID="$(command -v astrid 2>/dev/null || true)"
+[ -n "$ASTRID" ] || ASTRID="$HOME/.astrid/bin/astrid"
+if [ ! -x "$ASTRID" ]; then
+  echo "astrid-up: cannot find the 'astrid' binary (not on PATH, not at $HOME/.astrid/bin/astrid). Install Astrid first." >&2
+  exit 127
+fi
+
+# Best-effort, idempotent daemon start (no-op if already running). Silenced
+# on both streams so it can never write to the MCP stdout stream.
+"$ASTRID" start >/dev/null 2>&1 || true
+
+# Drop an empty `--principal ""` pair (operator left userConfig.principal
+# blank) so the server uses the active/default principal instead of an
+# empty id.
+if [ "${1:-}" = "--principal" ] && [ -z "${2:-}" ]; then
+  shift 2
+fi
+
+exec "$ASTRID" mcp serve "$@"
