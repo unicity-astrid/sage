@@ -43,18 +43,34 @@ fn tokens_match_length_mismatch_false() {
 #[test]
 fn topic_map_contains_all_known_hooks() {
     let names: Vec<&str> = HOOK_TOPIC_MAP.iter().map(|(n, _)| *n).collect();
-    assert!(names.contains(&"session_start"));
-    assert!(names.contains(&"session_end"));
-    assert!(names.contains(&"message_received"));
-    assert!(names.contains(&"before_tool_call"));
-    assert!(names.contains(&"after_tool_call"));
-    assert!(names.contains(&"message_sent"));
-    assert!(names.contains(&"subagent_start"));
-    assert!(names.contains(&"subagent_stop"));
-    assert!(names.contains(&"on_compaction_started"));
-    assert!(names.contains(&"on_compaction_completed"));
-    assert!(names.contains(&"notification"));
-    assert_eq!(names.len(), 11);
+    for expected in [
+        "session_start",
+        "session_end",
+        "session_setup",
+        "message_received",
+        "message_expanded",
+        "before_tool_call",
+        "after_tool_call",
+        "after_tool_call_failed",
+        "after_tool_batch",
+        "permission_denied",
+        "message_sent",
+        "message_failed",
+        "subagent_start",
+        "subagent_stop",
+        "on_compaction_started",
+        "on_compaction_completed",
+        "config_changed",
+        "instructions_loaded",
+        "file_changed",
+        "cwd_changed",
+        "elicitation_requested",
+        "elicitation_resolved",
+        "notification",
+    ] {
+        assert!(names.contains(&expected), "missing hook tail {expected}");
+    }
+    assert_eq!(names.len(), 23);
 }
 
 #[test]
@@ -445,10 +461,19 @@ fn topic_map_matches_documented_sage_install_alphabet() {
     let expected = [
         ("session_start", "hook.v1.event.session_start"),
         ("session_end", "hook.v1.event.session_end"),
+        ("session_setup", "hook.v1.event.session_setup"),
         ("message_received", "hook.v1.event.message_received"),
+        ("message_expanded", "hook.v1.event.message_expanded"),
         ("before_tool_call", "hook.v1.event.before_tool_call"),
         ("after_tool_call", "hook.v1.event.after_tool_call"),
+        (
+            "after_tool_call_failed",
+            "hook.v1.event.after_tool_call_failed",
+        ),
+        ("after_tool_batch", "hook.v1.event.after_tool_batch"),
+        ("permission_denied", "hook.v1.event.permission_denied"),
         ("message_sent", "hook.v1.event.message_sent"),
+        ("message_failed", "hook.v1.event.message_failed"),
         ("subagent_start", "hook.v1.event.subagent_start"),
         ("subagent_stop", "hook.v1.event.subagent_stop"),
         (
@@ -459,6 +484,15 @@ fn topic_map_matches_documented_sage_install_alphabet() {
             "on_compaction_completed",
             "hook.v1.event.on_compaction_completed",
         ),
+        ("config_changed", "hook.v1.event.config_changed"),
+        ("instructions_loaded", "hook.v1.event.instructions_loaded"),
+        ("file_changed", "hook.v1.event.file_changed"),
+        ("cwd_changed", "hook.v1.event.cwd_changed"),
+        (
+            "elicitation_requested",
+            "hook.v1.event.elicitation_requested",
+        ),
+        ("elicitation_resolved", "hook.v1.event.elicitation_resolved"),
         ("notification", "sage.v1.notification"),
     ];
     assert_eq!(HOOK_TOPIC_MAP, &expected);

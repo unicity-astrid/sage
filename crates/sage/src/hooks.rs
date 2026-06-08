@@ -47,28 +47,38 @@ const TOKEN_BYTES: usize = 32;
 /// `sage.v1.hook.<name>` topic tail) to the topic the
 /// validator republishes on after a successful token match.
 ///
-/// Ten entries map to canonical Astrid `hook.v1.event.<name>` topics —
-/// the session lifecycle (`session_start` / `session_end`), the prompt
-/// and tool-call turns (`message_received` / `before_tool_call` /
-/// `after_tool_call` / `message_sent`), the subagent lifecycle
-/// (`subagent_start` / `subagent_stop`), and the compaction window
-/// (`on_compaction_started` / `on_compaction_completed`). Every tail
-/// resolves to a name the hook-bridge capsule already defines, so this
-/// table widens without any cross-capsule contract change.
-/// `notification` has no canonical equivalent yet — sage republishes
-/// it on the sage-namespaced `sage.v1.notification` instead.
+/// Every tail except `notification` maps to a canonical Astrid
+/// `hook.v1.event.<name>` topic — the session lifecycle (setup / start /
+/// end), the prompt and tool-call turns (incl. failures, batches, prompt
+/// expansion, permission denials), the subagent lifecycle, the compaction
+/// window, and config / instructions / filesystem / MCP-elicitation
+/// observability. `hook.v1.event.*` is a wildcard publish, so the table
+/// widens with no cross-capsule contract change. `notification` has no
+/// canonical equivalent yet — sage republishes it on the sage-namespaced
+/// `sage.v1.notification` instead.
 ///
-/// `sage-install` reads this table when authoring
-/// `settings.local.json` so the spawn-side command strings and the
-/// run-loop validator agree on the topic alphabet from a single
-/// source of truth.
+/// SYNC: the SET of tails here MUST equal the set of `sage.v1.hook.<tail>`
+/// values in `sage_install::layout::HOOK_TOPIC_MAP` (sage-install/src/layout.rs).
+/// The two crates have no dependency edge, so the table is mirrored. A tail
+/// authored on the spawn side but absent here is published by `astrid-emit`
+/// yet dropped by the validator (`unknown_hook`); the reverse is dead. The
+/// cross-crate set-equality is pinned by tests on both sides.
 pub(crate) const HOOK_TOPIC_MAP: &[(&str, &str)] = &[
     ("session_start", "hook.v1.event.session_start"),
     ("session_end", "hook.v1.event.session_end"),
+    ("session_setup", "hook.v1.event.session_setup"),
     ("message_received", "hook.v1.event.message_received"),
+    ("message_expanded", "hook.v1.event.message_expanded"),
     ("before_tool_call", "hook.v1.event.before_tool_call"),
     ("after_tool_call", "hook.v1.event.after_tool_call"),
+    (
+        "after_tool_call_failed",
+        "hook.v1.event.after_tool_call_failed",
+    ),
+    ("after_tool_batch", "hook.v1.event.after_tool_batch"),
+    ("permission_denied", "hook.v1.event.permission_denied"),
     ("message_sent", "hook.v1.event.message_sent"),
+    ("message_failed", "hook.v1.event.message_failed"),
     ("subagent_start", "hook.v1.event.subagent_start"),
     ("subagent_stop", "hook.v1.event.subagent_stop"),
     (
@@ -79,6 +89,15 @@ pub(crate) const HOOK_TOPIC_MAP: &[(&str, &str)] = &[
         "on_compaction_completed",
         "hook.v1.event.on_compaction_completed",
     ),
+    ("config_changed", "hook.v1.event.config_changed"),
+    ("instructions_loaded", "hook.v1.event.instructions_loaded"),
+    ("file_changed", "hook.v1.event.file_changed"),
+    ("cwd_changed", "hook.v1.event.cwd_changed"),
+    (
+        "elicitation_requested",
+        "hook.v1.event.elicitation_requested",
+    ),
+    ("elicitation_resolved", "hook.v1.event.elicitation_resolved"),
     ("notification", "sage.v1.notification"),
 ];
 
