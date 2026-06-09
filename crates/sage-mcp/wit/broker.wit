@@ -1,0 +1,62 @@
+package sage:mcp-broker@1.0.0;
+
+/// Wire records for the sage-mcp broker's own request surface and internal
+/// audit topic. The broker bridges an MCP client (behind `astrid mcp serve`)
+/// to the Astrid capsule tool surface.
+///
+/// Opaque MCP sub-payloads the broker forwards but does not type-check — tool
+/// arguments, content blocks, descriptor lists — are carried as JSON strings,
+/// mirroring the `tool-call.arguments` convention in the shared contracts.
+/// Pure pass-through / trigger topics (`sage.v1.tools.describe`,
+/// `sage.v1.tools.list`, `astrid.v1.response.<req-id>`) are declared `"opaque"`
+/// in the manifest rather than given a record here, per the manifest's
+/// proxy-payload escape hatch.
+interface broker {
+    /// `astrid.v1.request.mcp.tools.list` — the shim asks for the tool surface.
+    /// The reply lands on `astrid.v1.response.<req-id>`.
+    record list-request {
+        /// Proxy correlation token (single clean segment; UUID-ish).
+        req-id: string,
+    }
+
+    /// `astrid.v1.request.mcp.tool.call` — the shim invokes a tool.
+    record call-request {
+        /// Proxy correlation token.
+        req-id: string,
+        /// Raw MCP tool name (the broker strips the `mcp__sage__` prefix before
+        /// routing to `tool.v1.execute.<name>`).
+        name: string,
+        /// JSON-encoded tool arguments, opaque to the broker (forwarded verbatim).
+        arguments: string,
+    }
+
+    /// `astrid.v1.request.mcp.approval.respond` — the shim forwards the user's
+    /// elicited approval choice to unblock a host-parked tool call.
+    record approval-respond {
+        /// Fresh proxy correlation token for this respond round-trip.
+        req-id: string,
+        /// The original `request_id` of the parked approval (echoed verbatim).
+        request-id: string,
+        /// One of the host approval verbs: approve / approve_session /
+        /// approve_always / deny.
+        decision: string,
+        /// The tool whose call is parked (echoed from the elicit flag).
+        tool-name: string,
+        /// The parked call's id (echoed from the elicit flag).
+        call-id: string,
+        /// Optional human-readable reason.
+        reason: option<string>,
+    }
+
+    /// `sage.v1.audit.*` — policy-gate audit emitted at the broker chokepoint:
+    /// `policy_deny` (a rule refused a call) and `policy_load_failed` (rules
+    /// unset / unparseable / over-cap → policy degraded to the exec-time PEP).
+    record policy-audit {
+        /// The tool whose call was refused (`policy_deny`).
+        tool: option<string>,
+        /// The rule id that fired (`policy_deny`).
+        rule: option<string>,
+        /// Failure reason (`policy_load_failed`).
+        reason: option<string>,
+    }
+}
