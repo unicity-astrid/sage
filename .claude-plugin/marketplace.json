@@ -1,0 +1,18 @@
+{
+  "name": "astrid",
+  "owner": {
+    "name": "Unicity Labs",
+    "email": "info@unicity-labs.com"
+  },
+  "metadata": {
+    "description": "Astrid — run agent runtimes (Claude Code, and other MCP clients) as governed Astrid agents.",
+    "homepage": "https://github.com/unicity-astrid/astrid"
+  },
+  "plugins": [
+    {
+      "name": "astrid",
+      "source": "./astrid-plugin",
+      "description": "Turn a vanilla `claude` REPL into a governed Astrid agent: capsule tools over MCP, an ephemeral self-cleaning daemon, a readiness doctor, an Astrid HUD status line, and an Astrid-agent identity. Astrid stays agent-agnostic; this is the Claude-specific adapter."
+    }
+  ]
+}

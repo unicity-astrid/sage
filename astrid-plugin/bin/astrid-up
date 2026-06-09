@@ -1,10 +1,22 @@
 #!/usr/bin/env sh
-# Ensure the Astrid daemon is up, then become the MCP stdio server.
+# Ensure an Astrid daemon is up, then become the MCP stdio server for this
+# Claude Code session.
 #
 # Bundled with the Astrid Claude Code plugin so installing the plugin needs
 # no separate `astrid start` — the daemon comes up the first time Claude
-# Code launches the MCP server. A plugin cannot spawn a long-lived host
-# daemon directly; this wrapper closes that gap from inside the plugin.
+# Code launches the MCP server, and tears itself down when the editor exits.
+# A plugin cannot spawn a long-lived host daemon directly; this wrapper
+# closes that gap from inside the plugin.
+#
+# DAEMON LIFECYCLE: we boot the daemon in EPHEMERAL mode (`astrid-daemon
+# --ephemeral`), which auto-shuts-down ~30s after its last client
+# disconnects. This session's `mcp serve` uplink is that client, so the
+# daemon lives exactly as long as the editor (plus the grace window) and
+# self-cleans afterwards — no orphaned background process. We deliberately
+# do NOT use `astrid start`, which forces PERSISTENT mode (stays up until
+# `astrid stop`). If a daemon is already running (persistent or ephemeral,
+# e.g. a second concurrent Claude session, or one you started by hand) we
+# reuse it untouched; the connection counter ref-counts the shared daemon.
 #
 # stdout DISCIPLINE: the MCP transport owns stdout — only the JSON-RPC
 # stream produced by `astrid mcp serve` may go there. Everything this
@@ -12,21 +24,70 @@
 # a stray line can never corrupt the protocol framing.
 set -eu
 
+log() { printf 'astrid-up: %s\n' "$*" >&2; }
+
 # Resolve the astrid binary: PATH first, then the default install location.
 ASTRID="$(command -v astrid 2>/dev/null || true)"
 [ -n "$ASTRID" ] || ASTRID="$HOME/.astrid/bin/astrid"
 if [ ! -x "$ASTRID" ]; then
-  echo "astrid-up: cannot find the 'astrid' binary (not on PATH, not at $HOME/.astrid/bin/astrid). Install Astrid first." >&2
+  log "cannot find the 'astrid' binary (not on PATH, not at $HOME/.astrid/bin/astrid). Install Astrid first."
   exit 127
 fi
 
-# Best-effort, idempotent daemon start (no-op if already running). Silenced
-# on both streams so it can never write to the MCP stdout stream.
-"$ASTRID" start >/dev/null 2>&1 || true
+# The readiness sentinel the daemon writes once every capsule is loaded and
+# the accept loop is live. Mirrors astrid-core::dirs (run/system.ready under
+# ASTRID_HOME, default ~/.astrid).
+ASTRID_HOME_DIR="${ASTRID_HOME:-$HOME/.astrid}"
+READY="$ASTRID_HOME_DIR/run/system.ready"
+
+# Liveness probe. `astrid status` exits 0 whether the daemon is up OR down
+# (it just prints a human line), so the exit code is useless here — we match
+# the live-status line instead, which is emitted ONLY after a successful
+# round-trip to a running daemon. A false negative is self-healing: the
+# redundant boot below fails to bind the in-use socket and exits harmlessly,
+# and `mcp serve` connects to the daemon that is already up.
+daemon_live() { "$ASTRID" status 2>/dev/null | grep -q '(PID'; }
+
+if ! daemon_live; then
+  # No reachable daemon — boot one in EPHEMERAL mode so it self-cleans.
+  ASTRID_BIN_DIR="$(dirname "$ASTRID")"
+  DAEMON="$ASTRID_BIN_DIR/astrid-daemon"
+  [ -x "$DAEMON" ] || DAEMON="$(command -v astrid-daemon 2>/dev/null || true)"
+  if [ -z "$DAEMON" ] || [ ! -x "$DAEMON" ]; then
+    log "no daemon running and cannot find 'astrid-daemon' to boot one (looked next to $ASTRID and on PATH)."
+    log "start one yourself with: astrid start"
+    exit 127
+  fi
+
+  log "no daemon running — booting one (ephemeral, self-cleaning)..."
+  # Detach via a subshell that exits immediately, so the daemon reparents to
+  # init right away and outlives this wrapper (and the `mcp serve` it execs
+  # into) — exactly how the CLI's own spawn_daemon detaches it. No controlling
+  # stdio; both streams silenced so nothing can reach the MCP stdout stream.
+  ( "$DAEMON" --ephemeral </dev/null >/dev/null 2>&1 & )
+
+  # Wait for readiness (~10s budget, matching the CLI's own boot poll). The
+  # sleep is guarded: a strict/busybox `sleep` that rejects fractional
+  # seconds must not abort the script under `set -e`.
+  i=0
+  while [ "$i" -lt 200 ]; do
+    if [ -e "$READY" ] && daemon_live; then
+      break
+    fi
+    sleep 0.05 2>/dev/null || sleep 1
+    i=$((i + 1))
+  done
+
+  if ! daemon_live; then
+    log "daemon did not become ready within 10s. Check logs under $ASTRID_HOME_DIR/log."
+    exit 1
+  fi
+fi
 
 # Drop an empty `--principal ""` pair (operator left userConfig.principal
-# blank) so the server uses the active/default principal instead of an
-# empty id.
+# blank) so `astrid mcp serve` resolves the active CLI principal itself
+# (context::resolve_agent → active agent context, else the default
+# principal). Zero-config: no userConfig needed for single-tenant use.
 if [ "${1:-}" = "--principal" ] && [ -z "${2:-}" ]; then
   shift 2
 fi

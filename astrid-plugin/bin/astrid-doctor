@@ -1,0 +1,130 @@
+#!/usr/bin/env sh
+# astrid-doctor — diagnose the Astrid runtime backing this Claude Code
+# session and report what the agent is (its principal) and what governs it.
+#
+# Two output modes:
+#   --format human  (default)  human-readable report on stdout, for the
+#                              /astrid:doctor slash command.
+#   --format hook              a SessionStart hook payload on stdout
+#                              ({hookSpecificOutput.additionalContext}),
+#                              so the live session is told it's an Astrid
+#                              agent and shown any readiness gap + the fix.
+#
+# READ-ONLY: this never boots, stops, or mutates anything — bin/astrid-up
+# owns the daemon lifecycle. The doctor only observes, so it can race the
+# wrapper's boot harmlessly. It ALWAYS exits 0 (a SessionStart hook must
+# never wedge startup); unreachable state is reported, not fatal.
+set -eu
+
+MODE="human"
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --format) MODE="${2:-human}"; shift 2 ;;
+    --format=*) MODE="${1#--format=}"; shift ;;
+    *) shift ;;
+  esac
+done
+
+# Drain stdin in hook mode (Claude Code pipes the SessionStart JSON in); we
+# don't need its fields, but leaving the pipe unread can wedge the caller.
+if [ "$MODE" = "hook" ]; then
+  cat >/dev/null 2>&1 || true
+fi
+
+# Resolve the astrid binary the same way bin/astrid-up does.
+ASTRID="$(command -v astrid 2>/dev/null || true)"
+[ -n "$ASTRID" ] || ASTRID="$HOME/.astrid/bin/astrid"
+
+emit() {
+  # emit REPORT in the selected mode. In hook mode, wrap as additionalContext.
+  _report="$1"
+  if [ "$MODE" = "hook" ]; then
+    if command -v jq >/dev/null 2>&1; then
+      jq -n --arg ctx "$_report" \
+        '{hookSpecificOutput:{hookEventName:"SessionStart",additionalContext:$ctx}}'
+    else
+      # jq-free fallback: escape backslash, quote, and newlines for a JSON
+      # string. Report content is ASCII we author, so this is sufficient.
+      _esc=$(printf '%s' "$_report" \
+        | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' \
+        | awk 'NR>1{printf "\\n"} {printf "%s", $0}')
+      printf '{"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":"%s"}}\n' "$_esc"
+    fi
+  else
+    printf '%s\n' "$_report"
+  fi
+}
+
+# astrid not installed at all — actionable, non-fatal.
+if [ ! -x "$ASTRID" ]; then
+  emit "Astrid is not installed (no 'astrid' binary on PATH or at ~/.astrid/bin/astrid).
+Install the Astrid runtime, then restart this session. The Astrid plugin can't bootstrap the runtime itself — it only wires Claude Code to an Astrid that already exists."
+  exit 0
+fi
+
+# Active principal — read from the local CLI context file, so this works
+# even before the daemon is up.
+PRINCIPAL="$("$ASTRID" agent current 2>/dev/null | head -n1 | tr -d '[:space:]')"
+[ -n "$PRINCIPAL" ] || PRINCIPAL="default"
+
+# Probe the daemon (read-only). `astrid status` exits 0 either way, so we
+# read its text. Give the wrapper's boot a brief moment (~2s) in case the
+# hook fires before the daemon finishes coming up.
+STATUS=""
+i=0
+while [ "$i" -lt 40 ]; do
+  STATUS="$("$ASTRID" status 2>/dev/null || true)"
+  if printf '%s' "$STATUS" | grep -q '(PID'; then
+    break
+  fi
+  sleep 0.05 2>/dev/null || sleep 1
+  i=$((i + 1))
+done
+
+if ! printf '%s' "$STATUS" | grep -q '(PID'; then
+  emit "Astrid agent — principal '$PRINCIPAL'.
+
+The Astrid daemon is not reachable yet. If tools don't appear shortly, start it with: astrid start
+(The plugin normally boots an ephemeral daemon automatically when the MCP server launches.)"
+  exit 0
+fi
+
+# Parse the status report.
+PIDLINE="$(printf '%s' "$STATUS" | grep '(PID' | head -n1 | sed 's/^[[:space:]]*//')"
+CAPCOUNT="$(printf '%s' "$STATUS" | grep -i 'Capsules:' | head -n1 | sed 's/^[[:space:]]*//')"
+CAPNAMES="$(printf '%s' "$STATUS" | sed -n 's/^[[:space:]]*-[[:space:]]*//p')"
+
+has_capsule() { printf '%s\n' "$CAPNAMES" | grep -qiE "$1"; }
+
+# Broker + uplink presence drive the tool-readiness verdict.
+BROKER_NOTE=""
+if has_capsule 'sage-mcp'; then
+  BROKER_NOTE="MCP broker:  sage-mcp loaded — Astrid tools are served."
+else
+  BROKER_NOTE="MCP broker:  MISSING — sage-mcp is not loaded, so 'tools/list' will be empty.
+             Install it so 'astrid.v1.request.mcp.*' is answered."
+fi
+
+INGRESS_NOTE="First-call note: tool *calls* are confused-deputy gated by sage-mcp's
+             trusted_ingress_ids allow-set (tools/list is ungated). If calls come
+             back denied, add this session's CLI uplink source_id to sage-mcp's
+             trusted_ingress_ids (one-time, single-tenant = your own machine)."
+
+REPORT="Astrid — you are running as a governed Astrid agent.
+
+  Principal:   $PRINCIPAL
+               (tool execution + capability checks are scoped to this identity)
+  Daemon:      $PIDLINE
+  $CAPCOUNT
+  $BROKER_NOTE
+
+Acting through Astrid: call the mcp__astrid__* tools to act via Astrid's capsule
+surface (filesystem, http, shell, system, skills). Every such call passes the
+broker policy gate and the principal's capability checks. Your native
+Bash/Read/Write/Edit run in Claude's own sandbox; mcp__astrid__* additionally
+goes through the Astrid runtime.
+
+$INGRESS_NOTE"
+
+emit "$REPORT"
+exit 0

@@ -1,0 +1,74 @@
+#!/usr/bin/env sh
+# astrid-statusline — Claude Code status line rendered as an "Astrid HUD".
+#
+# Overlays the Astrid layer (principal + daemon state) onto the standard
+# model / dir / git / context / cost line, so a glance tells you WHO you're
+# acting as and WHETHER the runtime is live.
+#
+#   ⬡ astrid:<principal> ●  │ <model> │ <dir> ⎇ <branch> │ ▓▓▓░░ 42% │ $0.12
+#                        ^ green = daemon up, dim = down
+#
+# A plugin cannot register the MAIN status line — Claude Code only lets a
+# plugin default `agent`/`subagentStatusLine`. The user wires this once in
+# ~/.claude/settings.json:
+#   "statusLine": { "type": "command",
+#                   "command": "<plugin-root>/bin/astrid-statusline" }
+# The /astrid:hud command prints the exact snippet (and path) to paste.
+#
+# CONTRACT: stdin = Claude Code's JSON status payload; stdout = ONE line.
+# Must be FAST (re-runs on every refresh): the daemon check is a cheap
+# socket-existence test, the principal a local context-file read — no
+# per-refresh round-trip to the daemon.
+set -eu
+
+input="$(cat 2>/dev/null || true)"
+
+ASTRID="$(command -v astrid 2>/dev/null || true)"
+[ -n "$ASTRID" ] || ASTRID="$HOME/.astrid/bin/astrid"
+ASTRID_HOME_DIR="${ASTRID_HOME:-$HOME/.astrid}"
+SOCK="$ASTRID_HOME_DIR/run/system.sock"
+
+# ANSI colors via a real ESC byte, so report content (which never contains
+# escapes) can be concatenated with plain parameter expansion.
+ESC=$(printf '\033')
+C_RESET="${ESC}[0m"; C_DIM="${ESC}[2m"; C_CY="${ESC}[36m"
+C_GN="${ESC}[32m"; C_YE="${ESC}[33m"; C_GY="${ESC}[90m"
+
+# Principal — local context-file read (fast; works even if daemon is down).
+PRINCIPAL="default"
+if [ -x "$ASTRID" ]; then
+  p="$("$ASTRID" agent current 2>/dev/null | head -n1 | tr -d '[:space:]')"
+  [ -n "$p" ] && PRINCIPAL="$p"
+fi
+
+# Daemon up/down — cheap socket-existence probe (no round-trip per refresh).
+if [ -S "$SOCK" ]; then DOT="${C_GN}●${C_RESET}"; else DOT="${C_GY}○${C_RESET}"; fi
+
+# Claude-side fields, via jq when available.
+MODEL=""; DIR=""; PCT=""; COST=""
+if [ -n "$input" ] && command -v jq >/dev/null 2>&1; then
+  MODEL="$(printf '%s' "$input" | jq -r '.model.display_name // .model.id // empty' 2>/dev/null || true)"
+  DIR="$(printf '%s' "$input" | jq -r '.workspace.current_dir // .cwd // empty' 2>/dev/null || true)"
+  PCT="$(printf '%s' "$input" | jq -r '.context_window.used_percentage // empty' 2>/dev/null | cut -d. -f1 || true)"
+  COST="$(printf '%s' "$input" | jq -r '.cost.total_cost_usd // empty' 2>/dev/null || true)"
+fi
+[ -n "$DIR" ] || DIR="$PWD"
+DIRBASE="$(basename "$DIR" 2>/dev/null || printf '%s' "$DIR")"
+BRANCH="$(git -C "$DIR" rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
+
+# Compose one line.
+OUT="${C_CY}⬡ astrid:${PRINCIPAL}${C_RESET} ${DOT}"
+[ -n "$MODEL" ] && OUT="${OUT} ${C_GY}│${C_RESET} ${C_DIM}${MODEL}${C_RESET}"
+OUT="${OUT} ${C_GY}│${C_RESET} ${DIRBASE}"
+[ -n "$BRANCH" ] && OUT="${OUT} ${C_DIM}⎇ ${BRANCH}${C_RESET}"
+if [ -n "$PCT" ] && [ "$PCT" -eq "$PCT" ] 2>/dev/null; then
+  bw=10; fill=$(( PCT * bw / 100 ))
+  [ "$fill" -lt 0 ] && fill=0; [ "$fill" -gt "$bw" ] && fill="$bw"
+  empty=$(( bw - fill )); bar=""
+  n=0; while [ "$n" -lt "$fill" ];  do bar="${bar}▓"; n=$((n + 1)); done
+  n=0; while [ "$n" -lt "$empty" ]; do bar="${bar}░"; n=$((n + 1)); done
+  OUT="${OUT} ${C_GY}│${C_RESET} ${bar} ${PCT}%"
+fi
+[ -n "$COST" ] && OUT="${OUT} ${C_GY}│${C_RESET} ${C_YE}\$${COST}${C_RESET}"
+
+printf '%s\n' "$OUT"

@@ -1,13 +1,16 @@
 {
   "name": "astrid",
   "displayName": "Astrid",
-  "version": "0.1.0",
-  "description": "Run Claude Code as an Astrid agent — capsule tools over MCP, governed by the Astrid runtime. Installing this plugin turns a vanilla `claude` REPL into an Astrid-integrated session.",
+  "version": "0.2.0",
+  "description": "Run Claude Code as a governed Astrid agent: capsule tools over MCP, an ephemeral self-cleaning daemon, a SessionStart readiness doctor, an Astrid HUD status line, /astrid:* operator commands, and an Astrid-agent identity. Installing this plugin turns a vanilla `claude` REPL into an Astrid-integrated session.",
   "author": { "name": "Unicity Labs", "email": "info@unicity-labs.com" },
   "homepage": "https://github.com/unicity-astrid/astrid",
   "license": "MIT OR Apache-2.0",
   "keywords": ["astrid", "mcp", "agent", "runtime", "capsule"],
   "mcpServers": "./.mcp.json",
+  "hooks": "./hooks/hooks.json",
+  "outputStyles": "./output-styles",
+  "commands": "./commands",
   "userConfig": {
     "principal": {
       "type": "string",
