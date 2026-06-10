@@ -32,6 +32,21 @@ pub(crate) fn write_mcp(cfg: &PrincipalConfig, principal_id: &str) -> Result<(),
     atomic::write_atomic(&path, &body)
 }
 
+/// Write the staged `.claude/managed-settings.json` for the invoking
+/// principal — the MANAGED-tier body ([`layout::managed_settings_json`]).
+///
+/// Claude does NOT read managed settings from this path; it reads them from
+/// the OS system path this WASM capsule cannot write. This file is the source
+/// the host bind-mounts into that system path (core #881), inert until then.
+/// It carries the un-strippable enforcement posture — the policy gate hook
+/// plus the permission / sandbox / auth lockdown. Atomic like the others, so
+/// a crashed install never leaves a half-written managed body.
+pub(crate) fn write_managed_settings(cfg: &PrincipalConfig) -> Result<(), SysError> {
+    let path = layout::managed_settings_path();
+    let body = serde_json::to_vec_pretty(&layout::managed_settings_json(cfg))?;
+    atomic::write_atomic(&path, &body)
+}
+
 /// Write the `.claude/CLAUDE.md` for the invoking principal — the
 /// standalone Astrid grounding (what Astrid OS is and the role it runs
 /// the agent in), branched on interaction mode. User-tier memory Claude

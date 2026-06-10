@@ -213,7 +213,8 @@ const CAPSULE_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// - v0 (legacy markers, no `artifact_version` field): `.mcp.json` was a non-functional stub; sage parsed tool calls inline from claude's stream-json.
 /// - v1: `.mcp.json` registers the `sage` MCP server (`astrid mcp serve --principal <id>`); claude executes `mcp__sage__*` tools directly against it.
 /// - v2: `settings.local.json` `PreToolUse` carries a second hook handler — a `type:"mcp_tool"` gate that asks the sage-mcp broker for a binding allow/deny decision on each native tool call (governance beyond the observe-only `astrid-emit` plane).
-const ARTIFACT_VERSION: u32 = 2;
+/// - v3: also stage `.claude/managed-settings.json` — the un-strippable MANAGED-tier body (the policy gate hook + permission/sandbox/auth lockdown) the host mounts into Claude's OS managed-settings path (core #881); inert until mounted.
+const ARTIFACT_VERSION: u32 = 3;
 
 /// True when a cache-hit marker's recorded artifact shape predates the
 /// current [`ARTIFACT_VERSION`], so the on-disk `.claude/` files must be
@@ -420,6 +421,7 @@ fn run_install(req: &InstallRequest, cfg: PrincipalConfig) -> Result<String, Sys
     // "cleaned on next run" requires that they also disappear on the
     // next *successful* run.
     atomic::cleanup_temp(&layout::settings_path());
+    atomic::cleanup_temp(&layout::managed_settings_path());
     atomic::cleanup_temp(&layout::mcp_path());
     atomic::cleanup_temp(&claude_md::claude_md_path());
 
@@ -433,6 +435,7 @@ fn run_install(req: &InstallRequest, cfg: PrincipalConfig) -> Result<String, Sys
     // `env::var("api_key")` at spawn time.
     if let Err(e) = write_configs(&sanitized, &cfg) {
         atomic::cleanup_temp(&layout::settings_path());
+        atomic::cleanup_temp(&layout::managed_settings_path());
         atomic::cleanup_temp(&layout::mcp_path());
         return Err(e);
     }
@@ -480,11 +483,13 @@ fn run_relink(req: &RelinkRequest, cfg: PrincipalConfig) -> Result<String, SysEr
     // reasoning as in run_install. Safe to run before the writes
     // because cleanup_temp only matches the `.<basename>.tmp.` prefix.
     atomic::cleanup_temp(&layout::settings_path());
+    atomic::cleanup_temp(&layout::managed_settings_path());
     atomic::cleanup_temp(&layout::mcp_path());
     atomic::cleanup_temp(&claude_md::claude_md_path());
 
     if let Err(e) = write_configs(&sanitized, &cfg) {
         atomic::cleanup_temp(&layout::settings_path());
+        atomic::cleanup_temp(&layout::managed_settings_path());
         atomic::cleanup_temp(&layout::mcp_path());
         return Err(e);
     }
@@ -516,11 +521,13 @@ fn reconcile_artifacts(
 
     provision_dirs(sanitized_id)?;
     atomic::cleanup_temp(&layout::settings_path());
+    atomic::cleanup_temp(&layout::managed_settings_path());
     atomic::cleanup_temp(&layout::mcp_path());
     atomic::cleanup_temp(&claude_md::claude_md_path());
 
     if let Err(e) = write_configs(sanitized_id, cfg) {
         atomic::cleanup_temp(&layout::settings_path());
+        atomic::cleanup_temp(&layout::managed_settings_path());
         atomic::cleanup_temp(&layout::mcp_path());
         return Err(e);
     }
@@ -553,6 +560,12 @@ fn provision_dirs(sanitized_id: &str) -> Result<(), SysError> {
 fn write_configs(sanitized_id: &str, cfg: &PrincipalConfig) -> Result<(), SysError> {
     publish_status(sanitized_id, "write_settings", "writing settings.local.json");
     settings::write_settings(cfg)?;
+    publish_status(
+        sanitized_id,
+        "write_managed",
+        "writing managed-settings.json (staged for the system-path mount)",
+    );
+    settings::write_managed_settings(cfg)?;
     publish_status(sanitized_id, "write_mcp", "writing .mcp.json (sage MCP server)");
     settings::write_mcp(cfg, sanitized_id)?;
     publish_status(sanitized_id, "write_claude_md", "writing CLAUDE.md");

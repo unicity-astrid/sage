@@ -45,6 +45,27 @@ pub(crate) fn mcp_path() -> String {
     "home://.claude/.mcp.json".to_string()
 }
 
+/// Path to the STAGED managed-settings body — the source the host
+/// bind-mounts into Claude's OS-level managed-settings path to make the
+/// policy gate + permission posture un-strippable.
+///
+/// IMPORTANT: Claude does NOT read managed settings from here. Its managed
+/// (system) tier is an OS path outside any per-principal home
+/// (`/Library/Application Support/ClaudeCode/managed-settings.json` on macOS,
+/// `/etc/claude-code/managed-settings.json` on Linux), which this WASM
+/// capsule cannot write. So this file is INERT until the host mounts it —
+/// the mount is the out-of-sage half, filed as core #881. Sage authors only
+/// the body (see [`managed_settings_json`]); the host owns placement.
+///
+/// SECURITY NOTE for the mount (core #881): this staging file lives under the
+/// principal's `home://`, which the supervised session CAN write. The mount
+/// MUST source from a host-protected copy (and mount read-only) — never
+/// bind the live, session-writable file, or a session could edit its own
+/// managed tier and defeat the un-strippability this exists to provide.
+pub(crate) fn managed_settings_path() -> String {
+    "home://.claude/managed-settings.json".to_string()
+}
+
 /// Name of the MCP server sage registers for the supervised `claude`
 /// session — the `astrid mcp serve` stdio shim onto the daemon's sage-mcp
 /// broker. Claude prefixes its tools `mcp__sage__*` and references it as the
@@ -564,6 +585,47 @@ pub(crate) fn settings_json(cfg: &PrincipalConfig) -> serde_json::Value {
     }
     if matches!(cfg.auth_mode, AuthMode::ApiKey) {
         obj.insert("apiKeyHelper".to_string(), serde_json::json!("/bin/false"));
+    }
+    root
+}
+
+/// The staged MANAGED-tier body — the un-strippable enforcement posture.
+///
+/// Authored at [`managed_settings_path`] for the host to mount into Claude's
+/// OS managed-settings path (core #881); inert until then. It reuses the FULL
+/// local-tier posture from [`settings_json`] (permissions allow/deny,
+/// `defaultMode`, sandbox, `disableSkillShellExecution`, `apiKeyHelper`) but
+/// narrows `hooks` to ONLY the binding policy gate
+/// ([`pretooluse_gate_handler`]). Rationale:
+///
+/// * The managed tier carries only what must be UN-STRIPPABLE. The
+///   observe-only `astrid-emit` plane is best-effort audit and stays in the
+///   (session-overridable) local tier — no need to duplicate 30 fire-and-
+///   forget hooks into the managed file.
+/// * Claude MERGES hooks across tiers and deduplicates `mcp_tool` handlers by
+///   `(server, tool, input)`. The gate here is byte-identical to its local
+///   copy, so the two collapse and the gate fires EXACTLY ONCE — even when
+///   both tiers are present. Stripping the local copy leaves the managed one
+///   standing; that is the whole point.
+/// * Permission `allow`/`deny` union across tiers and `deny` is sticky (a
+///   higher-tier allow cannot cancel a lower-tier deny), so the managed
+///   `deny` surface ([`REQUIRED_DENIES`]) and the `dontAsk` floor become
+///   un-strippable, and `apiKeyHelper` (when api-key mode) becomes an
+///   un-strippable auth lockdown.
+///
+/// Authored mode-agnostically like the rest: headless gets the full lockdown
+/// posture + gate; repl gets the operator's gate over an otherwise
+/// user-owned permission surface.
+pub(crate) fn managed_settings_json(cfg: &PrincipalConfig) -> serde_json::Value {
+    let mut root = settings_json(cfg);
+    // Narrow hooks to the binding gate only; leave every other key (the
+    // permission/sandbox/auth posture) exactly as the local tier authors it,
+    // so the managed copy is an un-strippable superset-by-precedence.
+    if let Some(obj) = root.as_object_mut() {
+        obj.insert(
+            "hooks".to_string(),
+            serde_json::json!({ "PreToolUse": [pretooluse_gate_handler()] }),
+        );
     }
     root
 }
@@ -1197,6 +1259,94 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
+    // Managed-settings tier — the staged, un-strippable enforcement body.
+    // ------------------------------------------------------------------
+
+    fn pretooluse_handlers(v: &serde_json::Value) -> &Vec<serde_json::Value> {
+        v.pointer("/hooks/PreToolUse")
+            .and_then(|x| x.as_array())
+            .expect("hooks.PreToolUse must be an array")
+    }
+
+    #[test]
+    fn managed_settings_carries_only_the_gate_hook() {
+        let v = managed_settings_json(&cfg(InteractionMode::Headless, AuthMode::ApiKey));
+        let hooks = v
+            .pointer("/hooks")
+            .and_then(|x| x.as_object())
+            .expect("managed hooks must be an object");
+        // Exactly one event (PreToolUse) with exactly one handler (the gate);
+        // the observe-only astrid-emit plane stays in the local tier.
+        assert_eq!(hooks.len(), 1, "managed hooks must carry only PreToolUse");
+        let pre = pretooluse_handlers(&v);
+        assert_eq!(pre.len(), 1, "managed PreToolUse must carry only the gate");
+        assert_pretooluse_gate(&pre[0]);
+        assert!(
+            !v.to_string().contains("astrid-emit"),
+            "managed tier must not duplicate the observe-only astrid-emit plane"
+        );
+    }
+
+    #[test]
+    fn managed_gate_is_byte_identical_to_local_gate() {
+        // Claude merges hooks across tiers and dedups mcp_tool handlers by
+        // (server, tool, input). The managed gate MUST equal the local gate
+        // so the two collapse and the gate fires ONCE, not twice, once both
+        // tiers are live.
+        let c = cfg(InteractionMode::Headless, AuthMode::ApiKey);
+        let local = settings_json(&c);
+        let managed = managed_settings_json(&c);
+        // Local PreToolUse is [observe-emit, gate]; managed is [gate].
+        assert_eq!(
+            &pretooluse_handlers(&local)[1],
+            &pretooluse_handlers(&managed)[0]
+        );
+    }
+
+    #[test]
+    fn managed_reuses_the_binding_local_posture() {
+        // The managed tier must carry the same un-strippable posture the
+        // local tier authors — deny surface, dontAsk floor, sandbox,
+        // apiKeyHelper — so stripping the local copy cannot relax them.
+        for am in [AuthMode::ApiKey, AuthMode::Subscription] {
+            let c = cfg(InteractionMode::Headless, am);
+            let local = settings_json(&c);
+            let managed = managed_settings_json(&c);
+            for key in [
+                "/permissions/allow",
+                "/permissions/deny",
+                "/permissions/defaultMode",
+                "/sandbox",
+                "/apiKeyHelper",
+            ] {
+                assert_eq!(
+                    local.pointer(key),
+                    managed.pointer(key),
+                    "managed must mirror local at {key} ({am:?})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn managed_settings_repl_imposes_gate_over_user_surface() {
+        // Repl is the user's own environment: the managed tier still imposes
+        // the operator's gate, but no permission lockdown (permissions stay
+        // empty, as the local repl tier authors them).
+        let v = managed_settings_json(&cfg(InteractionMode::Repl, AuthMode::Subscription));
+        let pre = pretooluse_handlers(&v);
+        assert_eq!(pre.len(), 1);
+        assert_pretooluse_gate(&pre[0]);
+        assert!(
+            v.pointer("/permissions/allow")
+                .and_then(|x| x.as_array())
+                .unwrap()
+                .is_empty(),
+            "repl managed: allow must stay empty (user owns the surface)"
+        );
+    }
+
+    // ------------------------------------------------------------------
     // KV key namespacing — guard against accidental collisions with
     // other capsules sharing the kv surface.
     // ------------------------------------------------------------------
@@ -1317,6 +1467,7 @@ mod tests {
         assert!(projects_dir().starts_with("home://"));
         assert!(settings_path().starts_with("home://"));
         assert!(mcp_path().starts_with("home://"));
+        assert!(managed_settings_path().starts_with("home://"));
     }
 
     #[test]
@@ -1329,6 +1480,7 @@ mod tests {
             projects_dir(),
             settings_path(),
             mcp_path(),
+            managed_settings_path(),
         ] {
             assert!(
                 !p.starts_with('~'),
