@@ -81,7 +81,12 @@ Claude offer to add it:
 ```
 
 Renders: `⬡ astrid:<principal> ●  │ <model> │ <dir> ⎇ <branch> │ <context-bar> │ <cost>`
-— the dot is green when the daemon is up.
+— the dot reflects governance health: green ● when governed (daemon up **and** the
+sage-mcp broker loaded), yellow ◐ when the daemon is up but the broker is missing
+(native tools run **ungoverned**), dim ○ when the daemon is down. It is a cached
+round-trip check (`astrid status`), not a socket-exists test — cooperative plugin
+mode has no sandbox floor under a dead gate, so the dot must not claim governance
+it can't back.
 
 ## Caveat: tool *calls* need a trusted ingress (one-time)
 
