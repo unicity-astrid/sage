@@ -212,7 +212,8 @@ const CAPSULE_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// History — bump in lockstep with each shape change:
 /// - v0 (legacy markers, no `artifact_version` field): `.mcp.json` was a non-functional stub; sage parsed tool calls inline from claude's stream-json.
 /// - v1: `.mcp.json` registers the `sage` MCP server (`astrid mcp serve --principal <id>`); claude executes `mcp__sage__*` tools directly against it.
-const ARTIFACT_VERSION: u32 = 1;
+/// - v2: `settings.local.json` `PreToolUse` carries a second hook handler — a `type:"mcp_tool"` gate that asks the sage-mcp broker for a binding allow/deny decision on each native tool call (governance beyond the observe-only `astrid-emit` plane).
+const ARTIFACT_VERSION: u32 = 2;
 
 /// True when a cache-hit marker's recorded artifact shape predates the
 /// current [`ARTIFACT_VERSION`], so the on-disk `.claude/` files must be

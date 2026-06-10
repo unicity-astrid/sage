@@ -1,18 +1,27 @@
 //! Per-principal policy decision point (PDP) for supervised `claude -p`
 //! tool calls — the binding argument-level gate.
 //!
-//! # Why this lives at the broker chokepoint
+//! # Two planes, one rule engine
 //!
-//! Every tool the supervised Claude invokes funnels through
+//! Every `mcp__sage__*` tool the supervised Claude invokes funnels through
 //! [`crate::broker::handle_mcp_call`] before
 //! [`crate::execute::dispatch_with_approval`] fans it out on the bus. That
 //! is the ONE capsule-space point that holds the parsed `(tool_name,
-//! arguments)` and can refuse to dispatch. So the PDP is evaluated there,
-//! UNCONDITIONALLY and IN-PROCESS — not as a Claude-side PreToolUse hook.
-//! A PreToolUse `mcp_tool` hook would be advisory: it is read from a
-//! settings tier a capable session can edit, and the gate call is a
-//! separate MCP call Claude can skip. The broker chokepoint cannot be
-//! routed around — the tool literally cannot execute without passing it.
+//! arguments)` and can refuse to dispatch, so for that plane the PDP is
+//! evaluated there UNCONDITIONALLY and IN-PROCESS: the broker chokepoint
+//! cannot be routed around — the tool literally cannot execute without
+//! passing it.
+//!
+//! Claude's NATIVE tools (`Bash`, `Write`, …) reach no such chokepoint —
+//! they execute inside the `claude` process. The only per-call lever for
+//! them is a PreToolUse `type:"mcp_tool"` hook, which calls back into this
+//! SAME [`evaluate`] via the reserved [`crate::broker::PRETOOLUSE_GATE_TOOL`].
+//! That path is honestly ADVISORY: the hook is read from a settings tier a
+//! capable session can edit, the gate call is one Claude could skip, and the
+//! platform fails open. So it is defence-in-depth on top of the host sandbox
+//! and the binding `--disallowedTools` deny-list — never a substitute for
+//! the in-process gate the `mcp__sage__*` plane enjoys. One operator rule
+//! set, two enforcement strengths.
 //!
 //! # What it adds over the host capability PEP (non-redundancy)
 //!

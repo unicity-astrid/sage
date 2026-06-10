@@ -66,6 +66,46 @@ const RESPONSE_PREFIX: &str = "astrid.v1.response.";
 /// longer is rejected before it can be stamped into an egress topic.
 const MAX_REQ_ID_LEN: usize = 128;
 
+/// Reserved broker tool name for the NATIVE-tool PreToolUse permission
+/// gate. It is NOT a real capsule tool and deliberately never appears in
+/// `tools/list`: it exists only to service Claude's `type:"mcp_tool"`
+/// PreToolUse hook, which calls it OUT-OF-BAND (not through Claude's tool
+/// surface) to get a binding allow/deny decision for a native tool call
+/// (`Bash`, `Write`, `Edit`, …). VERIFIED against the shipped `claude`
+/// executor: a `mcp_tool` hook issues `tools/call` DIRECTLY and does NOT
+/// pre-validate the name against the server's `tools/list`, so an
+/// intentionally-unlisted tool the broker special-cases is invoked normally
+/// — no descriptor injection needed.
+///
+/// ## Why a hook, when the `mcp__sage__*` plane is gated in-process
+///
+/// Native tools execute INSIDE the `claude` process and reach no Astrid
+/// chokepoint — unlike the `mcp__sage__*` tools, which funnel through
+/// [`handle_mcp_call`] where the same [`crate::policy`] PDP refuses to
+/// dispatch a denied call un-bypassably. For native tools there is no such
+/// in-process point, so the PreToolUse hook is the ONLY per-call lever. The
+/// gate reuses the SAME PDP, so one operator rule set governs both planes.
+///
+/// ## Honest limit — advisory, fail-open
+///
+/// This path is best-effort, not a guarantee. The hook is read from a
+/// settings tier a capable session can edit, the gate call is one Claude
+/// could route around, and the platform FAILS OPEN: a disconnected server,
+/// an `isError` reply, or non-JSON text all let the tool run. The
+/// fail-CLOSED boundary for native tools stays the Astrid host sandbox plus
+/// the `--disallowedTools` deny-list; this gate adds dynamic, argument-level
+/// DENY on top, and only ever NARROWS (an `Allow` defers to Claude's
+/// existing permission flow rather than asserting an explicit allow).
+///
+/// SYNC (load-bearing): must equal `sage_install::layout::PRETOOLUSE_GATE_TOOL`
+/// — sage-install authors the hook with this exact `tool` name. The two
+/// crates share no dependency edge, so the constant is mirrored, not shared;
+/// a drift silently DISABLES the gate (the hook would call a name the broker
+/// does not special-case, so `dispatch_with_approval` treats it as an
+/// unknown tool, drains to `isError`, and the hook fails open). A presence
+/// test in each crate anchors the value.
+pub(crate) const PRETOOLUSE_GATE_TOOL: &str = "astrid_pretooluse_gate";
+
 /// Inbound `astrid.v1.request.mcp.tools.list` payload.
 ///
 /// `req_id` is the proxy's correlation token, mirrored into the body
@@ -154,6 +194,20 @@ pub(crate) fn handle_mcp_call(payload: Value) -> Result<(), SysError> {
         ));
         return Ok(());
     };
+
+    // Native-tool PreToolUse gate. A reserved, unlisted tool name Claude's
+    // PreToolUse `mcp_tool` hook calls to get a binding decision for a NATIVE
+    // tool (`Bash`/`Write`/…) that runs inside the claude process and so
+    // never reaches the dispatch gate below. It is READ-ONLY — it evaluates
+    // policy and replies a hook decision, never dispatching — so it sits
+    // ABOVE the confused-deputy mutation gate, exactly like the read-only
+    // `handle_mcp_list`. The reply is ALWAYS `isError:false`: an
+    // `isError:true` MCP result makes the hook fail OPEN, so a deny must ride
+    // in the reply `content`, never the error flag. See [`PRETOOLUSE_GATE_TOOL`].
+    if req.name == PRETOOLUSE_GATE_TOOL {
+        publish_reply(&reply_topic, &pretooluse_gate_reply(&req));
+        return Ok(());
+    }
 
     // Confused-deputy gate. `astrid.v1.request.mcp.tool.call` is
     // state-mutating and externally reachable through the cli proxy, so
@@ -288,6 +342,109 @@ pub(crate) fn handle_mcp_call(payload: Value) -> Result<(), SysError> {
     Ok(())
 }
 
+/// Evaluate the per-principal [`crate::policy`] rule set against the native
+/// tool a PreToolUse hook is asking about, and build the broker `tool.call`
+/// reply whose `content` text is the Claude hook-decision JSON.
+///
+/// The host calls (policy load, audit publish, log) live here; the pure
+/// reply shaping is delegated to [`gate_reply_body`] so the allow/deny ->
+/// JSON contract stays unit-testable without a live bus.
+fn pretooluse_gate_reply(req: &CallRequest) -> Value {
+    let tool_name = req
+        .arguments
+        .get("tool_name")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let tool_input = gate_tool_input(&req.arguments);
+
+    let decision = crate::policy::evaluate(&crate::policy::load_rules(), tool_name, &tool_input);
+
+    if let crate::policy::Decision::Deny { reason } = &decision {
+        log::info(format!(
+            "sage-mcp: PreToolUse policy denied native tool '{tool_name}' (req_id '{}'): {reason}",
+            req.req_id
+        ));
+        // Audit the native-tool denial on the same `sage.v1.audit.policy_*`
+        // family the in-process broker gate uses. Operator rule id only —
+        // never the reflected tool arguments (injection). Best-effort.
+        let _ = ipc::publish_json(
+            "sage.v1.audit.pretooluse_deny",
+            &json!({ "tool": tool_name, "rule": reason }),
+        );
+    }
+
+    gate_reply_body(&req.req_id, &decision)
+}
+
+/// Pure shaper: map a PDP [`Decision`](crate::policy::Decision) to the broker
+/// `tool.call` reply the shim relays verbatim to Claude's PreToolUse hook.
+/// No host calls — fully unit-testable.
+///
+/// Two invariants this encodes:
+///
+/// * `isError` is ALWAYS `false`. Claude treats an `isError:true` MCP result
+///   as a non-blocking error and runs the tool anyway (fail-open), so a DENY
+///   must travel in the `content` payload, not the error flag.
+/// * It can only NARROW. `Decision::Deny` -> `permissionDecision:"deny"`;
+///   `Decision::Allow` (which is also the no-rule / load-failure default)
+///   -> a no-op `{"continue":true}` that defers to Claude's existing
+///   permission flow (the allow-list + `dontAsk`), NEVER an explicit
+///   `"allow"` that could skip a prompt or broaden the surface.
+fn gate_reply_body(req_id: &str, decision: &crate::policy::Decision) -> Value {
+    let hook_output = match decision {
+        crate::policy::Decision::Deny { reason } => json!({
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "deny",
+                "permissionDecisionReason":
+                    format!("denied by Astrid policy (rule: {reason})"),
+            }
+        }),
+        crate::policy::Decision::Allow => json!({ "continue": true }),
+    };
+
+    // The hook parses the gate tool's TEXT content like command-hook stdout,
+    // so serialize the decision object to a JSON string and wrap it in the
+    // standard MCP content block. `isError:false` — see the invariants above.
+    json!({
+        "kind": "tool.call",
+        "req_id": req_id,
+        "content": mcp_content(Value::String(
+            serde_json::to_string(&hook_output)
+                .unwrap_or_else(|_| String::from("{\"continue\":true}")),
+        )),
+        "isError": false,
+    })
+}
+
+/// Extract the native tool's input object from the gate-call arguments.
+///
+/// The hook authors `"tool_input": "${tool_input}"`. Claude's `${...}`
+/// interpolator resolves the `tool_input` node of the hook payload and — as
+/// VERIFIED against the shipped `claude` executor, whose interpolator
+/// `JSON.stringify`s any resolved object before splicing it into the string —
+/// replaces the token with `JSON.stringify(tool_input)`. So `tool_input`
+/// reaches the broker as a JSON STRING, which we parse back into the object
+/// the PDP matches against (full argument-level rules). A native tool always
+/// carries a non-empty `tool_input`; an absent path would interpolate to `""`
+/// (the executor's missing-path rule), which parses to `Null`.
+///
+/// The non-string arms are defensive belt-and-suspenders for a future build
+/// that injects structurally, or another MCP client; an unparseable value
+/// degrades to `Null` -> tool-NAME-only matching, a safe narrowing (never a
+/// broadening, since the PDP default is allow):
+///
+/// * a JSON STRING -> parsed (the verified, real-world path);
+/// * a nested JSON object/array -> used directly;
+/// * absent / non-JSON -> `Null` (tool-name-only matching).
+fn gate_tool_input(arguments: &Value) -> Value {
+    match arguments.get("tool_input") {
+        Some(v @ (Value::Object(_) | Value::Array(_))) => v.clone(),
+        Some(Value::String(s)) => serde_json::from_str(s).unwrap_or(Value::Null),
+        _ => Value::Null,
+    }
+}
+
 /// Build the single-segment egress topic for `req_id`, or `None` if the
 /// id cannot form a clean single segment.
 ///
@@ -402,5 +559,145 @@ mod tests {
         assert_eq!(req.req_id, "x");
         assert_eq!(req.name, "fs.read");
         assert_eq!(req.arguments, Value::Null);
+    }
+
+    // ------------------------------------------------------------------
+    // PreToolUse native-tool gate.
+    // ------------------------------------------------------------------
+
+    /// Parse the hook-decision JSON back out of a gate reply's single text
+    /// content block, so a test can assert on the decision the hook sees.
+    fn gate_decision_json(reply: &Value) -> Value {
+        let text = reply
+            .pointer("/content/0/text")
+            .and_then(Value::as_str)
+            .expect("gate reply must carry one text content block");
+        serde_json::from_str(text).expect("gate decision content must be JSON")
+    }
+
+    #[test]
+    fn gate_deny_blocks_via_content_never_iserror() {
+        let decision = crate::policy::Decision::Deny {
+            reason: "no-ssh-write".into(),
+        };
+        let reply = gate_reply_body("req1", &decision);
+
+        // The fail-open invariant: a DENY must NOT be signalled via
+        // `isError` (that would let the tool run); it rides in `content`.
+        assert_eq!(
+            reply.pointer("/isError").and_then(Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            reply.pointer("/req_id").and_then(Value::as_str),
+            Some("req1")
+        );
+
+        let decision_json = gate_decision_json(&reply);
+        assert_eq!(
+            decision_json.pointer("/hookSpecificOutput/hookEventName"),
+            Some(&Value::String("PreToolUse".into()))
+        );
+        assert_eq!(
+            decision_json.pointer("/hookSpecificOutput/permissionDecision"),
+            Some(&Value::String("deny".into()))
+        );
+        // The reason is the operator rule id, not a reflected argument.
+        let reason = decision_json
+            .pointer("/hookSpecificOutput/permissionDecisionReason")
+            .and_then(Value::as_str)
+            .unwrap();
+        assert!(reason.contains("no-ssh-write"), "reason was {reason:?}");
+    }
+
+    #[test]
+    fn gate_allow_defers_never_broadens() {
+        let reply = gate_reply_body("req2", &crate::policy::Decision::Allow);
+        assert_eq!(
+            reply.pointer("/isError").and_then(Value::as_bool),
+            Some(false)
+        );
+
+        // Allow must be a no-op continue, NOT an explicit permissionDecision
+        // — an explicit "allow" would suppress a prompt / broaden the surface,
+        // and the gate only ever narrows.
+        let decision_json = gate_decision_json(&reply);
+        assert_eq!(decision_json, json!({ "continue": true }));
+        assert!(
+            decision_json.pointer("/hookSpecificOutput").is_none(),
+            "allow path must not assert a permissionDecision"
+        );
+    }
+
+    #[test]
+    fn gate_tool_input_accepts_nested_object() {
+        let args = json!({ "tool_name": "Bash", "tool_input": { "command": "rm -rf /" } });
+        assert_eq!(gate_tool_input(&args), json!({ "command": "rm -rf /" }));
+    }
+
+    #[test]
+    fn gate_tool_input_parses_json_string() {
+        // If `${tool_input}` substitution stringifies the object, parse it
+        // back so argument-level rules still work.
+        let args =
+            json!({ "tool_name": "Write", "tool_input": "{\"file_path\":\"home://.ssh/x\"}" });
+        assert_eq!(
+            gate_tool_input(&args),
+            json!({ "file_path": "home://.ssh/x" })
+        );
+    }
+
+    #[test]
+    fn gate_tool_input_degrades_to_null_on_unsubstituted_or_absent() {
+        // A literal un-substituted placeholder is not valid JSON -> Null
+        // (tool-name-only matching), never a parse panic.
+        let literal = json!({ "tool_name": "Bash", "tool_input": "${tool_input}" });
+        assert_eq!(gate_tool_input(&literal), Value::Null);
+        // Absent tool_input -> Null.
+        let absent = json!({ "tool_name": "Bash" });
+        assert_eq!(gate_tool_input(&absent), Value::Null);
+    }
+
+    #[test]
+    fn gate_tool_name_is_pinned() {
+        // Value anchor for the cross-crate SYNC with
+        // `sage_install::layout::PRETOOLUSE_GATE_TOOL`. No dependency edge
+        // between the crates, so the name is mirrored, not shared; the
+        // sage-install side pins the same literal in
+        // `pretooluse_gate_tool_name_is_pinned`. A rename on one side without
+        // the other silently disables the gate (fail-open), so both anchor the
+        // exact string and a deliberate edit must touch both tests.
+        assert_eq!(PRETOOLUSE_GATE_TOOL, "astrid_pretooluse_gate");
+    }
+
+    #[test]
+    fn gate_end_to_end_shapes_a_deny_from_a_string_input() {
+        // Exercise gate_tool_input -> evaluate -> gate_reply_body together
+        // (the pure spine of pretooluse_gate_reply, minus the host calls).
+        let rules = vec![crate::policy::Rule {
+            id: "no-rm-rf".into(),
+            effect: crate::policy::Effect::Deny,
+            tool: "Bash".into(),
+            when: vec![crate::policy::ArgMatcher {
+                pointer: "/command".into(),
+                op: crate::policy::MatchOp::Contains,
+                value: "rm -rf".into(),
+            }],
+        }];
+        let args = json!({ "tool_name": "Bash", "tool_input": { "command": "rm -rf /tmp" } });
+        let decision = crate::policy::evaluate(
+            &rules,
+            args.get("tool_name").and_then(Value::as_str).unwrap(),
+            &gate_tool_input(&args),
+        );
+        let reply = gate_reply_body("req3", &decision);
+        assert_eq!(
+            reply.pointer("/isError").and_then(Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            gate_decision_json(&reply).pointer("/hookSpecificOutput/permissionDecision"),
+            Some(&Value::String("deny".into()))
+        );
     }
 }

@@ -45,6 +45,28 @@ pub(crate) fn mcp_path() -> String {
     "home://.claude/.mcp.json".to_string()
 }
 
+/// Name of the MCP server sage registers for the supervised `claude`
+/// session — the `astrid mcp serve` stdio shim onto the daemon's sage-mcp
+/// broker. Claude prefixes its tools `mcp__sage__*` and references it as the
+/// `server` of the PreToolUse `mcp_tool` gate hook. Single source of truth
+/// for [`mcp_json`] and [`pretooluse_gate_handler`], so the gate's target
+/// server can never drift from the registered one.
+const MCP_SERVER_NAME: &str = "sage";
+
+/// Raw tool name of the native-tool PreToolUse policy gate the `mcp_tool`
+/// hook calls on the [`MCP_SERVER_NAME`] server. The sage-mcp broker
+/// special-cases this exact name — it evaluates the per-principal policy and
+/// returns a binding Claude hook decision instead of dispatching a capsule
+/// tool.
+///
+/// SYNC (load-bearing): must equal `broker::PRETOOLUSE_GATE_TOOL` in the
+/// sage-mcp crate. The crates share no dependency edge, so the value is
+/// mirrored, not shared; a drift silently DISABLES the gate (the broker
+/// would treat the hook's call as an unknown tool, reply `isError`, and the
+/// hook would fail OPEN — the native tool runs ungoverned). A presence test
+/// in each crate anchors the value.
+const PRETOOLUSE_GATE_TOOL: &str = "astrid_pretooluse_gate";
+
 /// KV key marking a completed install for `principal_id`.
 ///
 /// Namespaced under `sage.` so the prefix can't collide with another
@@ -363,18 +385,64 @@ fn hooks_block() -> serde_json::Value {
     let mut hooks = serde_json::Map::new();
     for event in HOOK_EVENTS {
         let topic = hook_topic(event);
-        hooks.insert(
-            (*event).to_string(),
-            serde_json::json!([
-                {
-                    "type": "command",
-                    "command": format!("astrid-emit {topic}"),
-                    "timeout": 10
-                }
-            ]),
-        );
+        let mut handlers = vec![serde_json::json!({
+            "type": "command",
+            "command": format!("astrid-emit {topic}"),
+            "timeout": 10
+        })];
+        // PreToolUse additionally carries the BINDING-direction policy gate:
+        // a synchronous `mcp_tool` handler that asks the sage-mcp broker for
+        // an allow/deny decision on the native tool about to run, and can
+        // block it. Every other event stays observe-only (`astrid-emit`). The
+        // gate is appended AFTER the observe emit so the audit plane records
+        // the attempt regardless of outcome; Claude aggregates multiple
+        // PreToolUse handlers with deny > ask > allow precedence, and the
+        // gate's allow path returns a no-op (never an explicit allow), so the
+        // pair can only ever ADD a denial. See [`pretooluse_gate_handler`].
+        if *event == "PreToolUse" {
+            handlers.push(pretooluse_gate_handler());
+        }
+        hooks.insert((*event).to_string(), serde_json::Value::Array(handlers));
     }
     serde_json::Value::Object(hooks)
+}
+
+/// The PreToolUse `mcp_tool` hook handler — sage's native-tool policy gate.
+///
+/// Calls the reserved [`PRETOOLUSE_GATE_TOOL`] on the already-connected
+/// [`MCP_SERVER_NAME`] server with the name + input of the native tool about
+/// to run. The sage-mcp broker evaluates the per-principal policy and returns
+/// a Claude hook decision as the tool's text content; a
+/// `permissionDecision:"deny"` BLOCKS the tool. This is the one
+/// decision-returning hook — every other event is observe-only.
+///
+/// `${tool_name}` / `${tool_input}` are substituted by Claude from the hook
+/// payload. VERIFIED against the shipped `claude` executor: its `${...}`
+/// interpolator `JSON.stringify`s any resolved object, so `${tool_input}`
+/// (the whole input object) arrives at the broker as a JSON STRING it parses
+/// back for full argument-level rules; a missing path interpolates to `""`.
+/// The broker still parses defensively, so any future substitution shape
+/// degrades to coarser (tool-name-only) matching, never a broadening.
+///
+/// REQUIRES Claude Code >= 2.1.118 (which introduced `type:"mcp_tool"`
+/// hooks). On an older binary the handler type is unknown and the gate simply
+/// does not fire — the sibling observe-only `astrid-emit` handler is
+/// unaffected. FAILS OPEN by platform design: a disconnected server, a tool
+/// error, or a non-JSON reply lets the tool run, so this is an advisory,
+/// best-effort layer. The fail-closed boundary for native tools stays the
+/// Astrid host sandbox + the binding `--disallowedTools` deny-list (see
+/// [`settings_json`]); the gate adds dynamic, argument-level DENY on top.
+fn pretooluse_gate_handler() -> serde_json::Value {
+    serde_json::json!({
+        "type": "mcp_tool",
+        "server": MCP_SERVER_NAME,
+        "tool": PRETOOLUSE_GATE_TOOL,
+        "input": {
+            "tool_name": "${tool_name}",
+            "tool_input": "${tool_input}"
+        },
+        "timeout": 10
+    })
 }
 
 /// `.claude/settings.local.json` body for the given principal config.
@@ -528,15 +596,16 @@ pub(crate) fn mcp_json(_cfg: &PrincipalConfig, principal_id: &str) -> serde_json
     // the daemon scopes tool execution to this identity. The operator can
     // still add their own MCP servers to this file in repl mode; sage only
     // guarantees the Astrid server is present.
-    serde_json::json!({
-        "mcpServers": {
-            "sage": {
-                "command": "astrid",
-                "args": ["mcp", "serve", "--principal", principal_id],
-                "env": {}
-            }
-        }
-    })
+    let mut servers = serde_json::Map::new();
+    servers.insert(
+        MCP_SERVER_NAME.to_string(),
+        serde_json::json!({
+            "command": "astrid",
+            "args": ["mcp", "serve", "--principal", principal_id],
+            "env": {}
+        }),
+    );
+    serde_json::json!({ "mcpServers": serde_json::Value::Object(servers) })
 }
 
 #[cfg(test)]
@@ -781,7 +850,17 @@ mod tests {
                 .get(*event)
                 .and_then(|x| x.as_array())
                 .unwrap_or_else(|| panic!("hooks.{event} must be a JSON array"));
-            assert_eq!(entries.len(), 1, "hooks.{event} must have one entry");
+
+            // Every event carries the observe-only `astrid-emit` handler
+            // FIRST. PreToolUse additionally carries the policy gate SECOND;
+            // no other event has a second handler.
+            let expected_len = if *event == "PreToolUse" { 2 } else { 1 };
+            assert_eq!(
+                entries.len(),
+                expected_len,
+                "hooks.{event} must have {expected_len} entr(y/ies)"
+            );
+
             let command = entries[0]
                 .pointer("/command")
                 .and_then(|x| x.as_str())
@@ -805,7 +884,42 @@ mod tests {
                 Some(10),
                 "hooks.{event}: timeout must be 10s"
             );
+
+            if *event == "PreToolUse" {
+                assert_pretooluse_gate(&entries[1]);
+            }
         }
+    }
+
+    /// The PreToolUse `mcp_tool` gate handler shape: it targets the reserved
+    /// gate tool on the registered sage server and passes the native tool's
+    /// name + input through `${...}` substitution.
+    fn assert_pretooluse_gate(entry: &serde_json::Value) {
+        assert_eq!(
+            entry.pointer("/type").and_then(|x| x.as_str()),
+            Some("mcp_tool"),
+            "PreToolUse gate handler type must be mcp_tool"
+        );
+        assert_eq!(
+            entry.pointer("/server").and_then(|x| x.as_str()),
+            Some(MCP_SERVER_NAME),
+            "gate must target the registered sage MCP server"
+        );
+        assert_eq!(
+            entry.pointer("/tool").and_then(|x| x.as_str()),
+            Some(PRETOOLUSE_GATE_TOOL),
+            "gate must call the reserved broker gate tool"
+        );
+        assert_eq!(
+            entry.pointer("/input/tool_name").and_then(|x| x.as_str()),
+            Some("${tool_name}"),
+            "gate must forward the native tool name"
+        );
+        assert_eq!(
+            entry.pointer("/input/tool_input").and_then(|x| x.as_str()),
+            Some("${tool_input}"),
+            "gate must forward the native tool input"
+        );
     }
 
     // ----- The four mode-pair tests (full matrix). -----
@@ -908,12 +1022,13 @@ mod tests {
                         .and_then(|x| x.as_array())
                         .unwrap_or_else(|| panic!("hooks.{event} must be a JSON array"));
                     for entry in entries {
-                        let command = entry
-                            .pointer("/command")
-                            .and_then(|x| x.as_str())
-                            .unwrap_or_else(|| {
-                                panic!("hooks.{event}: command must be a string")
-                            });
+                        // Non-command handlers (the PreToolUse `mcp_tool`
+                        // gate) carry no `command` field — only the
+                        // `astrid-emit` command handlers are in scope here.
+                        let Some(command) = entry.pointer("/command").and_then(|x| x.as_str())
+                        else {
+                            continue;
+                        };
                         assert_ne!(
                             command, legacy_command,
                             "({im:?}, {am:?}) hooks.{event}: \
@@ -1023,6 +1138,62 @@ mod tests {
                 "repl ({am:?}): server must be `astrid mcp serve --principal <id>`"
             );
         }
+    }
+
+    // ------------------------------------------------------------------
+    // PreToolUse native-tool gate — wiring + cross-function consistency.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn pretooluse_is_the_only_event_with_a_second_handler() {
+        let v = settings_json(&cfg(InteractionMode::Headless, AuthMode::ApiKey));
+        let hooks = v.pointer("/hooks").and_then(|x| x.as_object()).unwrap();
+        for event in HOOK_EVENTS {
+            let len = hooks.get(*event).and_then(|x| x.as_array()).unwrap().len();
+            if *event == "PreToolUse" {
+                assert_eq!(len, 2, "PreToolUse must carry the observe emit + the gate");
+            } else {
+                assert_eq!(len, 1, "hooks.{event} must stay observe-only (one handler)");
+            }
+        }
+    }
+
+    #[test]
+    fn gate_targets_the_registered_mcp_server() {
+        // Cross-function consistency: the gate hook's `server` must be the
+        // SAME server `mcp_json` actually registers, or Claude calls the gate
+        // on a server that isn't connected and every gate decision fails open.
+        // Both sides resolve from `MCP_SERVER_NAME`, so this pins that the
+        // const is what each emits.
+        let settings = settings_json(&cfg(InteractionMode::Headless, AuthMode::ApiKey));
+        let gate = &settings
+            .pointer("/hooks/PreToolUse")
+            .and_then(|x| x.as_array())
+            .unwrap()[1];
+        let gate_server = gate.pointer("/server").and_then(|x| x.as_str()).unwrap();
+
+        let mcp = mcp_json(&cfg(InteractionMode::Headless, AuthMode::ApiKey), "alice");
+        let registered = mcp
+            .pointer("/mcpServers")
+            .and_then(|x| x.as_object())
+            .unwrap();
+        assert!(
+            registered.contains_key(gate_server),
+            "gate server {gate_server:?} must be a registered MCP server (have {:?})",
+            registered.keys().collect::<Vec<_>>()
+        );
+        assert_eq!(gate_server, MCP_SERVER_NAME);
+    }
+
+    #[test]
+    fn pretooluse_gate_tool_name_is_pinned() {
+        // Value anchor for the cross-crate SYNC with
+        // `sage_mcp::broker::PRETOOLUSE_GATE_TOOL`. No dependency edge between
+        // the crates, so the name is mirrored, not shared; the sage-mcp side
+        // pins the same literal in `gate_tool_name_is_pinned`. A rename on one
+        // side without the other silently disables the gate, so both anchor
+        // the exact string and a deliberate edit must touch both tests.
+        assert_eq!(PRETOOLUSE_GATE_TOOL, "astrid_pretooluse_gate");
     }
 
     // ------------------------------------------------------------------

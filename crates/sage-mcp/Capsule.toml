@@ -90,11 +90,13 @@ policy_rules = { type = "string", default = "", request = "Per-principal policy 
 
 [publish]
 "sage.v1.tools.list" = "opaque"
-# Policy-gate audits emitted by `crate::policy` at the broker chokepoint:
-# `sage.v1.audit.policy_deny` (a tool call refused by a rule) and
+# Policy-gate audits emitted at the broker. The in-process `mcp__sage__*`
+# gate emits `sage.v1.audit.policy_deny` (a tool call refused by a rule) and
 # `sage.v1.audit.policy_load_failed` (rules unset/unparseable/over-cap →
-# policy degraded to the exec-time capability PEP). Single `*` covers the
-# 4-segment `sage.v1.audit.<name>` topics.
+# policy degraded to the exec-time capability PEP); the native-tool
+# PreToolUse gate emits `sage.v1.audit.pretooluse_deny` (a native tool call
+# the hook blocked by policy). Single `*` covers the 4-segment
+# `sage.v1.audit.<name>` topics; all share the `{ tool, rule }` shape.
 "sage.v1.audit.*" = "broker/policy-audit"
 # Broker reply channel. Both broker handlers reply on
 # `astrid.v1.response.<req_id>`; the `req_id` is a single clean segment
