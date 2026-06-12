@@ -87,6 +87,12 @@ policy_rules = { type = "string", default = "", request = "Per-principal policy 
 # subscribe surface must enumerate both arities.
 "tool.v1.execute.*.result" = "@unicity-astrid/wit/types/tool-call-result"
 "tool.v1.execute.*.*.result" = "@unicity-astrid/wit/types/tool-call-result"
+# Native-tool verdict responder (the second PDP plane). sage-mcp joins the
+# hook-bridge `ToolCallBefore` merge: a `before_tool_call` fan-out — from the
+# kernel bridge (a bus-mediated tool) or an external `astrid-gate` PreToolUse
+# hook (a native tool) — carrying a correlation id gets a `{ skip }` verdict.
+# Exact (segment-arity-fixed) topic. See `crate::hook_gate`.
+"hook.v1.event.before_tool_call" = { wit = "opaque", handler = "handle_before_tool_call" }
 
 [publish]
 "sage.v1.tools.list" = "opaque"
@@ -98,6 +104,12 @@ policy_rules = { type = "string", default = "", request = "Per-principal policy 
 # the hook blocked by policy). Single `*` covers the 4-segment
 # `sage.v1.audit.<name>` topics; all share the `{ tool, rule }` shape.
 "sage.v1.audit.*" = "broker/policy-audit"
+# `before_tool_call` verdict replies. `handle_before_tool_call` replies on
+# `hook.v1.response.before_tool_call.<correlation_id>`; the id is a single
+# clean segment (charset-gated in `hook_gate::reply_topic`), so the egress
+# topic is exactly 5 segments — one trailing `*` (subtree) covers every
+# routable reply and a multi-segment id is rejected before the wire.
+"hook.v1.response.before_tool_call.*" = "opaque"
 # Broker reply channel. Both broker handlers reply on
 # `astrid.v1.response.<req_id>`; the `req_id` is a single clean segment
 # (UUID-ish, validated in `broker::reply_topic`) so the egress topic is

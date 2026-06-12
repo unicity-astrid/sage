@@ -437,7 +437,11 @@ fn gate_reply_body(req_id: &str, decision: &crate::policy::Decision) -> Value {
 /// * a JSON STRING -> parsed (the verified, real-world path);
 /// * a nested JSON object/array -> used directly;
 /// * absent / non-JSON -> `Null` (tool-name-only matching).
-fn gate_tool_input(arguments: &Value) -> Value {
+///
+/// `pub(crate)` so the `before_tool_call` hook responder ([`crate::hook_gate`])
+/// reuses the exact same defensive extraction — one definition, no drift
+/// between the two native-tool gate transports.
+pub(crate) fn gate_tool_input(arguments: &Value) -> Value {
     match arguments.get("tool_input") {
         Some(v @ (Value::Object(_) | Value::Array(_))) => v.clone(),
         Some(Value::String(s)) => serde_json::from_str(s).unwrap_or(Value::Null),

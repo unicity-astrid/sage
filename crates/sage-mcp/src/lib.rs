@@ -81,6 +81,7 @@ mod broker;
 mod cache;
 mod discovery;
 mod execute;
+mod hook_gate;
 mod policy;
 
 use astrid_sdk::prelude::*;
@@ -170,5 +171,20 @@ impl SageMcp {
     #[astrid::interceptor("handle_mcp_approval")]
     pub fn handle_mcp_approval(&self, payload: serde_json::Value) -> Result<(), SysError> {
         approval::handle_mcp_approval(payload)
+    }
+
+    /// `hook.v1.event.before_tool_call` — native-tool verdict responder.
+    ///
+    /// sage-mcp participates in the hook-bridge `ToolCallBefore` merge: it
+    /// evaluates the native tool named in the fan-out payload against the
+    /// invoking principal's policy and replies `{ skip }` on the
+    /// correlation-keyed reply topic. `skip:true` blocks the call (deny-wins
+    /// merge). This is the SECOND plane of the same PDP the broker enforces
+    /// in-process for `mcp__sage__*` tools — one operator rule set, two
+    /// transports. A fan-out with no `correlation_id` is observe-only and
+    /// gets no reply. See [`hook_gate`].
+    #[astrid::interceptor("handle_before_tool_call")]
+    pub fn handle_before_tool_call(&self, payload: serde_json::Value) -> Result<(), SysError> {
+        hook_gate::handle_before_tool_call(payload)
     }
 }
