@@ -48,7 +48,7 @@ the same `astrid mcp serve` surface.
 **Dev / today — load it raw, no install:**
 
 ```sh
-claude --plugin-dir /path/to/capsules/sage/astrid-plugin
+claude --plugin-dir /path/to/sage/astrid-plugin
 ```
 
 Set the principal once when prompted (or leave blank for the active principal).
@@ -57,8 +57,8 @@ The daemon starts on first launch; `mcp__astrid__*` tools appear.
 **Distributed — your own marketplace (no Anthropic gatekeeping):**
 
 ```sh
-# the marketplace manifest lives at the bundle root (capsules/sage)
-claude plugin marketplace add unicity-astrid/astrid     # or a local path
+# the marketplace manifest lives at this repo's root
+claude plugin marketplace add unicity-astrid/sage       # or a local path
 claude plugin install astrid@astrid
 ```
 
