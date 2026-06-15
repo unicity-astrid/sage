@@ -50,6 +50,11 @@
 //! * `astrid.v1.request.mcp.approval.respond` ->
 //!   [`SageMcp::handle_mcp_approval`]: the shim's elicited approval choice,
 //!   mapped onto `astrid.v1.approval.response.<id>` to unblock the tool.
+//! * `astrid.v1.request.mcp.ingress.respond` ->
+//!   [`SageMcp::handle_mcp_ingress_respond`]: the shim's elicited ingress
+//!   consent (`{ req_id, accept }`); on accept records trust under
+//!   `mcp.ingress.trust.<caller source_id>` so a re-sent `tool.call` passes
+//!   the confused-deputy gate.
 //!
 //! ### Elicitation/approval bridge (`astrid.v1.approval.*`)
 //!
@@ -140,9 +145,11 @@ impl SageMcp {
     /// hangs.
     ///
     /// State-mutating, so it is confused-deputy gated: the inbound
-    /// message's kernel-set `source_id` must be in the operator-pinned
-    /// `trusted_ingress_ids` allow-set before any dispatch. See
-    /// [`broker`].
+    /// message's kernel-set `source_id` must be a trusted ingress before any
+    /// dispatch. An untrusted source_id triggers an
+    /// `ingress_approval_required` reply that the shim turns into a user
+    /// consent prompt (see [`Self::handle_mcp_ingress_respond`]) rather than a
+    /// hard deny. See [`broker`].
     #[astrid::interceptor("handle_mcp_call")]
     pub fn handle_mcp_call(&self, payload: serde_json::Value) -> Result<(), SysError> {
         broker::handle_mcp_call(payload)
@@ -171,6 +178,25 @@ impl SageMcp {
     #[astrid::interceptor("handle_mcp_approval")]
     pub fn handle_mcp_approval(&self, payload: serde_json::Value) -> Result<(), SysError> {
         approval::handle_mcp_approval(payload)
+    }
+
+    /// `astrid.v1.request.mcp.ingress.respond` — ingress consent bridge.
+    ///
+    /// When a `tool.call` arrives from a `source_id` that has not yet been
+    /// trusted, [`Self::handle_mcp_call`] replies an
+    /// `ingress_approval_required` signal; the shim elicits the user's consent
+    /// and forwards the decision here as `{ req_id, accept }`. On `accept` this
+    /// records trust under `mcp.ingress.trust.<source_id>` so a re-sent call
+    /// passes the confused-deputy gate, then acks the shim on
+    /// `astrid.v1.response.<req_id>`.
+    ///
+    /// SECURITY-CRITICAL: trust is recorded against the kernel-stamped
+    /// `runtime::caller().source_id` of THIS message (the cli proxy), NEVER a
+    /// source_id from the payload body — the body carries none. See
+    /// [`approval::handle_mcp_ingress_respond`].
+    #[astrid::interceptor("handle_mcp_ingress_respond")]
+    pub fn handle_mcp_ingress_respond(&self, payload: serde_json::Value) -> Result<(), SysError> {
+        approval::handle_mcp_ingress_respond(payload)
     }
 
     /// `hook.v1.event.before_tool_call` — native-tool verdict responder.

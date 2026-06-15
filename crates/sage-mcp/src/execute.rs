@@ -51,14 +51,9 @@ const EXECUTE_SLICE_MS: u64 = 250;
 /// `tool.v1.execute.*` topic.
 const MAX_TOOL_NAME_LEN: usize = 128;
 
-/// Manifest `[env]` key holding the comma-separated allow-set of
-/// trusted ingress capsule UUIDs for state-mutating broker calls.
-///
-/// The operator pins which ingress capsule(s) — today the cli proxy;
-/// tomorrow a Telegram / Discord bridge — are permitted to drive
-/// `astrid.v1.request.mcp.tool.call`. Read back at call time via
-/// [`astrid_sdk::env::var_opt`]. See [`is_trusted_ingress`].
-const TRUSTED_INGRESS_ENV_KEY: &str = "trusted_ingress_ids";
+/// KV key prefix recording an ingress `source_id` the user has consented
+/// to trust for state-mutating broker calls. See [`is_ingress_trusted`].
+const INGRESS_TRUST_KEY_PREFIX: &str = "mcp.ingress.trust.";
 
 /// Outcome of a broker tool dispatch that watches for a mid-call approval.
 ///
@@ -246,6 +241,21 @@ pub(crate) fn match_result(payload: &str, call_id: &str) -> Option<(Value, bool)
     Some((content, is_error))
 }
 
+/// KV key recording consent to trust an ingress `source_id`. Split out so
+/// the prefix is applied in exactly one place and both the read
+/// ([`is_ingress_trusted`]) and the write
+/// ([`crate::approval::handle_mcp_ingress_respond`]) agree on the key shape.
+///
+/// Returns `None` for an empty `source_id` — an unattributed caller must
+/// never resolve to a routable trust key (which, with an empty suffix,
+/// would collapse to the bare prefix and risk a spurious match / write).
+pub(crate) fn ingress_trust_key(source_id: &str) -> Option<String> {
+    if source_id.is_empty() {
+        return None;
+    }
+    Some(format!("{INGRESS_TRUST_KEY_PREFIX}{source_id}"))
+}
+
 /// Confused-deputy guard for state-mutating broker calls.
 ///
 /// `source_id` is the kernel-set UUID of the capsule that originated the
@@ -253,12 +263,18 @@ pub(crate) fn match_result(payload: &str, call_id: &str) -> Option<(Value, bool)
 /// `CallerContext::source_id`). It is NOT guest-settable — the kernel
 /// stamps it from the publishing capsule's invocation context, so a
 /// malicious guest cannot forge it the way it could forge a body field.
-/// We require it to be a member of the operator-pinned allow-set read
-/// from the `trusted_ingress_ids` manifest `[env]` key (comma-separated
-/// UUIDs; the cli proxy today, extensible to future Telegram / Discord
-/// bridges). Whitespace around entries is trimmed; empty entries are
-/// ignored. An unset / empty allow-set fails CLOSED — no ingress is
-/// trusted until the operator names one.
+/// An ingress is trusted iff the per-(principal, source_id) KV key
+/// `mcp.ingress.trust.<source_id>` exists — written ONLY by
+/// [`crate::approval::handle_mcp_ingress_respond`] after the user
+/// interactively consents via the shim's elicit prompt. There is no
+/// operator-maintained allow-list and nothing a capsule computes; trust is
+/// recorded purely from a human accept, keyed on the kernel-stamped
+/// originating identity.
+///
+/// KV is scoped per-principal (and per-capsule) by the kernel, so this is
+/// naturally per-(principal, source_id) — consent granted under one
+/// principal does not leak to another. Fails CLOSED: an empty source_id, a
+/// missing key, or a host read error all return `false`.
 ///
 /// ## Why `principal.verified()` is insufficient here
 ///
@@ -277,33 +293,13 @@ pub(crate) fn match_result(payload: &str, call_id: &str) -> Option<(Value, bool)
 /// `source_id` (the originating capsule's identity) answers. We keep the
 /// kernel-resolved principal for downstream capability checks but gate
 /// admission on `source_id`, not trust marker.
-pub(crate) fn is_trusted_ingress(source_id: &str) -> bool {
-    let Ok(Some(raw)) = env::var_opt(TRUSTED_INGRESS_ENV_KEY) else {
-        // Unset or host error: fail closed — no ingress is trusted.
+pub(crate) fn is_ingress_trusted(source_id: &str) -> bool {
+    let Some(key) = ingress_trust_key(source_id) else {
         return false;
     };
-    ingress_allowed(&raw, source_id)
-}
-
-/// Pure allow-set membership check, split out so the comma-list parsing
-/// is unit-testable without the host `env::var_opt` call.
-///
-/// Splits on `,`, trims each entry, drops empties, and tests exact
-/// membership. An allow-set that is empty (or only whitespace / commas)
-/// admits nothing — the fail-closed property is preserved here as well
-/// as in [`is_trusted_ingress`]'s unset branch.
-fn ingress_allowed(raw: &str, source_id: &str) -> bool {
-    // An empty source_id (e.g. an empty caller context) must never match
-    // an empty / blank allow-set entry — blank entries are filtered, and
-    // we additionally refuse to treat an empty source_id as a real
-    // identity.
-    if source_id.is_empty() {
-        return false;
-    }
-    raw.split(',')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .any(|allowed| allowed == source_id)
+    // Present key (any value) → trusted; missing → not; host error → fail
+    // closed.
+    matches!(kv::get_bytes_opt(&key), Ok(Some(_)))
 }
 
 /// Tool-name charset gate. Same rule as the discovery validator —
@@ -347,48 +343,27 @@ mod tests {
     }
 
     #[test]
-    fn ingress_allowed_matches_single_uuid() {
-        let proxy = "0191f3a2-b4c7-4d8e-9f01-234567890abc";
-        assert!(ingress_allowed(proxy, proxy));
+    fn ingress_trust_key_applies_prefix() {
+        let id = "0191f3a2-b4c7-4d8e-9f01-234567890abc";
+        assert_eq!(
+            ingress_trust_key(id).as_deref(),
+            Some("mcp.ingress.trust.0191f3a2-b4c7-4d8e-9f01-234567890abc")
+        );
     }
 
     #[test]
-    fn ingress_allowed_matches_within_list_and_trims() {
-        let raw = " aaaa , 0191f3a2-b4c7-4d8e-9f01-234567890abc ,bbbb ";
-        assert!(ingress_allowed(raw, "0191f3a2-b4c7-4d8e-9f01-234567890abc"));
-        assert!(ingress_allowed(raw, "aaaa"));
-        assert!(ingress_allowed(raw, "bbbb"));
+    fn ingress_trust_key_rejects_empty_source() {
+        // An unattributed (empty) source_id must never resolve to a routable
+        // trust key — otherwise the read would collapse to the bare prefix
+        // and a write under an empty caller would grant blanket trust.
+        assert_eq!(ingress_trust_key(""), None);
     }
 
     #[test]
-    fn ingress_allowed_rejects_non_member() {
-        let raw = "aaaa,bbbb";
-        assert!(!ingress_allowed(raw, "cccc"));
-    }
-
-    #[test]
-    fn ingress_allowed_empty_set_admits_nothing() {
-        assert!(!ingress_allowed("", "aaaa"));
-        assert!(!ingress_allowed("   ", "aaaa"));
-        assert!(!ingress_allowed(",, ,", "aaaa"));
-    }
-
-    #[test]
-    fn ingress_allowed_empty_source_never_matches() {
-        // A blank caller source_id must not slip through, even against a
-        // (filtered-away) blank entry.
-        assert!(!ingress_allowed("", ""));
-        assert!(!ingress_allowed("aaaa,,bbbb", ""));
-    }
-
-    #[test]
-    fn ingress_allowed_requires_exact_match() {
-        let raw = "0191f3a2-b4c7-4d8e-9f01-234567890abc";
-        // No prefix / substring matches.
-        assert!(!ingress_allowed(raw, "0191f3a2"));
-        assert!(!ingress_allowed(
-            raw,
-            "0191f3a2-b4c7-4d8e-9f01-234567890abcd"
-        ));
+    fn is_ingress_trusted_empty_source_fails_closed() {
+        // No host KV call is reached for an empty source_id — it short-circuits
+        // to `false` via `ingress_trust_key` returning `None`. (The non-empty
+        // path needs a live host and is exercised by integration, not here.)
+        assert!(!is_ingress_trusted(""));
     }
 }

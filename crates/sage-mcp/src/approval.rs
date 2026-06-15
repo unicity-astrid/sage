@@ -267,9 +267,9 @@ struct ApprovalRespond {
 ///
 /// State-mutating (it can grant a capability), so it is confused-deputy
 /// gated identically to [`crate::broker::handle_mcp_call`]: the inbound
-/// message's kernel-set `source_id` must be in the operator-pinned
-/// `trusted_ingress_ids` allow-set before any decision is published. A
-/// rejected or malformed request publishes a `deny` so an outstanding tool
+/// message's kernel-set `source_id` must already be a trusted ingress
+/// ([`crate::execute::is_ingress_trusted`]) before any decision is published.
+/// A rejected or malformed request publishes a `deny` so an outstanding tool
 /// can never hang waiting on a decision that will not come — fail secure —
 /// and (when routable) delivers the resulting `isError` reply to the shim.
 pub(crate) fn handle_mcp_approval(payload: Value) -> Result<(), SysError> {
@@ -317,7 +317,7 @@ pub(crate) fn handle_mcp_approval(payload: Value) -> Result<(), SysError> {
             return Ok(());
         }
     };
-    if !crate::execute::is_trusted_ingress(&source_id) {
+    if !crate::execute::is_ingress_trusted(&source_id) {
         log::warn(format!(
             "sage-mcp: broker approval.respond: untrusted ingress source_id '{source_id}', \
              denying request_id '{}'",
@@ -335,6 +335,141 @@ pub(crate) fn handle_mcp_approval(payload: Value) -> Result<(), SysError> {
     let decision = normalize_decision(&req.decision);
     resolve_with_decision(&req, &response_topic, decision, req.reason.as_deref());
     Ok(())
+}
+
+/// Inbound `astrid.v1.request.mcp.ingress.respond` payload — the user's
+/// consent decision for an untrusted ingress, collected by the shim's
+/// elicit prompt.
+///
+/// `req_id` is the proxy correlation token (the ack lands on
+/// `astrid.v1.response.<req_id>`); `accept` is the user's decision. There is
+/// DELIBERATELY no `source_id` field — the ingress to trust is the
+/// kernel-stamped `runtime::caller().source_id` of whoever sent THIS message
+/// (the cli proxy), never a value the body could forge. Any other fields are
+/// ignored.
+#[derive(Debug, Deserialize)]
+struct IngressRespond {
+    req_id: String,
+    accept: bool,
+}
+
+/// Handle `astrid.v1.request.mcp.ingress.respond`.
+///
+/// The shim elicited the user's consent for an untrusted ingress (in response
+/// to an `ingress_approval_required` reply a prior
+/// [`crate::broker::handle_mcp_call`] produced) and forwards the decision
+/// here as `{ req_id, accept }`. On `accept:true` we record trust for the
+/// ingress under `mcp.ingress.trust.<source_id>` so a re-sent `tool.call`
+/// passes the confused-deputy gate; on `accept:false` we record nothing.
+/// Either way we ack on `astrid.v1.response.<req_id>` so the shim does not
+/// hang.
+///
+/// **SECURITY-CRITICAL**: the `source_id` trust is recorded against is the
+/// kernel-stamped `runtime::caller().source_id` of THIS message — the
+/// identity of whoever actually forwarded the `ingress.respond` (the cli
+/// proxy). It is NEVER taken from the payload body. A capsule cannot smuggle
+/// a trust grant for some OTHER ingress by putting a foreign source_id in the
+/// body, because the body carries none and we read only the kernel-stamped
+/// caller. An empty / unattributed caller is refused
+/// ([`crate::execute::ingress_trust_key`] returns `None`).
+pub(crate) fn handle_mcp_ingress_respond(payload: Value) -> Result<(), SysError> {
+    let req: IngressRespond = match serde_json::from_value(payload) {
+        Ok(v) => v,
+        Err(e) => {
+            // No recoverable req_id — there is no channel to ack on. Log
+            // and drop; the shim times out its own request.
+            log::warn(format!(
+                "sage-mcp: broker ingress.respond: malformed payload: {e}"
+            ));
+            return Ok(());
+        }
+    };
+
+    let reply_topic = crate::broker::reply_topic(&req.req_id);
+
+    // The kernel-stamped caller is the ONLY source of the ingress identity.
+    let source_id = match runtime::caller() {
+        Ok(ctx) => ctx.source_id,
+        Err(e) => {
+            log::warn(format!(
+                "sage-mcp: broker ingress.respond: no caller context, recording no trust: {e}"
+            ));
+            if let Some(reply) = &reply_topic {
+                ingress_ack(reply, &req.req_id, false);
+            }
+            return Ok(());
+        }
+    };
+
+    if req.accept {
+        match crate::execute::ingress_trust_key(&source_id) {
+            Some(key) => {
+                if let Err(e) = kv::set_bytes(&key, b"1") {
+                    log::warn(format!(
+                        "sage-mcp: broker ingress.respond: failed to record trust for \
+                         source_id '{source_id}': {e}"
+                    ));
+                    // Could not persist — ack as not-granted so the shim does
+                    // not falsely believe trust was recorded.
+                    if let Some(reply) = &reply_topic {
+                        ingress_ack(reply, &req.req_id, false);
+                    }
+                    return Ok(());
+                }
+                log::info(format!(
+                    "sage-mcp: broker ingress.respond: recorded trust for ingress source_id \
+                     '{source_id}'"
+                ));
+                // Best-effort audit on the same `sage.v1.audit.*` family the
+                // policy gate uses. source_id is kernel-stamped, not a
+                // reflected argument.
+                let _ = ipc::publish_json(
+                    "sage.v1.audit.ingress_trusted",
+                    &json!({ "source_id": source_id }),
+                );
+                if let Some(reply) = &reply_topic {
+                    ingress_ack(reply, &req.req_id, true);
+                }
+            }
+            None => {
+                // Empty / unattributed caller — refuse to record a routable
+                // trust key. Ack as not-granted.
+                log::warn(
+                    "sage-mcp: broker ingress.respond: empty caller source_id; no trust recorded",
+                );
+                if let Some(reply) = &reply_topic {
+                    ingress_ack(reply, &req.req_id, false);
+                }
+            }
+        }
+    } else {
+        log::info(format!(
+            "sage-mcp: broker ingress.respond: user declined trust for ingress source_id \
+             '{source_id}'"
+        ));
+        if let Some(reply) = &reply_topic {
+            ingress_ack(reply, &req.req_id, false);
+        }
+    }
+    Ok(())
+}
+
+/// Ack an `ingress.respond` to the shim on `astrid.v1.response.<req_id>`.
+///
+/// `granted` reports whether trust was actually persisted, so the shim only
+/// re-sends the parked `tool.call` when the gate will now pass. Best-effort:
+/// a publish failure is logged, not retried (the shim times out otherwise).
+fn ingress_ack(reply_topic: &str, req_id: &str, granted: bool) {
+    let reply = json!({
+        "kind": "ingress.respond",
+        "req_id": req_id,
+        "granted": granted,
+    });
+    if let Err(e) = ipc::publish_json(reply_topic, &reply) {
+        log::warn(format!(
+            "sage-mcp: broker ingress.respond: failed to ack {reply_topic}: {e}"
+        ));
+    }
 }
 
 /// Publish `decision` on the per-request response topic to unblock the host,
@@ -688,6 +823,41 @@ mod tests {
             }))
             .is_err()
         );
+    }
+
+    #[test]
+    fn ingress_respond_parses_minimum_shape() {
+        let v = json!({ "req_id": "r1", "accept": true });
+        let parsed: IngressRespond = serde_json::from_value(v).unwrap();
+        assert_eq!(parsed.req_id, "r1");
+        assert!(parsed.accept);
+    }
+
+    #[test]
+    fn ingress_respond_requires_accept_and_req_id() {
+        // `req_id` is the only ack channel; `accept` is the decision. Both
+        // are mandatory — a payload missing either is rejected rather than
+        // silently defaulting (a defaulted `accept` could mean a silent
+        // grant or a silent deny, both wrong).
+        assert!(serde_json::from_value::<IngressRespond>(json!({ "accept": true })).is_err());
+        assert!(serde_json::from_value::<IngressRespond>(json!({ "req_id": "r1" })).is_err());
+    }
+
+    #[test]
+    fn ingress_respond_ignores_body_source_id() {
+        // SECURITY: a `source_id` in the body must be inert — the trust write
+        // keys on the kernel-stamped caller, never this field. The struct does
+        // not deserialize it, so a hostile body cannot smuggle a foreign
+        // ingress identity through the wire shape.
+        let v = json!({
+            "req_id": "r1",
+            "accept": true,
+            "source_id": "attacker-controlled-uuid",
+        });
+        let parsed: IngressRespond = serde_json::from_value(v).unwrap();
+        assert_eq!(parsed.req_id, "r1");
+        assert!(parsed.accept);
+        // No field on the struct carries the body source_id — it is dropped.
     }
 
     #[test]
