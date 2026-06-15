@@ -45,10 +45,7 @@ impl SageCompletion {
     /// for legacy interceptor-result callers, but the explicit
     /// `ipc::publish_json` below is what registry post-#752 consumes.
     #[astrid::interceptor("llm_describe")]
-    pub fn llm_describe(
-        &self,
-        _payload: serde_json::Value,
-    ) -> Result<serde_json::Value, SysError> {
+    pub fn llm_describe(&self, _payload: serde_json::Value) -> Result<serde_json::Value, SysError> {
         let context_window = env::var("context_window")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())

@@ -103,10 +103,7 @@ pub(crate) enum AssistantBlock {
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum Decoded {
     /// `{type:"system",subtype:"init",session_id,model,...}`.
-    SystemInit {
-        session_id: String,
-        model: String,
-    },
+    SystemInit { session_id: String, model: String },
     /// `{type:"assistant",message:{content:[...]}}`. Each call carries
     /// the full content array as separate typed blocks (text only).
     Assistant { content_blocks: Vec<AssistantBlock> },
@@ -204,8 +201,8 @@ impl LineDecoder {
 
 /// Decode one already-line-bounded JSON string.
 fn decode_line(line: &str) -> Result<Decoded, CodecError> {
-    let value: Value = serde_json::from_str(line)
-        .map_err(|e| CodecError::Malformed(e.to_string()))?;
+    let value: Value =
+        serde_json::from_str(line).map_err(|e| CodecError::Malformed(e.to_string()))?;
 
     let ty = value
         .get("type")
@@ -280,13 +277,17 @@ fn decode_user(value: &Value) -> Decoded {
         .get("message")
         .and_then(|m| m.get("content"))
         .and_then(Value::as_array)
-        .and_then(|arr| arr.iter().find_map(|b| {
-            if b.get("type").and_then(Value::as_str) == Some("tool_result") {
-                b.get("tool_use_id").and_then(Value::as_str).map(String::from)
-            } else {
-                None
-            }
-        }));
+        .and_then(|arr| {
+            arr.iter().find_map(|b| {
+                if b.get("type").and_then(Value::as_str) == Some("tool_result") {
+                    b.get("tool_use_id")
+                        .and_then(Value::as_str)
+                        .map(String::from)
+                } else {
+                    None
+                }
+            })
+        });
 
     match tool_use_id {
         Some(id) => Decoded::UserToolResultEcho { tool_use_id: id },
@@ -403,7 +404,10 @@ mod tests {
         let bytes = payload.as_bytes();
         // Find the euro's first byte (0xE2) and split between byte 1
         // and byte 2 of its 3-byte sequence.
-        let euro_start = bytes.iter().position(|b| *b == 0xE2).expect("euro byte missing");
+        let euro_start = bytes
+            .iter()
+            .position(|b| *b == 0xE2)
+            .expect("euro byte missing");
         let split = euro_start + 1;
 
         let r1: Vec<_> = dec.feed(&bytes[..split]).collect();
@@ -415,7 +419,10 @@ mod tests {
             Ok(Decoded::Assistant { content_blocks }) => {
                 let AssistantBlock::Text { text } = &content_blocks[0];
                 assert_eq!(text, "price: \u{20ac}5");
-                assert!(!text.contains('\u{FFFD}'), "boundary split corrupted into U+FFFD");
+                assert!(
+                    !text.contains('\u{FFFD}'),
+                    "boundary split corrupted into U+FFFD"
+                );
             }
             other => panic!("expected Assistant, got {other:?}"),
         }
@@ -462,7 +469,8 @@ mod tests {
     #[test]
     fn decode_system_init() {
         let mut dec = LineDecoder::new();
-        let line = r#"{"type":"system","subtype":"init","session_id":"sid","model":"claude-sonnet-4-6"}"#;
+        let line =
+            r#"{"type":"system","subtype":"init","session_id":"sid","model":"claude-sonnet-4-6"}"#;
         let r: Vec<_> = dec.feed(format!("{line}\n").as_bytes()).collect();
         match &r[0] {
             Ok(Decoded::SystemInit { session_id, model }) => {
@@ -528,7 +536,8 @@ mod tests {
     #[test]
     fn decode_user_without_tool_result_is_unknown() {
         let mut dec = LineDecoder::new();
-        let line = r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"hi"}]}}"#;
+        let line =
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"hi"}]}}"#;
         let r: Vec<_> = dec.feed(format!("{line}\n").as_bytes()).collect();
         assert!(matches!(r[0], Ok(Decoded::Unknown(_))));
     }

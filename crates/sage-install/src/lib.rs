@@ -517,7 +517,11 @@ fn reconcile_artifacts(
     cfg: &PrincipalConfig,
     home_path: &str,
 ) -> Result<(), SysError> {
-    publish_status(sanitized_id, "reconcile", "rewriting stale .claude/ artifacts");
+    publish_status(
+        sanitized_id,
+        "reconcile",
+        "rewriting stale .claude/ artifacts",
+    );
 
     provision_dirs(sanitized_id)?;
     atomic::cleanup_temp(&layout::settings_path());
@@ -558,7 +562,11 @@ fn provision_dirs(sanitized_id: &str) -> Result<(), SysError> {
 }
 
 fn write_configs(sanitized_id: &str, cfg: &PrincipalConfig) -> Result<(), SysError> {
-    publish_status(sanitized_id, "write_settings", "writing settings.local.json");
+    publish_status(
+        sanitized_id,
+        "write_settings",
+        "writing settings.local.json",
+    );
     settings::write_settings(cfg)?;
     publish_status(
         sanitized_id,
@@ -566,7 +574,11 @@ fn write_configs(sanitized_id: &str, cfg: &PrincipalConfig) -> Result<(), SysErr
         "writing managed-settings.json (staged for the system-path mount)",
     );
     settings::write_managed_settings(cfg)?;
-    publish_status(sanitized_id, "write_mcp", "writing .mcp.json (sage MCP server)");
+    publish_status(
+        sanitized_id,
+        "write_mcp",
+        "writing .mcp.json (sage MCP server)",
+    );
     settings::write_mcp(cfg, sanitized_id)?;
     publish_status(sanitized_id, "write_claude_md", "writing CLAUDE.md");
     settings::write_claude_md(cfg)?;
@@ -628,8 +640,7 @@ mod tests {
     #[test]
     fn install_request_without_config_defaults_to_headless_api_key_v1() {
         let payload = r#"{"principal_id":"alice"}"#;
-        let req: InstallRequest =
-            serde_json::from_str(payload).expect("payload must deserialize");
+        let req: InstallRequest = serde_json::from_str(payload).expect("payload must deserialize");
         assert_eq!(req.principal_id, "alice");
         assert!(!req.force, "force defaults to false");
         assert!(
@@ -649,8 +660,7 @@ mod tests {
     #[test]
     fn relink_request_without_config_defaults_to_headless_api_key_v1() {
         let payload = r#"{"principal_id":"alice"}"#;
-        let req: RelinkRequest =
-            serde_json::from_str(payload).expect("payload must deserialize");
+        let req: RelinkRequest = serde_json::from_str(payload).expect("payload must deserialize");
         assert_eq!(req.principal_id, "alice");
         assert!(req.config.is_none());
 
@@ -674,8 +684,7 @@ mod tests {
                 "schema_version":1
             }
         }"#;
-        let req: InstallRequest =
-            serde_json::from_str(payload).expect("payload must deserialize");
+        let req: InstallRequest = serde_json::from_str(payload).expect("payload must deserialize");
         assert!(req.force);
         let cfg = req.config.expect("config must be Some");
         assert_eq!(cfg.interaction_mode, InteractionMode::Repl);
@@ -718,7 +727,8 @@ mod tests {
         };
         let v: serde_json::Value = serde_json::to_value(&event).unwrap();
         assert_eq!(
-            v.pointer("/config/interaction_mode").and_then(|x| x.as_str()),
+            v.pointer("/config/interaction_mode")
+                .and_then(|x| x.as_str()),
             Some("headless")
         );
         assert_eq!(
@@ -783,7 +793,8 @@ mod tests {
         };
         let v: serde_json::Value = serde_json::to_value(&marker).unwrap();
         assert_eq!(
-            v.get("artifact_version").and_then(serde_json::Value::as_u64),
+            v.get("artifact_version")
+                .and_then(serde_json::Value::as_u64),
             Some(u64::from(ARTIFACT_VERSION))
         );
         let back: InstallMarker = serde_json::from_value(v).unwrap();

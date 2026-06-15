@@ -84,8 +84,7 @@ pub(crate) fn execute_request(
                     "input_schema": t.input_schema,
                 });
                 if i == last_idx {
-                    obj["cache_control"] =
-                        serde_json::json!({ "type": "ephemeral", "ttl": "5m" });
+                    obj["cache_control"] = serde_json::json!({ "type": "ephemeral", "ttl": "5m" });
                 }
                 obj
             })
@@ -227,10 +226,11 @@ fn handle_event(
             }
         }
         StreamingEvent::MessageDelta {
-            usage: Some(AnthropicUsage {
-                input_tokens,
-                output_tokens,
-            }),
+            usage:
+                Some(AnthropicUsage {
+                    input_tokens,
+                    output_tokens,
+                }),
             ..
         } => {
             // Anthropic's `message_delta.usage.output_tokens` is cumulative;

@@ -124,9 +124,7 @@ pub(crate) fn apply(req: SettingsSetRequest) -> Result<(), SysError> {
     // Apply partial patch: absent Option fields preserve the current
     // value; present fields overwrite.
     let merged = config::PrincipalConfig {
-        interaction_mode: req
-            .interaction_mode
-            .unwrap_or(previous.interaction_mode),
+        interaction_mode: req.interaction_mode.unwrap_or(previous.interaction_mode),
         auth_mode: req.auth_mode.unwrap_or(previous.auth_mode),
         model: req.model.unwrap_or(previous.model),
         max_turns: req.max_turns.or(previous.max_turns),
@@ -218,8 +216,7 @@ pub(crate) fn apply(req: SettingsSetRequest) -> Result<(), SysError> {
     // module doc-comment for the accepted ambiguity vs a concurrent
     // fresh install for the same principal.
     if let Some(sub) = install_sub {
-        let mut remaining_ms =
-            u64::try_from(RELINK_COMPLETE_DEADLINE.as_millis()).unwrap_or(5_000);
+        let mut remaining_ms = u64::try_from(RELINK_COMPLETE_DEADLINE.as_millis()).unwrap_or(5_000);
         let mut outcome: Option<InstallEnvelope> = None;
         while remaining_ms > 0 && outcome.is_none() {
             let step = remaining_ms.min(2_000);

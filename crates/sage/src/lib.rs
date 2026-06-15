@@ -82,9 +82,7 @@ use codec::{Outbound, encode};
 // rejection split. `PrincipalConfig` and `save` remain plumbing for the
 // install hook and `handle_settings_set` interceptor.
 use config::{AuthMode, InteractionMode, LoadOutcome, load_status as load_principal_config_status};
-use state::{
-    MAX_SESSIONS_PER_PRINCIPAL, RuntimeSession, SessionRecord, Sessions, save_record,
-};
+use state::{MAX_SESSIONS_PER_PRINCIPAL, RuntimeSession, SessionRecord, Sessions, save_record};
 
 /// Graceful-shutdown grace before falling back to SIGKILL.
 /// [`shutdown::stop_session`] reads this.
@@ -446,8 +444,8 @@ impl Sage {
         // the subprocess `HOME` / cwd must be a real OS path the host
         // spawn primitive can interpret.
         let home_path = resolved_home;
-        let prompt = identity::fetch_prompt(&principal_id, &session_id, &home_path)
-            .unwrap_or_else(|e| {
+        let prompt =
+            identity::fetch_prompt(&principal_id, &session_id, &home_path).unwrap_or_else(|e| {
                 log::warn(format!("sage: identity fetch errored: {e}, using fallback"));
                 "You are an agent running inside Astrid OS. Tools are exposed via mcp__sage__*."
                     .into()

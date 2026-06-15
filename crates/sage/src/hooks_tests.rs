@@ -444,10 +444,7 @@ fn hook_token_key_format_is_stable_for_kv_lookups() {
     // that's a caller bug -- sage's `validate_id` rejects empty
     // ids before they reach this helper. Document the assumption
     // by asserting on a real-world id alphabet.
-    let realistic = hook_token_key(
-        "user-abc_123",
-        "550e8400-e29b-41d4-a716-446655440000",
-    );
+    let realistic = hook_token_key("user-abc_123", "550e8400-e29b-41d4-a716-446655440000");
     assert_eq!(
         realistic,
         "sage.hook_token.user-abc_123.550e8400-e29b-41d4-a716-446655440000",
@@ -478,10 +475,7 @@ fn topic_map_matches_documented_sage_install_alphabet() {
             "hook.v1.event.after_tool_call_failed",
         ),
         ("after_tool_batch", "hook.v1.event.after_tool_batch"),
-        (
-            "permission_requested",
-            "hook.v1.event.permission_requested",
-        ),
+        ("permission_requested", "hook.v1.event.permission_requested"),
         ("permission_denied", "hook.v1.event.permission_denied"),
         ("message_sent", "hook.v1.event.message_sent"),
         ("message_failed", "hook.v1.event.message_failed"),

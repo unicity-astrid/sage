@@ -680,10 +680,7 @@ mod tests {
 
     #[test]
     fn sanitize_accepts_typical_id() {
-        assert_eq!(
-            sanitize_principal_id("alice").unwrap(),
-            "alice".to_string()
-        );
+        assert_eq!(sanitize_principal_id("alice").unwrap(), "alice".to_string());
     }
 
     #[test]
@@ -834,7 +831,8 @@ mod tests {
 
         // Fail-secure permission mode + Claude's inner sandbox, both pinned.
         assert_eq!(
-            v.pointer("/permissions/defaultMode").and_then(|x| x.as_str()),
+            v.pointer("/permissions/defaultMode")
+                .and_then(|x| x.as_str()),
             Some("dontAsk"),
             "headless: permission defaultMode must be dontAsk (fail-secure)"
         );
@@ -1120,7 +1118,10 @@ mod tests {
             "HOOK_EVENTS and HOOK_TOPIC_MAP must enumerate the same events"
         );
         for (event, (k, _)) in HOOK_EVENTS.iter().zip(HOOK_TOPIC_MAP.iter()) {
-            assert_eq!(event, k, "HOOK_EVENTS and HOOK_TOPIC_MAP must agree on order");
+            assert_eq!(
+                event, k,
+                "HOOK_EVENTS and HOOK_TOPIC_MAP must agree on order"
+            );
         }
         for (_, topic) in HOOK_TOPIC_MAP {
             assert!(
@@ -1353,10 +1354,7 @@ mod tests {
 
     #[test]
     fn install_complete_key_is_sage_namespaced() {
-        assert_eq!(
-            install_complete_key("alice"),
-            "sage.install.complete.alice"
-        );
+        assert_eq!(install_complete_key("alice"), "sage.install.complete.alice");
     }
 
     // ------------------------------------------------------------------
@@ -1426,10 +1424,8 @@ mod tests {
         // Compare as sets so a pure reordering of either list (no semantic
         // effect — deny order is irrelevant) does not spuriously fail,
         // while any membership difference (add, drop, substitute) does.
-        let actual: std::collections::BTreeSet<&str> =
-            REQUIRED_DENIES.iter().copied().collect();
-        let canonical: std::collections::BTreeSet<&str> =
-            CANONICAL.iter().copied().collect();
+        let actual: std::collections::BTreeSet<&str> = REQUIRED_DENIES.iter().copied().collect();
+        let canonical: std::collections::BTreeSet<&str> = CANONICAL.iter().copied().collect();
 
         let missing: Vec<&str> = canonical.difference(&actual).copied().collect();
         let unexpected: Vec<&str> = actual.difference(&canonical).copied().collect();

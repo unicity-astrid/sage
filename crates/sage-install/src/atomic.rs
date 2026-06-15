@@ -176,6 +176,9 @@ mod tests {
         let bytes: Vec<u8> = (0u8..=15).collect();
         let s = hex_encode(&bytes);
         assert_eq!(s.len(), bytes.len() * 2);
-        assert!(s.chars().all(|c| c.is_ascii_hexdigit() && !c.is_uppercase()));
+        assert!(
+            s.chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_uppercase())
+        );
     }
 }

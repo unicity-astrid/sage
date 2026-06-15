@@ -488,8 +488,7 @@ mod tests {
 
     #[test]
     fn deserialize_rejects_unknown_auth_mode() {
-        let bad =
-            r#"{"interaction_mode":"headless","auth_mode":"oauth_pkce","schema_version":1}"#;
+        let bad = r#"{"interaction_mode":"headless","auth_mode":"oauth_pkce","schema_version":1}"#;
         let parsed: Result<PrincipalConfig, _> = serde_json::from_str(bad);
         assert!(parsed.is_err());
     }

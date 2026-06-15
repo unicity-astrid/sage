@@ -81,8 +81,7 @@ fn install_complete_success_without_home_path_returns_empty_string() {
 
 #[test]
 fn install_complete_other_principal_is_skip() {
-    let payload =
-        r#"{"principal_id":"p2","success":false,"home_path":"","error":"boom"}"#;
+    let payload = r#"{"principal_id":"p2","success":false,"home_path":"","error":"boom"}"#;
     // Even a failure for a *different* principal must Skip, not
     // Failure — otherwise concurrent installs would abort each
     // other's spawn paths.

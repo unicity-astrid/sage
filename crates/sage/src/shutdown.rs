@@ -93,7 +93,9 @@ pub(crate) fn stop_session(
     })?;
 
     if !initial {
-        log::warn(format!("sage: stop({session_id}) — no live session, dropping"));
+        log::warn(format!(
+            "sage: stop({session_id}) — no live session, dropping"
+        ));
         return Ok(());
     }
 
@@ -556,9 +558,7 @@ fn wait_for_exit(sessions: &Sessions, session_id: &str, grace: Duration) -> bool
     let deadline = time::monotonic() + grace;
     while time::monotonic() < deadline {
         // Phase 1: clone the Process handle out from under the lock.
-        let proc_opt = match sessions
-            .with(|map| map.get(session_id).map(|s| s.process.clone()))
-        {
+        let proc_opt = match sessions.with(|map| map.get(session_id).map(|s| s.process.clone())) {
             Ok(p) => p,
             Err(_) => return false, // poisoned — fall through to kill()
         };
@@ -591,16 +591,19 @@ fn publish_exited(session_id: &str, reason: &str, summary: &ExitSummary) {
     });
     if let Some(obj) = payload.as_object_mut() {
         if let Some(tail) = &summary.stdout_tail {
-            obj.insert("stdout_tail".into(), serde_json::Value::String(tail.clone()));
+            obj.insert(
+                "stdout_tail".into(),
+                serde_json::Value::String(tail.clone()),
+            );
         }
         if let Some(tail) = &summary.stderr_tail {
-            obj.insert("stderr_tail".into(), serde_json::Value::String(tail.clone()));
+            obj.insert(
+                "stderr_tail".into(),
+                serde_json::Value::String(tail.clone()),
+            );
         }
         if let Some(detail) = &summary.detail {
-            obj.insert(
-                "detail".into(),
-                serde_json::Value::String(detail.clone()),
-            );
+            obj.insert("detail".into(), serde_json::Value::String(detail.clone()));
         }
     }
     let _ = ipc::publish_json(&format!("sage.v1.event.{session_id}.exited"), &payload);

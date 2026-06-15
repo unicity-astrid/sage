@@ -76,10 +76,7 @@ pub(crate) const HOOK_TOPIC_MAP: &[(&str, &str)] = &[
         "hook.v1.event.after_tool_call_failed",
     ),
     ("after_tool_batch", "hook.v1.event.after_tool_batch"),
-    (
-        "permission_requested",
-        "hook.v1.event.permission_requested",
-    ),
+    ("permission_requested", "hook.v1.event.permission_requested"),
     ("permission_denied", "hook.v1.event.permission_denied"),
     ("message_sent", "hook.v1.event.message_sent"),
     ("message_failed", "hook.v1.event.message_failed"),
@@ -211,9 +208,13 @@ struct HookEnvelope {
 /// Look up the canonical republish topic for a hook name. Returns
 /// `None` for unknown hook names; the caller audits and drops.
 fn canonical_topic_for(hook_name: &str) -> Option<&'static str> {
-    HOOK_TOPIC_MAP
-        .iter()
-        .find_map(|(name, topic)| if *name == hook_name { Some(*topic) } else { None })
+    HOOK_TOPIC_MAP.iter().find_map(|(name, topic)| {
+        if *name == hook_name {
+            Some(*topic)
+        } else {
+            None
+        }
+    })
 }
 
 /// Build the canonical republish body for a token-validated envelope.
@@ -290,12 +291,7 @@ fn audit_truncate(s: &str) -> &str {
 /// * `"tail_mismatch"` — the topic's trailing segment doesn't match
 ///   the envelope's `hook` field (producer is malformed or actively
 ///   adversarial).
-fn publish_spoof_audit(
-    claimed_principal: &str,
-    claimed_session: &str,
-    hook: &str,
-    reason: &str,
-) {
+fn publish_spoof_audit(claimed_principal: &str, claimed_session: &str, hook: &str, reason: &str) {
     let _ = ipc::publish_json(
         "sage.v1.audit.hook_spoof_attempt",
         &serde_json::json!({

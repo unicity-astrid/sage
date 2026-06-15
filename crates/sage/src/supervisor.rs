@@ -95,7 +95,10 @@ fn drive_session(sessions: &Sessions, session_id: &str) -> Result<(), SysError> 
         let mut events: Vec<PendingEvent> = Vec::new();
         let mut buffer_overflow = false;
         if !logs.stdout.is_empty() {
-            let decoded = session.codec.feed(logs.stdout.as_bytes()).collect::<Vec<_>>();
+            let decoded = session
+                .codec
+                .feed(logs.stdout.as_bytes())
+                .collect::<Vec<_>>();
             for item in decoded {
                 match item {
                     Ok(d) => collect_events(session_id, d, &mut events),
@@ -103,7 +106,9 @@ fn drive_session(sessions: &Sessions, session_id: &str) -> Result<(), SysError> 
                         buffer_overflow = true;
                     }
                     Err(CodecError::Malformed(msg)) => {
-                        log::warn(format!("sage: malformed stream-json on {session_id}: {msg}"));
+                        log::warn(format!(
+                            "sage: malformed stream-json on {session_id}: {msg}"
+                        ));
                     }
                 }
             }
@@ -224,9 +229,7 @@ fn collect_events(session_id: &str, decoded: Decoded, out: &mut Vec<PendingEvent
                 payload: serde_json::json!({ "event": event }),
             });
         }
-        Decoded::ControlRequest { .. }
-        | Decoded::UserToolResultEcho { .. }
-        | Decoded::Ping => {
+        Decoded::ControlRequest { .. } | Decoded::UserToolResultEcho { .. } | Decoded::Ping => {
             // No-op. Control requests (permission gating, MCP transport)
             // are handled by claude itself against the registered MCP
             // server, never by sage; tool_result echoes are
