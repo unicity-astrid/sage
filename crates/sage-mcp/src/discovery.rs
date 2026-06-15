@@ -30,9 +30,15 @@ const TOOLS_LIST_TOPIC: &str = "sage.v1.tools.list";
 /// mcp__sage__*` flag on the agent subprocess matches against this.
 const MCP_TOOL_PREFIX: &str = "mcp__sage__";
 
-/// Total drain window for the describe fan-out (matches the registry
-/// capsule's settle window).
-const DISCOVERY_TIMEOUT_MS: u64 = 500;
+/// Total drain window for the describe fan-out. Sized to cover a COLD
+/// start: the first `tools/list` after a plain daemon boot races the
+/// fan-out against WASM instantiation + kernel broadcast latency, and the
+/// old 500 ms lost that race — which matters because an MCP client fetches
+/// `tools/list` once at connect, so an empty first answer sticks for the
+/// session. The loop below still returns as soon as responders go quiet
+/// AFTER replying, so this is headroom for a slow cold start, not a fixed
+/// wait on the warm path.
+const DISCOVERY_TIMEOUT_MS: u64 = 2_500;
 /// Slice size for the drain loop. A single `recv(timeout)` would only
 /// pick up the first batch; the loop keeps polling in shorter slices
 /// until the budget closes.
@@ -80,6 +86,17 @@ pub(crate) fn collect_snapshot() -> Vec<McpToolDescriptor> {
     }
 
     let descriptors = discover();
+    // A fan-out that returns NOTHING is almost always a cold-start race-loss
+    // (instantiation + broadcast latency beat the drain window), not a genuine
+    // "no tools" answer. Caching it would (a) clobber a prior good snapshot
+    // and (b) surface an empty `tools/list`. So on empty, leave the cache
+    // untouched — keep whatever we had (good or empty) and let the NEXT call
+    // retry the fan-out. (`is_fresh` already refuses to short-circuit on an
+    // empty cache, so a cold cache simply re-discovers rather than pinning
+    // empty for the TTL.)
+    if descriptors.is_empty() {
+        return cached.as_vec();
+    }
     cache::replace(descriptors).as_vec()
 }
 
@@ -164,11 +181,13 @@ fn discover() -> Vec<McpToolDescriptor> {
     }
 
     let mut acc: Vec<McpToolDescriptor> = Vec::new();
+    let mut seen_any = false;
     let mut remaining = DISCOVERY_TIMEOUT_MS;
     loop {
         let step = remaining.min(DISCOVERY_SLICE_MS);
         match sub.recv(step) {
-            Ok(result) => {
+            Ok(result) if !result.messages.is_empty() => {
+                seen_any = true;
                 for msg in &result.messages {
                     let Ok(value) = serde_json::from_str::<serde_json::Value>(&msg.payload) else {
                         continue;
@@ -176,7 +195,18 @@ fn discover() -> Vec<McpToolDescriptor> {
                     acc.extend(parse_describe_response(&value));
                 }
             }
-            Err(_) => break,
+            // A quiet slice — the host returned early-empty, OR `recv` timed
+            // out on this slice. Two cases: if responders have ALREADY replied,
+            // this is quiescence → stop. If NOT, we're still racing a cold
+            // start (WASM instantiation + broadcast latency), so keep polling
+            // until the budget closes rather than breaking at the first 100 ms
+            // gap — otherwise widening `DISCOVERY_TIMEOUT_MS` buys nothing,
+            // because the loop would bail before the first response arrives.
+            Ok(_) | Err(_) => {
+                if seen_any {
+                    break;
+                }
+            }
         }
         remaining = remaining.saturating_sub(step);
         if remaining == 0 {
