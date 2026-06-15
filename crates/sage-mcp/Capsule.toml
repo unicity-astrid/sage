@@ -16,30 +16,27 @@ type = "executable"
 [capabilities]
 kv = []
 
-# Confused-deputy allow-set for the state-mutating broker front door
-# (`astrid.v1.request.mcp.tool.call`). Comma-separated list of trusted
-# ingress capsule UUIDs — the kernel-set `source_id` of the capsule that
-# forwarded the call (today the cli proxy; extensible to future
-# Telegram / Discord bridges). Read back at call time via
-# `astrid_sdk::env::var_opt("trusted_ingress_ids")` and matched against
-# `runtime::caller().source_id` in `execute::is_trusted_ingress`. Unset
-# fails closed: no ingress is trusted until the operator pins one. The
-# read-only `astrid.v1.request.mcp.tools.list` front door is not gated by
-# this — it only exposes the public tool surface.
-[env]
-trusted_ingress_ids = { type = "string", default = "", request = "Comma-separated UUIDs of trusted ingress capsules allowed to drive MCP tool calls (e.g. the cli proxy capsule UUID)" }
+# The confused-deputy gate for the state-mutating broker front door
+# (`astrid.v1.request.mcp.tool.call`) no longer reads an operator-maintained
+# allow-set. An ingress `source_id` (the kernel-set originating-capsule UUID)
+# is trusted iff the user has interactively consented to it — recorded under
+# the per-(principal, source_id) KV key `mcp.ingress.trust.<source_id>` by
+# `approval::handle_mcp_ingress_respond` after an elicit prompt. The `kv`
+# capability above backs that read/write.
+#
 # Per-principal argument-level policy rules — a JSON array of
 # { id, effect:"deny"|"allow", tool:"<glob>", when:[{pointer,op,value}] }.
 # Evaluated IN-PROCESS at the broker chokepoint (`policy::evaluate`,
 # read via `env::var_opt("policy_rules")`, so it resolves the invoking
-# principal's overlay — per-principal with no cross-capsule KV write,
-# mirroring `trusted_ingress_ids`). The PDP only NARROWS: unset / empty /
+# principal's overlay — per-principal with no cross-capsule KV write). The
+# PDP only NARROWS: unset / empty /
 # malformed → no policy → the host's exec-time capability enforcement
 # remains the boundary (degrade-to-PEP + a loud `sage.v1.audit.policy_*`
 # audit). DENY rules over free-form strings are best-effort (the kernel
 # resolves `home://` host-side; a raw-literal path/command deny is
 # evadable) — the robust shapes are allowlist-style eq/prefix. See
 # `crate::policy`.
+[env]
 policy_rules = { type = "string", default = "", request = "Per-principal policy rules as a JSON array (leave blank for none); see sage-mcp policy docs" }
 
 # sage-mcp describes the tool surface Claude sees by querying the tool
@@ -64,9 +61,18 @@ policy_rules = { type = "string", default = "", request = "Per-principal policy 
 # `astrid.v1.approval.response.<id>` to unblock the parked tool. Exact
 # (segment-arity-fixed) topic — the proxy carries the correlation token in
 # the body. State-mutating (it can grant a capability), so the handler is
-# confused-deputy gated on `source_id` against `trusted_ingress_ids`, the
-# same allow-set the tool-call front door uses.
+# confused-deputy gated on the kernel-set `source_id` (a trusted ingress),
+# the same gate the tool-call front door uses.
 "astrid.v1.request.mcp.approval.respond" = { wit = "broker/approval-respond", handler = "handle_mcp_approval" }
+# Ingress consent bridge (broker side). When a `tool.call` arrives from an
+# untrusted `source_id`, the broker replies an `ingress_approval_required`
+# signal; the shim elicits the user's consent and forwards the decision here
+# as `{ req_id, accept }`. On accept, `handle_mcp_ingress_respond` records
+# trust under `mcp.ingress.trust.<source_id>` (the SECURITY-CRITICAL
+# `source_id` is the kernel-stamped `runtime::caller().source_id` of this
+# message — never a body field) and acks on `astrid.v1.response.<req_id>`.
+# Exact (segment-arity-fixed) topic.
+"astrid.v1.request.mcp.ingress.respond" = { wit = "opaque", handler = "handle_mcp_ingress_respond" }
 # Dynamic-subscribe pattern: `execute::dispatch_with_approval` calls
 # `ipc::subscribe("astrid.v1.approval")` per broker tool call to observe a
 # capability-approval request published by the host while a gated tool is

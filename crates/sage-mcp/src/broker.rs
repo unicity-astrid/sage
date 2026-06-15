@@ -43,13 +43,18 @@
 //! [`handle_mcp_call`] is state-mutating and externally reachable, so it
 //! additionally requires the inbound message's kernel-set `source_id`
 //! (the originating capsule UUID, via [`astrid_sdk::runtime::caller`]) to
-//! be in the operator-pinned trusted-ingress allow-set
-//! (`trusted_ingress_ids` `[env]` key). This stops a non-ingress capsule
-//! from puppeting sage-mcp into executing tools on a principal's behalf.
-//! [`handle_mcp_list`] is read-only (it returns the public tool surface
-//! the proxy already publishes) and is NOT gated as strictly. See
-//! [`crate::execute::is_trusted_ingress`] for why the trust marker
-//! (`verified()`) cannot substitute for the `source_id` identity check.
+//! be a TRUSTED ingress. Trust is recorded interactively: an untrusted
+//! source_id triggers an `ingress_approval_required` reply that the shim
+//! turns into a user consent prompt, and on accept the broker records trust
+//! under the per-(principal, source_id) KV key `mcp.ingress.trust.<source_id>`
+//! (see [`crate::execute::is_ingress_trusted`] and
+//! [`crate::approval::handle_mcp_ingress_respond`]). This stops a non-ingress
+//! capsule from puppeting sage-mcp into executing tools on a principal's
+//! behalf without a human ever consenting to it. [`handle_mcp_list`] is
+//! read-only (it returns the public tool surface the proxy already publishes)
+//! and is NOT gated as strictly. See [`crate::execute::is_ingress_trusted`]
+//! for why the trust marker (`verified()`) cannot substitute for the
+//! `source_id` identity check.
 
 use astrid_sdk::prelude::*;
 use serde::Deserialize;
@@ -211,15 +216,22 @@ pub(crate) fn handle_mcp_call(payload: Value) -> Result<(), SysError> {
 
     // Confused-deputy gate. `astrid.v1.request.mcp.tool.call` is
     // state-mutating and externally reachable through the cli proxy, so
-    // before we dispatch we require the message's kernel-set
-    // `source_id` (the originating capsule UUID, NOT a guest-settable
-    // body field) to be in the operator-pinned trusted-ingress
-    // allow-set. A capsule the operator has NOT designated as an ingress
-    // bridge must not be able to puppet sage-mcp into executing tools on
-    // a principal's behalf. Failure paths reply `isError:true` (never
-    // dispatch) so the proxy still gets exactly one reply and never
-    // hangs. See [`execute::is_trusted_ingress`] for why `verified()` is
-    // insufficient on this path.
+    // before we dispatch we require the message's kernel-set `source_id`
+    // (the originating capsule UUID, NOT a guest-settable body field) to be
+    // a TRUSTED ingress. Trust is no longer an operator-maintained allow-list:
+    // an ingress is trusted iff the user has interactively consented to it
+    // (recorded under the per-(principal, source_id) KV key
+    // `mcp.ingress.trust.<source_id>` — see [`execute::is_ingress_trusted`]).
+    //
+    // When the source_id is NOT yet trusted we do NOT hard-deny: we reply a
+    // distinct `ingress_approval_required` signal (NOT `isError`, since it is
+    // a prompt-needed state, not a failure) so the shim can elicit consent
+    // from the user and, on accept, forward
+    // `astrid.v1.request.mcp.ingress.respond` ->
+    // [`crate::approval::handle_mcp_ingress_respond`], which records trust
+    // against the kernel-stamped caller source_id and lets a re-sent call
+    // pass this gate. We NEVER dispatch on this path. See
+    // [`execute::is_ingress_trusted`] for why `verified()` is insufficient.
     let source_id = match runtime::caller() {
         Ok(ctx) => ctx.source_id,
         Err(e) => {
@@ -241,19 +253,24 @@ pub(crate) fn handle_mcp_call(payload: Value) -> Result<(), SysError> {
             return Ok(());
         }
     };
-    if !execute::is_trusted_ingress(&source_id) {
-        log::warn(format!(
-            "sage-mcp: broker tool.call: rejecting untrusted ingress source_id '{source_id}' \
-             for req_id '{}'",
+    if !execute::is_ingress_trusted(&source_id) {
+        log::info(format!(
+            "sage-mcp: broker tool.call: ingress source_id '{source_id}' not yet trusted; \
+             requesting interactive consent for req_id '{}'",
             req.req_id
         ));
+        // Prompt-needed signal — NOT an error. The shim elicits consent and,
+        // on accept, drives `ingress.respond` then re-sends this call. We
+        // echo `source_id` for display/diagnostics only; the trust write
+        // keys on the kernel-stamped caller of the `ingress.respond`, never
+        // this body field. No tool is dispatched.
         let reply = json!({
             "kind": "tool.call",
             "req_id": req.req_id,
-            "content": mcp_content(Value::String(
-                "sage-mcp: ingress not in trusted allow-set; tool call rejected".into(),
-            )),
-            "isError": true,
+            "ingress_approval_required": true,
+            "source_id": source_id,
+            "tool_name": req.name,
+            "isError": false,
         });
         publish_reply(&reply_topic, &reply);
         return Ok(());
