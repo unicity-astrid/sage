@@ -259,6 +259,15 @@ pub(crate) fn handle_mcp_call(payload: Value) -> Result<(), SysError> {
              requesting interactive consent for req_id '{}'",
             req.req_id
         ));
+        // Record that a consent prompt is now outstanding for this ingress.
+        // The respond handler ([`crate::approval::handle_mcp_ingress_respond`])
+        // only honours an `accept` that consumes this marker, so an unsolicited
+        // or replayed `ingress.respond` cannot prime trust without a prompt the
+        // broker actually issued. Keyed on the kernel-stamped caller (the same
+        // identity the trust write uses) — best-effort; a write failure just
+        // re-prompts on the next call, never grants spuriously.
+        execute::mark_ingress_pending(&source_id);
+
         // Prompt-needed signal — NOT an error. The shim elicits consent and,
         // on accept, drives `ingress.respond` then re-sends this call. We
         // echo `source_id` for display/diagnostics only; the trust write

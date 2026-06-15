@@ -55,6 +55,13 @@ const MAX_TOOL_NAME_LEN: usize = 128;
 /// to trust for state-mutating broker calls. See [`is_ingress_trusted`].
 const INGRESS_TRUST_KEY_PREFIX: &str = "mcp.ingress.trust.";
 
+/// KV key prefix marking that the broker has an OUTSTANDING consent prompt
+/// for an ingress `source_id` — written when [`crate::broker::handle_mcp_call`]
+/// replies `ingress_approval_required` and consumed by
+/// [`crate::approval::handle_mcp_ingress_respond`]. See
+/// [`mark_ingress_pending`] / [`take_ingress_pending`].
+const INGRESS_PENDING_KEY_PREFIX: &str = "mcp.ingress.pending.";
+
 /// Outcome of a broker tool dispatch that watches for a mid-call approval.
 ///
 /// The capability-gated tool's host-side `request_approval` syscall
@@ -256,6 +263,81 @@ pub(crate) fn ingress_trust_key(source_id: &str) -> Option<String> {
     Some(format!("{INGRESS_TRUST_KEY_PREFIX}{source_id}"))
 }
 
+/// KV key marking an outstanding consent prompt for `source_id`. Same
+/// empty-source guard as [`ingress_trust_key`] — an unattributed caller must
+/// never resolve to a routable pending key.
+fn ingress_pending_key(source_id: &str) -> Option<String> {
+    if source_id.is_empty() {
+        return None;
+    }
+    Some(format!("{INGRESS_PENDING_KEY_PREFIX}{source_id}"))
+}
+
+/// Record that the broker has surfaced an `ingress_approval_required` prompt
+/// for `source_id`, so a later `ingress.respond` can be correlated to a prompt
+/// the broker actually issued ([`take_ingress_pending`]).
+///
+/// Best-effort: a write failure is logged, not fatal. If the marker is lost
+/// the subsequent accept simply fails the correlation check and the user is
+/// re-prompted on the next call — fail-secure, never a spurious grant.
+///
+/// The keyspace is bounded by the set of installed capsules (a `source_id` is
+/// a kernel-stamped capsule UUID), and every marker is consumed by the paired
+/// respond, so no TTL/sweep is needed.
+pub(crate) fn mark_ingress_pending(source_id: &str) {
+    let Some(key) = ingress_pending_key(source_id) else {
+        log::warn(
+            "sage-mcp: empty source_id; not marking an ingress consent prompt as pending",
+        );
+        return;
+    };
+    if let Err(e) = kv::set_bytes(&key, b"1") {
+        log::warn(format!(
+            "sage-mcp: failed to mark ingress consent prompt pending for source_id \
+             '{source_id}': {e}"
+        ));
+    }
+}
+
+/// Consume the outstanding consent-prompt marker for `source_id`, returning
+/// whether one existed.
+///
+/// This is the req-correlation gate: [`crate::approval::handle_mcp_ingress_respond`]
+/// only honours an `accept` when this returns `true`, so an UNSOLICITED or
+/// replayed `ingress.respond` (one for which the broker never issued a prompt)
+/// cannot prime trust. The marker is deleted on consume — both on accept and
+/// on decline — so it is single-use and a decline does not leave a stale
+/// marker a later unsolicited accept could ride.
+///
+/// Fail-closed: an empty `source_id`, a missing marker, or a host read error
+/// all return `false`. A delete failure after a confirmed-present marker is
+/// logged but still reported as consumed (the grant proceeds; the worst case
+/// is one re-usable stale marker, never a denied legitimate grant).
+pub(crate) fn take_ingress_pending(source_id: &str) -> bool {
+    let Some(key) = ingress_pending_key(source_id) else {
+        return false;
+    };
+    match kv::get_bytes_opt(&key) {
+        Ok(Some(_)) => {
+            if let Err(e) = kv::delete(&key) {
+                log::warn(format!(
+                    "sage-mcp: failed to clear ingress pending marker for source_id \
+                     '{source_id}': {e}"
+                ));
+            }
+            true
+        }
+        Ok(None) => false,
+        Err(e) => {
+            log::warn(format!(
+                "sage-mcp: ingress pending read error for source_id '{source_id}', \
+                 failing closed: {e}"
+            ));
+            false
+        }
+    }
+}
+
 /// Confused-deputy guard for state-mutating broker calls.
 ///
 /// `source_id` is the kernel-set UUID of the capsule that originated the
@@ -357,6 +439,33 @@ mod tests {
         // trust key — otherwise the read would collapse to the bare prefix
         // and a write under an empty caller would grant blanket trust.
         assert_eq!(ingress_trust_key(""), None);
+    }
+
+    #[test]
+    fn ingress_pending_key_applies_prefix() {
+        let id = "0191f3a2-b4c7-4d8e-9f01-234567890abc";
+        assert_eq!(
+            ingress_pending_key(id).as_deref(),
+            Some("mcp.ingress.pending.0191f3a2-b4c7-4d8e-9f01-234567890abc")
+        );
+    }
+
+    #[test]
+    fn ingress_pending_key_rejects_empty_source() {
+        // Mirror the trust-key guard: an unattributed (empty) source must not
+        // resolve to a routable pending key, or `mark`/`take` would collapse
+        // to the bare prefix and a single marker would correlate every
+        // unattributed respond.
+        assert_eq!(ingress_pending_key(""), None);
+    }
+
+    #[test]
+    fn take_ingress_pending_empty_source_fails_closed() {
+        // No host KV call is reached for an empty source_id — it short-circuits
+        // to `false` via `ingress_pending_key` returning `None`, so an
+        // unattributed accept can never satisfy the correlation gate. (The
+        // non-empty path needs a live host and is exercised by integration.)
+        assert!(!take_ingress_pending(""));
     }
 
     #[test]

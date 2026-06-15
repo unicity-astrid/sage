@@ -372,6 +372,20 @@ struct IngressRespond {
 /// body, because the body carries none and we read only the kernel-stamped
 /// caller. An empty / unattributed caller is refused
 /// ([`crate::execute::ingress_trust_key`] returns `None`).
+///
+/// **Correlation gate**: trust is recorded only when this respond consumes an
+/// outstanding consent-prompt marker the broker wrote for `source_id` when it
+/// replied `ingress_approval_required`
+/// ([`crate::execute::take_ingress_pending`]). An accept with no marker —
+/// unsolicited, replayed, or for an ingress the broker never prompted on — is
+/// refused. The shim mints a FRESH `req_id` per respond and the broker hands
+/// it no prompt id to echo, so `source_id` (identical on the gated call and
+/// its respond, since the same proxy forwards both) is the only correlation
+/// token available without a wire change. The marker is single-use (consumed
+/// on accept and decline). This does NOT by itself prove a human (vs a
+/// capsule) drove the accept — that remains the publish-ACL on
+/// `astrid.v1.request.mcp.ingress.respond`; it removes the unsolicited /
+/// replayed-respond residual (sage#3).
 pub(crate) fn handle_mcp_ingress_respond(payload: Value) -> Result<(), SysError> {
     let req: IngressRespond = match serde_json::from_value(payload) {
         Ok(v) => v,
@@ -401,7 +415,26 @@ pub(crate) fn handle_mcp_ingress_respond(payload: Value) -> Result<(), SysError>
         }
     };
 
+    // Correlation gate: only honour a respond that consumes a prompt the
+    // broker actually issued for THIS ingress. Consumed on accept AND decline
+    // so a declined prompt cannot leave a stale marker a later unsolicited
+    // accept could ride. Fail-closed (missing marker / read error → false).
+    let had_prompt = crate::execute::take_ingress_pending(&source_id);
+
     if req.accept {
+        if !had_prompt {
+            // Unsolicited or replayed accept: no consent prompt is outstanding
+            // for this ingress, so the broker never asked. Refuse to record
+            // trust and ack as not-granted — the shim will not re-send.
+            log::warn(format!(
+                "sage-mcp: broker ingress.respond: accept with no outstanding prompt for \
+                 source_id '{source_id}'; recording no trust"
+            ));
+            if let Some(reply) = &reply_topic {
+                ingress_ack(reply, &req.req_id, false);
+            }
+            return Ok(());
+        }
         match crate::execute::ingress_trust_key(&source_id) {
             Some(key) => {
                 if let Err(e) = kv::set_bytes(&key, b"1") {
