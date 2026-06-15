@@ -86,18 +86,38 @@ pub(crate) fn collect_snapshot() -> Vec<McpToolDescriptor> {
     }
 
     let descriptors = discover();
-    // A fan-out that returns NOTHING is almost always a cold-start race-loss
-    // (instantiation + broadcast latency beat the drain window), not a genuine
-    // "no tools" answer. Caching it would (a) clobber a prior good snapshot
-    // and (b) surface an empty `tools/list`. So on empty, leave the cache
-    // untouched — keep whatever we had (good or empty) and let the NEXT call
-    // retry the fan-out. (`is_fresh` already refuses to short-circuit on an
-    // empty cache, so a cold cache simply re-discovers rather than pinning
-    // empty for the TTL.)
-    if descriptors.is_empty() {
-        return cached.as_vec();
+    match snapshot_outcome(&descriptors) {
+        // Keep the prior cache untouched and let the next call retry — see
+        // [`snapshot_outcome`].
+        SnapshotOutcome::Keep => cached.as_vec(),
+        SnapshotOutcome::Replace => cache::replace(descriptors).as_vec(),
     }
-    cache::replace(descriptors).as_vec()
+}
+
+/// Whether a fresh fan-out result should REPLACE the cache or be discarded in
+/// favour of the prior cache.
+#[derive(Debug, PartialEq, Eq)]
+enum SnapshotOutcome {
+    /// Discard the fan-out; serve the prior cache and write nothing. An EMPTY
+    /// fan-out is a cold-start race-loss (WASM instantiation + broadcast
+    /// latency beat the drain window), NOT a genuine "no tools" answer:
+    /// caching it would clobber a prior good snapshot and pin an empty
+    /// `tools/list` for the session (the MCP client fetches it once at
+    /// connect). `is_fresh` already refuses to short-circuit an empty cache,
+    /// so a cold cache simply re-discovers on the next call.
+    Keep,
+    /// Persist the fan-out and serve it.
+    Replace,
+}
+
+/// Pure reconciliation decision for [`collect_snapshot`] — the host calls
+/// (load / discover / replace) stay in the caller, so this is unit-testable.
+fn snapshot_outcome(discovered: &[McpToolDescriptor]) -> SnapshotOutcome {
+    if discovered.is_empty() {
+        SnapshotOutcome::Keep
+    } else {
+        SnapshotOutcome::Replace
+    }
 }
 
 /// Convert internal descriptors to the standard MCP `tools/list`
@@ -345,4 +365,38 @@ fn wall_ms() -> u64 {
         .ok()
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
         .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn desc(name: &str) -> McpToolDescriptor {
+        McpToolDescriptor {
+            name: name.to_string(),
+            title: None,
+            description: String::new(),
+            input_schema: serde_json::Value::Null,
+            capabilities: None,
+        }
+    }
+
+    /// Regression for the `tools/list` empty-cache pin: a cold-start
+    /// race-loss returns no descriptors, which must KEEP the prior cache and
+    /// never replace it. Replacing on empty clobbered a good snapshot and
+    /// pinned an empty `tools/list` for the whole session (the MCP client
+    /// fetches the list once at connect).
+    #[test]
+    fn empty_fanout_keeps_cache() {
+        assert_eq!(snapshot_outcome(&[]), SnapshotOutcome::Keep);
+    }
+
+    /// A non-empty fan-out is a genuine answer and replaces the cache.
+    #[test]
+    fn non_empty_fanout_replaces_cache() {
+        assert_eq!(
+            snapshot_outcome(&[desc("fs.read")]),
+            SnapshotOutcome::Replace
+        );
+    }
 }

@@ -111,9 +111,7 @@ pub(crate) fn upsert(incoming: Vec<McpToolDescriptor>) -> CacheState {
         for desc in &incoming {
             // Upserting an existing name never grows the cache; only a
             // genuinely new name does. Cap insertion when at the limit.
-            if state.tools.len() >= MAX_CACHED_TOOLS
-                && !state.tools.contains_key(&desc.name)
-            {
+            if state.tools.len() >= MAX_CACHED_TOOLS && !state.tools.contains_key(&desc.name) {
                 continue;
             }
             state.tools.insert(desc.name.clone(), desc.clone());
@@ -186,4 +184,58 @@ fn now_ms() -> u64 {
         .ok()
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
         .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn state(updated_at_ms: u64, n_tools: usize) -> CacheState {
+        let mut tools = BTreeMap::new();
+        for i in 0..n_tools {
+            let name = format!("tool{i}");
+            tools.insert(
+                name.clone(),
+                McpToolDescriptor {
+                    name,
+                    title: None,
+                    description: String::new(),
+                    input_schema: serde_json::Value::Null,
+                    capabilities: None,
+                },
+            );
+        }
+        CacheState {
+            updated_at_ms,
+            tools,
+        }
+    }
+
+    #[test]
+    fn fresh_within_ttl() {
+        assert!(state(1_000, 3).is_fresh(1_000 + CACHE_TTL_MS - 1));
+    }
+
+    #[test]
+    fn stale_past_ttl() {
+        assert!(!state(1_000, 3).is_fresh(1_000 + CACHE_TTL_MS + 1));
+    }
+
+    /// The `tools/list` reliability guard: an empty cache (cold, or left
+    /// empty by a transient empty fan-out) must NEVER short-circuit, so the
+    /// server always re-discovers rather than pinning an empty `tools/list`
+    /// for the TTL.
+    #[test]
+    fn empty_cache_is_never_fresh() {
+        assert!(!state(1_000, 0).is_fresh(1_000 + 1));
+    }
+
+    /// A degraded host clock (`now == 0`) or a snapshot written under one
+    /// (`updated_at == 0`) leaves the TTL undefined — never treat either as
+    /// fresh, or a degraded host pins the cache forever.
+    #[test]
+    fn degraded_clock_is_never_fresh() {
+        assert!(!state(1_000, 3).is_fresh(0));
+        assert!(!state(0, 3).is_fresh(1_000));
+    }
 }
