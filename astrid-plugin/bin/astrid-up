@@ -89,7 +89,13 @@ fi
 # (context::resolve_agent → active agent context, else the default
 # principal). Zero-config: no userConfig needed for single-tenant use.
 if [ "${1:-}" = "--principal" ] && [ -z "${2:-}" ]; then
-  shift 2
+  # Claude Code expands a blank `${user_config.principal}` and DROPS the
+  # empty value, so the server is invoked as `astrid-up --principal` (one
+  # arg), not `--principal ""` (two). A blind `shift 2` then over-shifts and
+  # aborts under `set -eu`, killing the MCP server. Drop the flag, and the
+  # empty value only if it was actually passed.
+  shift
+  [ "$#" -gt 0 ] && shift
 fi
 
 exec "$ASTRID" mcp serve "$@"

@@ -15,7 +15,9 @@
     "principal": {
       "type": "string",
       "title": "Astrid principal",
-      "description": "The Astrid principal this Claude Code session acts as. Scopes tool execution and capability checks to this identity. Leave blank to use the active/default principal."
+      "description": "The Astrid principal this Claude Code session acts as. Scopes tool execution, capability checks, and audit to this identity. Run `astrid agent list` to see available principals. Defaults to 'default'.",
+      "required": true,
+      "default": "default"
     }
   }
 }
