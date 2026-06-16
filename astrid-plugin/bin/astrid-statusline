@@ -42,9 +42,17 @@ ESC=$(printf '\033')
 C_RESET="${ESC}[0m"; C_DIM="${ESC}[2m"; C_CY="${ESC}[36m"
 C_GN="${ESC}[32m"; C_YE="${ESC}[33m"; C_GY="${ESC}[90m"
 
-# Principal — local context-file read (fast; works even if daemon is down).
+# Principal this session ACTS AS — published by bin/astrid-up to the run dir
+# (the identity handed to `astrid mcp serve --principal`), DECOUPLED from the
+# operator's active CLI context. A user-wired status line command does not get
+# the plugin's CLAUDE_PLUGIN_OPTION_* env, so read the published file; fall
+# back to the CLI context, then `default`. Fast: a small local file read.
 PRINCIPAL="default"
-if [ -x "$ASTRID" ]; then
+SESSION_PRINCIPAL_FILE="$ASTRID_HOME_DIR/run/session.principal"
+if [ -r "$SESSION_PRINCIPAL_FILE" ]; then
+  p="$(head -n1 "$SESSION_PRINCIPAL_FILE" 2>/dev/null | tr -d '[:space:]')"
+  [ -n "$p" ] && PRINCIPAL="$p"
+elif [ -x "$ASTRID" ]; then
   p="$("$ASTRID" agent current 2>/dev/null | head -n1 | tr -d '[:space:]')"
   [ -n "$p" ] && PRINCIPAL="$p"
 fi

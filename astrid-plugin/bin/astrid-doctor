@@ -62,9 +62,16 @@ Install the Astrid runtime, then restart this session. The Astrid plugin can't b
   exit 0
 fi
 
-# Active principal — read from the local CLI context file, so this works
-# even before the daemon is up.
-PRINCIPAL="$("$ASTRID" agent current 2>/dev/null | head -n1 | tr -d '[:space:]')"
+# Principal this session ACTS AS. Claude Code exports the configured userConfig
+# value to every plugin subprocess as CLAUDE_PLUGIN_OPTION_PRINCIPAL — that is
+# the session identity handed to `astrid mcp serve --principal`, intentionally
+# DECOUPLED from the operator's active CLI context (`astrid agent current`,
+# typically `default`/admin). Prefer the session value (try both case forms of
+# the env var); fall back to the CLI context, then `default`.
+PRINCIPAL="${CLAUDE_PLUGIN_OPTION_PRINCIPAL:-${CLAUDE_PLUGIN_OPTION_principal:-}}"
+if [ -z "$PRINCIPAL" ] && [ -x "$ASTRID" ]; then
+  PRINCIPAL="$("$ASTRID" agent current 2>/dev/null | head -n1 | tr -d '[:space:]')"
+fi
 [ -n "$PRINCIPAL" ] || PRINCIPAL="default"
 
 # Probe the daemon (read-only). `astrid status` exits 0 either way, so we

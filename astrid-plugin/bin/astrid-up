@@ -84,18 +84,82 @@ if ! daemon_live; then
   fi
 fi
 
-# Drop an empty `--principal ""` pair (operator left userConfig.principal
-# blank) so `astrid mcp serve` resolves the active CLI principal itself
-# (context::resolve_agent → active agent context, else the default
-# principal). Zero-config: no userConfig needed for single-tenant use.
-if [ "${1:-}" = "--principal" ] && [ -z "${2:-}" ]; then
-  # Claude Code expands a blank `${user_config.principal}` and DROPS the
-  # empty value, so the server is invoked as `astrid-up --principal` (one
-  # arg), not `--principal ""` (two). A blind `shift 2` then over-shifts and
-  # aborts under `set -eu`, killing the MCP server. Drop the flag, and the
-  # empty value only if it was actually passed.
+# Resolve the principal this session will act as. Claude Code expands the
+# `${user_config.principal}` arg from .mcp.json: a configured value arrives as
+# `--principal <name>`; a blank one (operator cleared it) collapses to a lone
+# `--principal` with no value.
+PRINCIPAL=""
+[ "${1:-}" = "--principal" ] && PRINCIPAL="${2:-}"
+
+# Blank principal: drop the dangling flag so `astrid mcp serve` resolves the
+# active CLI principal itself (context::resolve_agent → active agent context,
+# else `default`). Claude Code expands a blank `${user_config.principal}` and
+# DROPS the empty value, so the server is invoked as `astrid-up --principal`
+# (one arg), not `--principal ""` (two). A blind `shift 2` then over-shifts
+# and aborts under `set -eu`, killing the MCP server — so drop the flag, and
+# the empty value only if it was actually passed.
+if [ "${1:-}" = "--principal" ] && [ -z "$PRINCIPAL" ]; then
   shift
   [ "$#" -gt 0 ] && shift
+fi
+
+# Publish the resolved session principal for the read-only display surfaces
+# (SessionStart doctor, HUD status line, /astrid:whoami) so they report the
+# identity this session ACTS AS — not the operator's active CLI context, which
+# stays `default`/admin and is intentionally decoupled. Co-located with the
+# run-dir sentinels those scripts already resolve (a live daemon owns the dir).
+# Best-effort: a write failure only degrades the displays to their CLI-context
+# fallback, never the session itself.
+SESSION_PRINCIPAL_FILE="$ASTRID_HOME_DIR/run/session.principal"
+if [ -n "$PRINCIPAL" ]; then
+  printf '%s\n' "$PRINCIPAL" > "$SESSION_PRINCIPAL_FILE" 2>/dev/null || true
+else
+  # Blank → `mcp serve` resolves the active context itself; clear any stale
+  # value so the displays fall back to that same context, not a past session.
+  rm -f "$SESSION_PRINCIPAL_FILE" 2>/dev/null || true
+fi
+
+# Provision the session principal as a SCOPED agent before serving as it.
+# `astrid agent create` with no `--group` lands the principal in the built-in
+# `agent` group: self-scoped capabilities (`self:*`, `delegate:self:*`) and
+# NONE of the admin-meta surface the `default` principal holds via the `admin`
+# group (`*`). So the governed Claude session can drive its own tools but
+# cannot administer the OS it runs on — no system-wide capsule:install, no
+# agent:* / group:* / caps:grant, no quota:set on other principals, no
+# system:shutdown, no audit:read_all across principals. This is the whole
+# point: Claude runs as a least-authority agent, not as admin.
+#
+#   --yes                   non-interactive (no TTY in a plugin/MCP context)
+#   --inherit-from default  copy the operator's env/KV/secrets so tool
+#                           execution behaves identically, minus that authority
+#
+# We deliberately do NOT pass `--bare`: shipped astrid rejects it (the
+# distro-vs-bare distinction needs a distro-management IPC that has not landed,
+# #657), and a plain create installs no distro anyway — the per-agent distro
+# path is that same unshipped IPC, so `agent create` just writes the scoped
+# profile and returns. `--inherit-from` landed after astrid 0.8.0, so the
+# enriched form fails on an older CLI; we try it first and fall back to the
+# plain scoped create. The scoping (group `agent`) is identical either way —
+# only the env/secret carry-over is version-gated, switching on once the
+# operator's CLI is new enough.
+#
+# Idempotent + non-fatal: a re-run hits "principal already exists" (a clean
+# error, short-circuited before any state copy); both forms then fail and
+# `|| true` swallows it, so a provisioning hiccup can never wedge the session.
+# We never auto-create `default` — it is the reserved bootstrap admin identity
+# (the kernel refuses to re-create it regardless), so opting a session into it
+# is a deliberate operator choice, not something this wrapper does silently.
+#
+# NOTE (soft floor): the local socket self-stamps the principal — there is no
+# per-connection auth yet — so this scoping is an honest default, not a hard
+# boundary against a hostile in-process actor. The hard floor lands with
+# per-connection principal auth (tracked separately). It is still strictly
+# better than serving as admin: every well-behaved path is now least-authority.
+if [ -n "$PRINCIPAL" ] && [ "$PRINCIPAL" != "default" ]; then
+  log "ensuring scoped agent principal '$PRINCIPAL' exists (built-in 'agent' group)..."
+  "$ASTRID" agent create "$PRINCIPAL" --inherit-from default --yes >/dev/null 2>&1 \
+    || "$ASTRID" agent create "$PRINCIPAL" --yes >/dev/null 2>&1 \
+    || true
 fi
 
 exec "$ASTRID" mcp serve "$@"

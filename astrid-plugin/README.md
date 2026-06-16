@@ -29,8 +29,12 @@ the same `astrid mcp serve` surface.
 - **Astrid identity output-style** — *Astrid agent*: frames Claude as a
   capability-scoped, audited agent acting for a principal (coding instructions
   preserved). Enable via `/output-style`.
-- **`userConfig.principal`** — the Astrid principal this session acts as. Leave
-  blank to use the active CLI principal (`astrid mcp serve` resolves it).
+- **`userConfig.principal`** — the Astrid principal this session acts as.
+  Defaults to `claude`, a least-authority agent (built-in `agent` group:
+  self-scoped only, **not** the admin `default`), auto-provisioned on first
+  launch and decoupled from your operator CLI context (which stays `default`).
+  Set to `default` to run with admin authority, or any name to run as that
+  scoped agent; leave blank to use the active CLI principal.
 
 ## Prerequisites
 
@@ -51,8 +55,9 @@ the same `astrid mcp serve` surface.
 claude --plugin-dir /path/to/sage/astrid-plugin
 ```
 
-Set the principal once when prompted (or leave blank for the active principal).
-The daemon starts on first launch; `mcp__astrid__*` tools appear.
+Leave the principal at its `claude` default (a scoped agent, auto-provisioned
+on first launch) — or set your own. The daemon starts on first launch;
+`mcp__astrid__*` tools appear.
 
 **Distributed — your own marketplace (no Anthropic gatekeeping):**
 
@@ -94,8 +99,11 @@ it can't back.
 `tools/call` is confused-deputy gated by the sage-mcp broker: it only dispatches
 for a `source_id` listed in the broker's `trusted_ingress_ids`. Until that's
 set to the CLI uplink's id, calls are denied (fail-closed). Set it once when
-installing/configuring the sage-mcp capsule. (Single-tenant: you're admin, so
-the principal stamp is a self-stamp — fine on your own machine.)
+installing/configuring the sage-mcp capsule. (Single-tenant: you the operator
+are admin via `default`, so authorizing your own session's ingress is a
+self-stamp — fine on your own machine. The session itself runs as the scoped
+`claude` principal; until per-connection auth lands that principal stamp is
+also a soft self-stamp, so the scoping is an honest default, not a hard floor.)
 `/astrid:doctor` flags this if your calls come back denied.
 
 ## Not yet: native-action governance on the bus
