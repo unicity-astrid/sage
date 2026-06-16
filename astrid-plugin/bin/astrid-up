@@ -112,10 +112,12 @@ fi
 # fallback, never the session itself.
 SESSION_PRINCIPAL_FILE="$ASTRID_HOME_DIR/run/session.principal"
 if [ -n "$PRINCIPAL" ]; then
-  printf '%s\n' "$PRINCIPAL" > "$SESSION_PRINCIPAL_FILE" 2>/dev/null || true
+  printf '%s\n' "$PRINCIPAL" > "$SESSION_PRINCIPAL_FILE" 2>/dev/null \
+    || log "note: could not publish session principal to $SESSION_PRINCIPAL_FILE; HUD/doctor fall back to the CLI context."
 else
   # Blank → `mcp serve` resolves the active context itself; clear any stale
   # value so the displays fall back to that same context, not a past session.
+  # A missing file is the desired end state, so a failed remove is not a fault.
   rm -f "$SESSION_PRINCIPAL_FILE" 2>/dev/null || true
 fi
 
@@ -143,12 +145,16 @@ fi
 # only the env/secret carry-over is version-gated, switching on once the
 # operator's CLI is new enough.
 #
-# Idempotent + non-fatal: a re-run hits "principal already exists" (a clean
-# error, short-circuited before any state copy); both forms then fail and
-# `|| true` swallows it, so a provisioning hiccup can never wedge the session.
-# We never auto-create `default` — it is the reserved bootstrap admin identity
-# (the kernel refuses to re-create it regardless), so opting a session into it
-# is a deliberate operator choice, not something this wrapper does silently.
+# Idempotent + non-fatal, but NOT silent: a second run hits "principal already
+# exists" (benign — expected on every launch after the first) and stays quiet;
+# any OTHER failure (daemon unreachable, capability denied, …) is surfaced as a
+# WARNING on stderr so a broken provision is visible, not swallowed. It is still
+# non-fatal: serving the session matters more than wedging on a provisioning
+# hiccup, and an unprovisioned `claude` falls back to an empty profile, which is
+# MORE restrictive (zero admin caps), so the degradation fails secure on the cap
+# axis. We never auto-create `default` — it is the reserved bootstrap admin
+# identity (the kernel refuses to re-create it regardless), so opting a session
+# into it is a deliberate operator choice, not something this wrapper does.
 #
 # NOTE (soft floor): the local socket self-stamps the principal — there is no
 # per-connection auth yet — so this scoping is an honest default, not a hard
@@ -157,9 +163,21 @@ fi
 # better than serving as admin: every well-behaved path is now least-authority.
 if [ -n "$PRINCIPAL" ] && [ "$PRINCIPAL" != "default" ]; then
   log "ensuring scoped agent principal '$PRINCIPAL' exists (built-in 'agent' group)..."
-  "$ASTRID" agent create "$PRINCIPAL" --inherit-from default --yes >/dev/null 2>&1 \
-    || "$ASTRID" agent create "$PRINCIPAL" --yes >/dev/null 2>&1 \
-    || true
+  # Enriched form first (carries env/secrets, post-0.8.0); fall back to the
+  # plain scoped create. Capture output so a real failure can be reported.
+  if create_out="$("$ASTRID" agent create "$PRINCIPAL" --inherit-from default --yes 2>&1)" \
+     || create_out="$("$ASTRID" agent create "$PRINCIPAL" --yes 2>&1)"; then
+    log "scoped principal '$PRINCIPAL' ready."
+  else
+    case "$create_out" in
+      *"already exists"*)
+        : ;; # expected steady state — the principal was provisioned earlier
+      *)
+        log "WARNING: failed to provision scoped principal '$PRINCIPAL':"
+        log "  ${create_out:-<no output>}"
+        log "  serving anyway; the session may fall back to an unscoped profile." ;;
+    esac
+  fi
 fi
 
 exec "$ASTRID" mcp serve "$@"
