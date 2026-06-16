@@ -1,0 +1,96 @@
+# Distro.toml — the "Sage" distribution: Claude Code, governed by Astrid.
+#
+# Install with `astrid init --distro sage` (a bare name resolves to
+# raw.githubusercontent.com/unicity-astrid/sage/main/Distro.toml — this file at
+# the repo root). The Claude Code plugin's `astrid-up` calls this on first
+# setup so the governed-Claude capsule set is present before the daemon boots,
+# closing the cold-start "capsules not installed" gap.
+#
+# DESIGN NOTES
+#  * Unattended by construction: NO `group`s and NO `{{ var }}` templates, so
+#    neither `astrid init` stdin prompt (capsule multi-select / variable
+#    collection) fires. The plugin installs it with zero operator input.
+#  * Env propagation: the [capsule.env] tables set NON-secret config verbatim.
+#    At `astrid init` these are written to
+#    ~/.astrid/home/<principal>/.config/env/<capsule>.env.json (0600); the
+#    kernel seeds them into each capsule's scoped KV at load, so the capsule's
+#    own `env::var(...)` reads them. A distro CANNOT provision `type = "secret"`
+#    keys (those read from the SecretStore, which init never writes), so
+#    `api_key` is deliberately absent: subscription mode leaves it blank, API
+#    mode provisions it out-of-band via `astrid secret set`.
+#
+# KNOWN GAPS (core-side — this manifest is valid today but not yet installable
+# end-to-end; tracked separately):
+#  1. SOURCE DISAMBIGUATION — the three sage capsules share ONE repo
+#     (@unicity-astrid/sage). The installer currently fetches "the first
+#     .capsule asset" from a repo's latest release and cannot tell them
+#     apart. Needs a core change to match the release asset by capsule
+#     `name` (preferred — keeps the monorepo) or per-capsule repos.
+#  2. RELEASE ASSETS — no prebuilt `.capsule` release assets exist yet, so
+#     install falls back to clone+build (needs the wasm toolchain). A release
+#     pipeline producing `.capsule` assets is the blessed, no-toolchain path.
+
+schema-version = 1
+
+[distro]
+id = "sage"
+name = "Sage"
+pretty-name = "Sage (Claude on Astrid)"
+version = "0.1.0"            # bump to force re-provision (is_lock_fresh keys on id + version)
+description = "Claude Code, governed by Astrid — capsule tool broker, native-tool policy gate, and per-principal provisioning."
+maintainers = ["Joshua J. Bouw <dev@joshuajbouw.com>"]
+repository = "https://github.com/unicity-astrid/sage"
+license = "MIT OR Apache-2.0"
+astrid-version = ">=0.8.0"  # floor for the host surface sage needs (process tier, elicitation broker)
+
+# --- The uplink. Validation requires at least one capsule with role = "uplink";
+#     capsule-cli owns the Unix socket + handshake, so it is the frontend. ---
+[[capsule]]
+name = "astrid-capsule-cli"
+source = "@unicity-astrid/capsule-cli"
+version = "0.1.0"
+role = "uplink"
+
+# --- The governed-Claude-Code stack (all live in @unicity-astrid/sage). ---
+
+# Supervisor: owns kv://sage.principal.config; handles spawn / send / settings.
+# The distro flips the capsule's own defaults (headless / api_key) to the
+# plugin path (repl / subscription) via env propagation — this is the lever a
+# distro uses to configure its capsules.
+[[capsule]]
+name = "sage"
+source = "@unicity-astrid/sage"
+version = "0.1.0"
+[capsule.env]
+interaction_mode = "repl"          # you run `claude` directly (the plugin), not Astrid-driven headless
+auth_mode = "subscription"         # Claude Code uses your subscription; no API key
+
+# Broker + native-tool PreToolUse policy gate + tool discovery.
+[[capsule]]
+name = "sage-mcp"
+source = "@unicity-astrid/sage"
+version = "0.1.0"
+# policy_rules defaults to "" (no extra per-principal rules); the managed
+# settings gate is the primary policy plane. Set a JSON array of capsule-side
+# argument-level rules here if desired (see sage-mcp policy docs).
+
+# Per-principal provisioner: writes .claude/settings(.local|.managed).json,
+# .mcp.json, CLAUDE.md, and the hook block for the governed agent.
+[[capsule]]
+name = "sage-install"
+source = "@unicity-astrid/sage"
+version = "0.1.0"
+
+# NOTE: the sibling `sage-completion` capsule (Anthropic-API LLM provider —
+# "Claude as a model" for Astrid's own per-turn completions) is deliberately
+# NOT bundled here. It needs an Anthropic API key and serves the API path, not
+# this distro's subscription posture. It belongs in a provider-selection distro
+# (e.g. astralis, under a `group = "llm"` choice) once the distro secret path
+# can provision a provider key.
+
+# --- Tool surface ---
+# This base distro governs Claude's NATIVE tools (Read/Write/Bash) through the
+# sage-mcp PreToolUse gate; it does NOT bundle Astrid tool-provider capsules
+# (fs / http / shell / ...). To expose the `mcp__sage__*` broker tool surface
+# (the agent-neutral MCP backplane), add those capsules as further [[capsule]]
+# entries — optionally under a `group` for install-time multi-select.
