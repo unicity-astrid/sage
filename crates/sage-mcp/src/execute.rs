@@ -286,9 +286,7 @@ fn ingress_pending_key(source_id: &str) -> Option<String> {
 /// respond, so no TTL/sweep is needed.
 pub(crate) fn mark_ingress_pending(source_id: &str) {
     let Some(key) = ingress_pending_key(source_id) else {
-        log::warn(
-            "sage-mcp: empty source_id; not marking an ingress consent prompt as pending",
-        );
+        log::warn("sage-mcp: empty source_id; not marking an ingress consent prompt as pending");
         return;
     };
     if let Err(e) = kv::set_bytes(&key, b"1") {
