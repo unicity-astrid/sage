@@ -161,8 +161,17 @@ pub(crate) fn handle_mcp_list(payload: Value) -> Result<(), SysError> {
         return Ok(());
     };
 
-    let snapshot = discovery::collect_snapshot();
+    let started = discovery::wall_ms();
+    let (source_id, principal) = caller_fields();
+    log::info(format!(
+        "sage-mcp: broker ingress method=tools.list req_id={} source_id={source_id} \
+         principal={principal}",
+        req.req_id
+    ));
+
+    let snapshot = discovery::collect_snapshot(&req.req_id);
     let tools = discovery::to_mcp_descriptors(&snapshot);
+    let tool_count = tools.len();
 
     let reply = json!({
         "kind": "tools.list",
@@ -170,6 +179,12 @@ pub(crate) fn handle_mcp_list(payload: Value) -> Result<(), SysError> {
         "tools": tools,
     });
     publish_reply(&reply_topic, &reply);
+    log::info(format!(
+        "sage-mcp: broker response method=tools.list req_id={} outcome=ok tools={tool_count} \
+         elapsed_ms={}",
+        req.req_id,
+        discovery::wall_ms().saturating_sub(started)
+    ));
     Ok(())
 }
 
@@ -200,6 +215,8 @@ pub(crate) fn handle_mcp_call(payload: Value) -> Result<(), SysError> {
         return Ok(());
     };
 
+    let started = discovery::wall_ms();
+
     // Native-tool PreToolUse gate. A reserved, unlisted tool name Claude's
     // PreToolUse `mcp_tool` hook calls to get a binding decision for a NATIVE
     // tool (`Bash`/`Write`/…) that runs inside the claude process and so
@@ -210,7 +227,23 @@ pub(crate) fn handle_mcp_call(payload: Value) -> Result<(), SysError> {
     // `isError:true` MCP result makes the hook fail OPEN, so a deny must ride
     // in the reply `content`, never the error flag. See [`PRETOOLUSE_GATE_TOOL`].
     if req.name == PRETOOLUSE_GATE_TOOL {
+        // Out-of-band native-tool permission gate (not a routed tool call); the
+        // gated NATIVE tool is named in the arguments, not `req.name`.
+        let native = req
+            .arguments
+            .get("tool_name")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        log::info(format!(
+            "sage-mcp: broker ingress method=pretooluse_gate req_id={} tool={native}",
+            req.req_id
+        ));
         publish_reply(&reply_topic, &pretooluse_gate_reply(&req));
+        log::info(format!(
+            "sage-mcp: broker response method=pretooluse_gate req_id={} outcome=ok elapsed_ms={}",
+            req.req_id,
+            discovery::wall_ms().saturating_sub(started)
+        ));
         return Ok(());
     }
 
@@ -232,14 +265,14 @@ pub(crate) fn handle_mcp_call(payload: Value) -> Result<(), SysError> {
     // against the kernel-stamped caller source_id and lets a re-sent call
     // pass this gate. We NEVER dispatch on this path. See
     // [`execute::is_ingress_trusted`] for why `verified()` is insufficient.
-    let source_id = match runtime::caller() {
-        Ok(ctx) => ctx.source_id,
+    let (source_id, principal) = match runtime::caller() {
+        Ok(ctx) => (ctx.source_id, ctx.principal.unwrap_or_default()),
         Err(e) => {
             // No caller context — cannot attribute the ingress. Fail
             // closed rather than dispatch an unattributed mutation.
             log::warn(format!(
-                "sage-mcp: broker tool.call: no caller context, rejecting req_id '{}': {e}",
-                req.req_id
+                "sage-mcp: broker tool.call: no caller context, rejecting req_id={} tool={}: {e}",
+                req.req_id, req.name
             ));
             let reply = json!({
                 "kind": "tool.call",
@@ -253,11 +286,26 @@ pub(crate) fn handle_mcp_call(payload: Value) -> Result<(), SysError> {
             return Ok(());
         }
     };
+
+    // Ingress milestone — one concise line per accepted tool.call. Tool NAME
+    // only, never arguments (an argument may carry a secret; INFO must not
+    // leak it). `arg_count` is the cheap, non-sensitive shape signal.
+    log::info(format!(
+        "sage-mcp: broker ingress method=tool.call req_id={} source_id={source_id} \
+         principal={} tool={} arg_count={}",
+        req.req_id,
+        display_principal(&principal),
+        req.name,
+        arg_count(&req.arguments)
+    ));
+
     if !execute::is_ingress_trusted(&source_id) {
-        log::info(format!(
-            "sage-mcp: broker tool.call: ingress source_id '{source_id}' not yet trusted; \
-             requesting interactive consent for req_id '{}'",
-            req.req_id
+        // Trust decision: untrusted ingress → consent-required (WARN: a
+        // mutation was withheld pending a human accept, security-relevant).
+        log::warn(format!(
+            "sage-mcp: broker trust=consent-required req_id={} source_id={source_id} tool={}; \
+             requesting interactive consent",
+            req.req_id, req.name
         ));
         // Record that a consent prompt is now outstanding for this ingress.
         // The respond handler ([`crate::approval::handle_mcp_ingress_respond`])
@@ -282,8 +330,21 @@ pub(crate) fn handle_mcp_call(payload: Value) -> Result<(), SysError> {
             "isError": false,
         });
         publish_reply(&reply_topic, &reply);
+        log::info(format!(
+            "sage-mcp: broker response method=tool.call req_id={} outcome=consent_required \
+             tool={} elapsed_ms={}",
+            req.req_id,
+            req.name,
+            discovery::wall_ms().saturating_sub(started)
+        ));
         return Ok(());
     }
+
+    // Trust decision: source_id is a trusted ingress → proceed to dispatch.
+    log::info(format!(
+        "sage-mcp: broker trust=trusted req_id={} source_id={source_id} tool={}",
+        req.req_id, req.name
+    ));
 
     // Argument-level policy gate — the binding PDP. Evaluated in-process
     // at THIS chokepoint (the one capsule-space point holding parsed
@@ -298,9 +359,11 @@ pub(crate) fn handle_mcp_call(payload: Value) -> Result<(), SysError> {
     if let crate::policy::Decision::Deny { reason } =
         crate::policy::evaluate(&crate::policy::load_rules(), &req.name, &req.arguments)
     {
-        log::info(format!(
-            "sage-mcp: policy denied tool '{}' (req_id '{}'): {reason}",
-            req.name, req.req_id
+        // A received request that will NOT be dispatched → WARN (never silent).
+        // `rule` is the operator's static rule id, never a reflected argument.
+        log::warn(format!(
+            "sage-mcp: broker policy-deny req_id={} tool={} rule={reason}",
+            req.req_id, req.name
         ));
         let _ = ipc::publish_json(
             "sage.v1.audit.policy_deny",
@@ -315,8 +378,22 @@ pub(crate) fn handle_mcp_call(payload: Value) -> Result<(), SysError> {
             "isError": true,
         });
         publish_reply(&reply_topic, &reply);
+        log::info(format!(
+            "sage-mcp: broker response method=tool.call req_id={} outcome=policy_denied \
+             tool={} elapsed_ms={}",
+            req.req_id,
+            req.name,
+            discovery::wall_ms().saturating_sub(started)
+        ));
         return Ok(());
     }
+
+    // Routing milestone — the broker is about to dispatch the execute to the
+    // providing capsule via the routed `tool.v1.execute.<tool>` topic.
+    log::info(format!(
+        "sage-mcp: broker route req_id={} tool={} topic=tool.v1.execute.{}",
+        req.req_id, req.name, req.name
+    ));
 
     // The execute core wants a `call_id` for result correlation on the
     // shared `tool.v1.execute.<bare>.result` topic. The broker's
@@ -335,34 +412,67 @@ pub(crate) fn handle_mcp_call(payload: Value) -> Result<(), SysError> {
     // which maps the choice onto `astrid.v1.approval.response.<id>` to
     // unblock the tool. See [`crate::approval`].
     let reply = match execute::dispatch_with_approval(&req.name, &req.req_id, &req.arguments) {
-        execute::DispatchOutcome::Result(content, is_error) => json!({
-            "kind": "tool.call",
-            "req_id": req.req_id,
-            "content": mcp_content(content),
-            "isError": is_error,
-        }),
-        execute::DispatchOutcome::ApprovalRequired(required) => json!({
-            "kind": "tool.call",
-            "req_id": req.req_id,
-            // No tool result yet — the tool is parked on the approval. The
-            // shim MUST elicit the choice and respond on
-            // `astrid.v1.request.mcp.approval.respond` (echoing back the
-            // `tool_name` + `call_id` the flag carries) before a result can
-            // be produced. `content` is empty and `isError` false: this is
-            // a pending state, not a failure. The terminal result is
-            // delivered by `approval::handle_mcp_approval` once the decision
-            // lands — see [`crate::approval`]. `req.req_id` doubles as the
-            // dispatch `call_id` (it is the result-correlation token).
-            "content": mcp_content(Value::String(String::new())),
-            "isError": false,
-            "approval_required": required.to_reply_flag(&req.name, &req.req_id),
-        }),
-        execute::DispatchOutcome::Failed(message) => json!({
-            "kind": "tool.call",
-            "req_id": req.req_id,
-            "content": mcp_content(Value::String(message)),
-            "isError": true,
-        }),
+        execute::DispatchOutcome::Result(content, is_error) => {
+            log::info(format!(
+                "sage-mcp: broker response method=tool.call req_id={} tool={} outcome={} \
+                 elapsed_ms={}",
+                req.req_id,
+                req.name,
+                if is_error { "error" } else { "ok" },
+                discovery::wall_ms().saturating_sub(started)
+            ));
+            json!({
+                "kind": "tool.call",
+                "req_id": req.req_id,
+                "content": mcp_content(content),
+                "isError": is_error,
+            })
+        }
+        execute::DispatchOutcome::ApprovalRequired(required) => {
+            log::info(format!(
+                "sage-mcp: broker response method=tool.call req_id={} tool={} \
+                 outcome=approval_required elapsed_ms={}",
+                req.req_id,
+                req.name,
+                discovery::wall_ms().saturating_sub(started)
+            ));
+            json!({
+                "kind": "tool.call",
+                "req_id": req.req_id,
+                // No tool result yet — the tool is parked on the approval. The
+                // shim MUST elicit the choice and respond on
+                // `astrid.v1.request.mcp.approval.respond` (echoing back the
+                // `tool_name` + `call_id` the flag carries) before a result can
+                // be produced. `content` is empty and `isError` false: this is
+                // a pending state, not a failure. The terminal result is
+                // delivered by `approval::handle_mcp_approval` once the decision
+                // lands — see [`crate::approval`]. `req.req_id` doubles as the
+                // dispatch `call_id` (it is the result-correlation token).
+                "content": mcp_content(Value::String(String::new())),
+                "isError": false,
+                "approval_required": required.to_reply_flag(&req.name, &req.req_id),
+            })
+        }
+        execute::DispatchOutcome::Failed(message) => {
+            // A received request that could NOT be dispatched / drained (no
+            // provider, not-subscribed, dispatch error, or response timeout)
+            // → WARN, never silent. `dispatch_with_approval` collapses every
+            // such mode into a single human-readable `message`; it carries no
+            // tool arguments, only the tool name + failure reason, so it is
+            // safe to surface verbatim.
+            log::warn(format!(
+                "sage-mcp: broker no-route req_id={} tool={} reason=\"{message}\" elapsed_ms={}",
+                req.req_id,
+                req.name,
+                discovery::wall_ms().saturating_sub(started)
+            ));
+            json!({
+                "kind": "tool.call",
+                "req_id": req.req_id,
+                "content": mcp_content(Value::String(message)),
+                "isError": true,
+            })
+        }
     };
     publish_reply(&reply_topic, &reply);
     Ok(())
@@ -475,6 +585,48 @@ pub(crate) fn gate_tool_input(arguments: &Value) -> Value {
     }
 }
 
+/// Read the kernel-stamped caller attribution for ingress logging on a
+/// read-only path (`tools.list`) that does not otherwise need it. Returns
+/// `(source_id, principal)` rendered for a log line — never fails the
+/// request: a missing caller context degrades to `unknown` placeholders so
+/// observability never changes control flow. The mutating `tool.call` path
+/// keeps its own caller fetch (it fails closed on error) and does not use
+/// this.
+fn caller_fields() -> (String, String) {
+    match runtime::caller() {
+        Ok(ctx) => {
+            let principal = ctx.principal.unwrap_or_default();
+            let principal = if principal.is_empty() {
+                "unknown".to_string()
+            } else {
+                principal
+            };
+            (ctx.source_id, principal)
+        }
+        Err(_) => ("unknown".to_string(), "unknown".to_string()),
+    }
+}
+
+/// Render a principal id for a log line, mapping the empty/absent case (the
+/// SDK exposes `principal` as `Option<String>`) to a stable `unknown` tag so
+/// the `principal=` field is never blank/ambiguous when grepping.
+fn display_principal(principal: &str) -> &str {
+    if principal.is_empty() {
+        "unknown"
+    } else {
+        principal
+    }
+}
+
+/// Number of top-level tool arguments, for a non-sensitive shape signal in
+/// the ingress log. We log the COUNT, never the argument CONTENTS (a value
+/// may carry a secret). A JSON object counts its keys; any other shape
+/// (array / scalar / null) is reported as `0` — the broker's tools all take
+/// an object argument, so a non-object is the no-arguments case.
+fn arg_count(arguments: &Value) -> usize {
+    arguments.as_object().map_or(0, serde_json::Map::len)
+}
+
 /// Build the single-segment egress topic for `req_id`, or `None` if the
 /// id cannot form a clean single segment.
 ///
@@ -561,6 +713,24 @@ mod tests {
     fn reply_topic_accepts_hyphenated_uuid() {
         let id = "0191f3a2-b4c7-4d8e-9f01-234567890abc";
         assert!(reply_topic(id).is_some());
+    }
+
+    #[test]
+    fn arg_count_counts_object_keys_only() {
+        // The ingress log reports the COUNT of top-level arguments (a
+        // non-sensitive shape signal), never the values. An object counts its
+        // keys; any non-object shape is the no-arguments case (0).
+        assert_eq!(arg_count(&json!({ "a": 1, "b": 2 })), 2);
+        assert_eq!(arg_count(&json!({})), 0);
+        assert_eq!(arg_count(&Value::Null), 0);
+        assert_eq!(arg_count(&json!([1, 2, 3])), 0);
+        assert_eq!(arg_count(&json!("scalar")), 0);
+    }
+
+    #[test]
+    fn display_principal_maps_empty_to_unknown() {
+        assert_eq!(display_principal(""), "unknown");
+        assert_eq!(display_principal("user-7"), "user-7");
     }
 
     #[test]
