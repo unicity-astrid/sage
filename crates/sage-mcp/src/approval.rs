@@ -286,6 +286,11 @@ pub(crate) fn handle_mcp_approval(payload: Value) -> Result<(), SysError> {
         }
     };
 
+    log::info(format!(
+        "sage-mcp: broker ingress method=approval.respond req_id={} request_id={} tool={}",
+        req.req_id, req.request_id, req.tool_name
+    ));
+
     let reply_topic = crate::broker::reply_topic(&req.req_id);
     let Some(response_topic) = response_topic(&req.request_id) else {
         log::warn(format!(
@@ -398,6 +403,11 @@ pub(crate) fn handle_mcp_ingress_respond(payload: Value) -> Result<(), SysError>
             return Ok(());
         }
     };
+
+    log::info(format!(
+        "sage-mcp: broker ingress method=ingress.respond req_id={} accept={}",
+        req.req_id, req.accept
+    ));
 
     let reply_topic = crate::broker::reply_topic(&req.req_id);
 

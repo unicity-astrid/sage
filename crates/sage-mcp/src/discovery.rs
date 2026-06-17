@@ -67,7 +67,10 @@ const MAX_TOOLS_PER_RESPONSE: usize = 256;
 /// stale path: subscribe-before-publish fan-out, dedupe by name
 /// (last-write-wins), replace the cache, publish the new list.
 pub(crate) fn describe_tools() {
-    let snapshot = collect_snapshot();
+    // The agent-runner describe path has no proxy `req_id`; tag its fan-out
+    // logs with a stable synthetic id so they are still distinguishable from
+    // the broker `tools.list` path when grepping a shared log.
+    let snapshot = collect_snapshot("describe_tools");
     publish_tools_list(&snapshot);
 }
 
@@ -78,14 +81,18 @@ pub(crate) fn describe_tools() {
 /// broker-facing `astrid.v1.request.mcp.tools.list` handler so the two
 /// front doors run the exact same discovery + cache logic — no
 /// duplicated fan-out, dedupe, or TTL handling.
-pub(crate) fn collect_snapshot() -> Vec<McpToolDescriptor> {
+///
+/// `req_id` tags the fan-out lifecycle logs (start / per-responder / complete
+/// / incomplete) so a single `tools.list` is greppable end to end. It is a
+/// log tag only — when the cache is fresh no fan-out runs and it goes unused.
+pub(crate) fn collect_snapshot(req_id: &str) -> Vec<McpToolDescriptor> {
     let cached = cache::load();
     let now = wall_ms();
     if cached.is_fresh(now) {
         return cached.as_vec();
     }
 
-    let descriptors = discover();
+    let descriptors = discover(req_id);
     match snapshot_outcome(&descriptors) {
         // Keep the prior cache untouched and let the next call retry — see
         // [`snapshot_outcome`].
@@ -182,37 +189,67 @@ pub(crate) fn collect_tool_descriptors(payload: serde_json::Value) {
 /// Subscribe-before-publish fan-out. Mirrors the registry capsule
 /// pattern: open the subscription, fire the empty `{}` request, drain
 /// up to `DISCOVERY_TIMEOUT_MS` in `DISCOVERY_SLICE_MS` slices.
-fn discover() -> Vec<McpToolDescriptor> {
+///
+/// `req_id` is the correlation token for the originating describe request
+/// (the broker's `req_id` for a `tools.list`, or a synthesized id for the
+/// agent-runner `describe_tools` path) so the whole fan-out lifecycle —
+/// start, each responder collected, completion, and any timeout/drop — is
+/// greppable end to end. It is a LOG TAG only and never reaches the wire.
+fn discover(req_id: &str) -> Vec<McpToolDescriptor> {
+    let started = wall_ms();
     let sub = match ipc::subscribe(DESCRIBE_RESPONSE_PATTERN) {
         Ok(s) => s,
         Err(e) => {
             log::warn(format!(
-                "sage-mcp: failed to subscribe to {DESCRIBE_RESPONSE_PATTERN}: {e}"
+                "sage-mcp: broker fan-out subscribe failed req_id={req_id} \
+                 topic={DESCRIBE_RESPONSE_PATTERN}: {e}"
             ));
             return Vec::new();
         }
     };
 
+    log::info(format!(
+        "sage-mcp: broker fan-out start req_id={req_id} deadline_ms={DISCOVERY_TIMEOUT_MS}"
+    ));
+
     if let Err(e) = ipc::publish(DESCRIBE_REQUEST_TOPIC, "{}") {
         log::warn(format!(
-            "sage-mcp: failed to publish {DESCRIBE_REQUEST_TOPIC}: {e}"
+            "sage-mcp: broker fan-out publish failed req_id={req_id} \
+             topic={DESCRIBE_REQUEST_TOPIC}: {e}"
         ));
         return Vec::new();
     }
 
     let mut acc: Vec<McpToolDescriptor> = Vec::new();
     let mut seen_any = false;
+    // Count of distinct responder source_ids whose describe broadcast we
+    // collected, plus the cumulative dropped/lagged signal the bus reports —
+    // these feed the completion / incomplete WARN below so a first-call
+    // fan-out drop is visible rather than silent.
+    let mut responders: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut dropped: u64 = 0;
+    let mut lagged: u64 = 0;
     let mut remaining = DISCOVERY_TIMEOUT_MS;
     loop {
         let step = remaining.min(DISCOVERY_SLICE_MS);
         match sub.recv(step) {
             Ok(result) if !result.messages.is_empty() => {
                 seen_any = true;
+                dropped = dropped.saturating_add(result.dropped);
+                lagged = lagged.saturating_add(result.lagged);
                 for msg in &result.messages {
                     let Ok(value) = serde_json::from_str::<serde_json::Value>(&msg.payload) else {
                         continue;
                     };
-                    acc.extend(parse_describe_response(&value));
+                    let tools = parse_describe_response(&value);
+                    responders.insert(msg.source_id.clone());
+                    log::debug(format!(
+                        "sage-mcp: broker fan-out collected req_id={req_id} \
+                         responder={} tool_count={}",
+                        msg.source_id,
+                        tools.len()
+                    ));
+                    acc.extend(tools);
                 }
             }
             // A quiet slice — the host returned early-empty, OR `recv` timed
@@ -222,7 +259,15 @@ fn discover() -> Vec<McpToolDescriptor> {
             // until the budget closes rather than breaking at the first 100 ms
             // gap — otherwise widening `DISCOVERY_TIMEOUT_MS` buys nothing,
             // because the loop would bail before the first response arrives.
-            Ok(_) | Err(_) => {
+            Ok(result) => {
+                // Quiet but non-error slice may still carry drop/lag counters.
+                dropped = dropped.saturating_add(result.dropped);
+                lagged = lagged.saturating_add(result.lagged);
+                if seen_any {
+                    break;
+                }
+            }
+            Err(_) => {
                 if seen_any {
                     break;
                 }
@@ -240,6 +285,30 @@ fn discover() -> Vec<McpToolDescriptor> {
     let mut seen = std::collections::HashSet::new();
     acc.retain(|d| seen.insert(d.name.clone()));
     acc.reverse();
+
+    let elapsed = wall_ms().saturating_sub(started);
+    let timed_out = remaining == 0;
+    // Incomplete iff the bus dropped/lagged messages (a responder's reply was
+    // missed), OR we exhausted the whole budget without quiescence (a slow /
+    // never-replying responder — the known first-call fan-out drop). Either
+    // way the answer below may be missing tools, so surface it at WARN rather
+    // than letting an under-count look like a clean result.
+    if dropped > 0 || lagged > 0 || (timed_out && !seen_any) {
+        log::warn(format!(
+            "sage-mcp: broker fan-out incomplete req_id={req_id} responders={} tools={} \
+             dropped={dropped} lagged={lagged} timed_out={timed_out} elapsed_ms={elapsed}",
+            responders.len(),
+            acc.len()
+        ));
+    } else {
+        log::info(format!(
+            "sage-mcp: broker fan-out complete req_id={req_id} responders={} tools={} \
+             elapsed_ms={elapsed}",
+            responders.len(),
+            acc.len()
+        ));
+    }
+
     acc
 }
 
@@ -359,8 +428,10 @@ fn publish_tools_list(descriptors: &[McpToolDescriptor]) {
     }
 }
 
-/// Wall-clock millis used for cache TTL bookkeeping.
-fn wall_ms() -> u64 {
+/// Wall-clock millis used for cache TTL bookkeeping and lifecycle-log
+/// elapsed measurement. `pub(crate)` so the broker / execute paths measure
+/// elapsed against the same monotone-ish wall clock — one definition.
+pub(crate) fn wall_ms() -> u64 {
     time::now()
         .ok()
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
