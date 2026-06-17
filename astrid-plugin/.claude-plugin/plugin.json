@@ -15,9 +15,9 @@
     "principal": {
       "type": "string",
       "title": "Astrid principal",
-      "description": "The Astrid principal this Claude Code session acts as. Scopes tool execution, capability checks, and audit to this identity. Defaults to 'claude' — a least-authority agent (built-in 'agent' group: self-scoped only, NOT the admin 'default'), auto-provisioned on first launch. Set to 'default' to run with admin authority, or any name to run as that scoped agent. Run `astrid agent list` to see principals.",
+      "description": "The Astrid principal this Claude Code session acts as. Scopes tool execution, capability checks, and audit to this identity. Defaults to 'claude-code' — a least-authority agent in the 'claude' family group (self-scoped only, NOT the admin 'default'), auto-provisioned on first launch. Set to 'default' to run with admin authority, or any name to run as that scoped agent. Run `astrid agent list` to see principals.",
       "required": true,
-      "default": "claude"
+      "default": "claude-code"
     }
   }
 }

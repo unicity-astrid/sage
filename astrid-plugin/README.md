@@ -55,8 +55,9 @@ the same `astrid mcp serve` surface.
 claude --plugin-dir /path/to/sage/astrid-plugin
 ```
 
-Leave the principal at its `claude` default (a scoped agent, auto-provisioned
-on first launch) — or set your own. The daemon starts on first launch;
+Leave the principal at its `claude-code` default (a scoped agent in the `claude`
+family group, auto-provisioned on first launch) — or set your own. The daemon
+starts on first launch;
 `mcp__astrid__*` tools appear.
 
 **Distributed — your own marketplace (no Anthropic gatekeeping):**
@@ -102,7 +103,7 @@ set to the CLI uplink's id, calls are denied (fail-closed). Set it once when
 installing/configuring the sage-mcp capsule. (Single-tenant: you the operator
 are admin via `default`, so authorizing your own session's ingress is a
 self-stamp — fine on your own machine. The session itself runs as the scoped
-`claude` principal; until per-connection auth lands that principal stamp is
+`claude-code` principal; until per-connection auth lands that principal stamp is
 also a soft self-stamp, so the scoping is an honest default, not a hard floor.)
 `/astrid:doctor` flags this if your calls come back denied.
 
