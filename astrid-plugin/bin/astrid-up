@@ -121,40 +121,46 @@ else
   rm -f "$SESSION_PRINCIPAL_FILE" 2>/dev/null || true
 fi
 
-# Provision the session principal as a SCOPED agent before serving as it.
-# `astrid agent create` with no `--group` lands the principal in the built-in
-# `agent` group: self-scoped capabilities (`self:*`, `delegate:self:*`) and
-# NONE of the admin-meta surface the `default` principal holds via the `admin`
-# group (`*`). So the governed Claude session can drive its own tools but
-# cannot administer the OS it runs on — no system-wide capsule:install, no
-# agent:* / group:* / caps:grant, no quota:set on other principals, no
-# system:shutdown, no audit:read_all across principals. This is the whole
-# point: Claude runs as a least-authority agent, not as admin.
+# Provision the session principal as a SCOPED agent before serving as it, placed
+# in the `claude` FAMILY group rather than the generic built-in `agent` tier.
+# The `claude` group is a custom, operator-manageable group carrying the same
+# self-scoped baseline the built-in `agent` group grants (`self:*`,
+# `delegate:self:*`): self-service over the principal's OWN session/quota/KV plus
+# recursive delegation, and NONE of the admin-meta surface the `default`
+# principal holds via the `admin` group (`*`). So the governed Claude session can
+# drive its own tools but cannot administer the OS it runs on — no system-wide
+# capsule:install, no agent:* / group:* / caps:grant, no quota:set on other
+# principals, no system:shutdown, no audit:read_all across principals. Claude
+# runs as a least-authority agent, not as admin.
 #
+# Why a named `claude` group instead of the built-in `agent`: it is the Claude
+# product FAMILY identity. Per-product principals (claude-code here; claude-chat,
+# cowork later) share this one baseline and diverge via per-principal
+# grants/revokes (precedence: revokes > grants > group). An operator can re-tune
+# the whole family's authority in one place — `astrid group modify claude
+# --add-caps ...` propagates live to every member on its next check — while the
+# built-in `agent` tier stays the generic fallback for non-Claude agents.
+#
+#   group create claude --caps self:*,delegate:self:*   the family baseline
+#   agent create <p> --group claude --yes               scoped principal in it
 #   --yes                   non-interactive (no TTY in a plugin/MCP context)
-#   --inherit-from default  copy the operator's env/KV/secrets so tool
-#                           execution behaves identically, minus that authority
+#   --inherit-from default  copy the operator's env/KV/secrets so tool execution
+#                           behaves identically, minus that authority. Landed
+#                           after astrid 0.8.0; on an older CLI it is rejected and
+#                           we fall back to the plain scoped create. The scoping
+#                           (group `claude`) is identical either way — only the
+#                           env/secret carry-over is version-gated.
 #
-# We deliberately do NOT pass `--bare`: shipped astrid rejects it (the
-# distro-vs-bare distinction needs a distro-management IPC that has not landed,
-# #657), and a plain create installs no distro anyway — the per-agent distro
-# path is that same unshipped IPC, so `agent create` just writes the scoped
-# profile and returns. `--inherit-from` landed after astrid 0.8.0, so the
-# enriched form fails on an older CLI; we try it first and fall back to the
-# plain scoped create. The scoping (group `agent`) is identical either way —
-# only the env/secret carry-over is version-gated, switching on once the
-# operator's CLI is new enough.
-#
-# Idempotent + non-fatal, but NOT silent: a second run hits "principal already
-# exists" (benign — expected on every launch after the first) and stays quiet;
-# any OTHER failure (daemon unreachable, capability denied, …) is surfaced as a
-# WARNING on stderr so a broken provision is visible, not swallowed. It is still
-# non-fatal: serving the session matters more than wedging on a provisioning
-# hiccup, and an unprovisioned `claude` falls back to an empty profile, which is
-# MORE restrictive (zero admin caps), so the degradation fails secure on the cap
-# axis. We never auto-create `default` — it is the reserved bootstrap admin
-# identity (the kernel refuses to re-create it regardless), so opting a session
-# into it is a deliberate operator choice, not something this wrapper does.
+# Idempotent + non-fatal, but NOT silent: a second run hits "already exists"
+# (benign — expected on every launch after the first) and stays quiet; any OTHER
+# failure (daemon unreachable, capability denied, …) is surfaced as a WARNING on
+# stderr so a broken provision is visible, not swallowed. Still non-fatal:
+# serving the session matters more than wedging on a provisioning hiccup, and an
+# unprovisioned principal falls back to an empty profile (zero caps) — MORE
+# restrictive, so the degradation fails secure on the cap axis. We never
+# auto-create `default` — the reserved bootstrap admin identity (the kernel
+# refuses to re-create it regardless) — so opting a session into it is a
+# deliberate operator choice, not something this wrapper does.
 #
 # NOTE (soft floor): the local socket self-stamps the principal — there is no
 # per-connection auth yet — so this scoping is an honest default, not a hard
@@ -162,11 +168,41 @@ fi
 # per-connection principal auth (tracked separately). It is still strictly
 # better than serving as admin: every well-behaved path is now least-authority.
 if [ -n "$PRINCIPAL" ] && [ "$PRINCIPAL" != "default" ]; then
-  log "ensuring scoped agent principal '$PRINCIPAL' exists (built-in 'agent' group)..."
-  # Enriched form first (carries env/secrets, post-0.8.0); fall back to the
-  # plain scoped create. Capture output so a real failure can be reported.
-  if create_out="$("$ASTRID" agent create "$PRINCIPAL" --inherit-from default --yes 2>&1)" \
-     || create_out="$("$ASTRID" agent create "$PRINCIPAL" --yes 2>&1)"; then
+  # Ensure the `claude` family group exists before placing the principal in it.
+  # CREATE-IF-ABSENT, never reconcile: we only `group create` when `group show`
+  # reports it missing, so an operator who later retunes the group
+  # (`astrid group modify claude --add-caps/--remove-caps`) keeps that change —
+  # a subsequent launch sees the group present and skips the create entirely.
+  # Belt & suspenders: `group create` is create-only (the kernel rejects a
+  # redundant create as "declares ... more than once"), so it can NEVER overwrite
+  # existing caps even if the `group show` guard is lost to a race. Likewise the
+  # `agent create` below no-ops on an existing principal, so an operator's group
+  # reassignment of the principal also survives.
+  if ! "$ASTRID" group show claude >/dev/null 2>&1; then
+    if group_out="$("$ASTRID" group create claude \
+        --caps "self:*,delegate:self:*" \
+        --description "Claude product family — self-scoped baseline" 2>&1)"; then
+      log "created the 'claude' capability group (self-scoped baseline)."
+    else
+      case "$group_out" in
+        # Exists already, or a concurrent launch won the create between our
+        # `group show` guard and here — both benign. The kernel reports a
+        # redundant create as "declares ... more than once", not "exists".
+        *"already exists"*|*"more than once"*) : ;;
+        *)
+          log "WARNING: could not create the 'claude' group:"
+          log "  ${group_out:-<no output>}"
+          log "  '$PRINCIPAL' may fall back to an unscoped profile." ;;
+      esac
+    fi
+  fi
+
+  log "ensuring scoped agent principal '$PRINCIPAL' exists (group 'claude')..."
+  # Enriched form first (carries env/secrets, post-0.8.0); fall back to the plain
+  # scoped create. Both place the principal in the `claude` group. Capture output
+  # so a real failure can be reported.
+  if create_out="$("$ASTRID" agent create "$PRINCIPAL" --group claude --inherit-from default --yes 2>&1)" \
+     || create_out="$("$ASTRID" agent create "$PRINCIPAL" --group claude --yes 2>&1)"; then
     log "scoped principal '$PRINCIPAL' ready."
   else
     case "$create_out" in
