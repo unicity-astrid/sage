@@ -36,7 +36,7 @@ schema-version = 1
 id = "sage"
 name = "Sage"
 pretty-name = "Sage (Claude on Astrid)"
-version = "0.1.0"            # bump to force re-provision (is_lock_fresh keys on id + version)
+version = "0.1.1"            # bump to force re-provision (is_lock_fresh keys on id + version)
 description = "Claude Code, governed by Astrid — capsule tool broker, native-tool policy gate, and per-principal provisioning."
 maintainers = ["Joshua J. Bouw <dev@joshuajbouw.com>"]
 repository = "https://github.com/unicity-astrid/sage"
@@ -79,6 +79,13 @@ version = "0.1.0"
 [[capsule]]
 name = "sage-install"
 source = "@unicity-astrid/sage"
+version = "0.1.0"
+
+# Capsule-authoring forge: the self-contained authoring Skill + tools so a
+# fresh Claude knows how to build a capsule (SDK, WIT, Capsule.toml).
+[[capsule]]
+name = "astrid-capsule-forge"
+source = "@unicity-astrid/capsule-forge"
 version = "0.1.0"
 
 # NOTE: the sibling `sage-completion` capsule (Anthropic-API LLM provider —
