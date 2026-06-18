@@ -26,6 +26,13 @@ the same `astrid mcp serve` surface.
 - **`/astrid:*` commands** — `/astrid:whoami`, `/astrid:status`,
   `/astrid:capsules`, `/astrid:doctor`, `/astrid:hud`. Read-only operator
   views, backed by the `astrid` CLI.
+- **Capsule-authoring skill** (`skills/forge/SKILL.md` → `/astrid:forge`) — the
+  complete, self-contained guide to writing an Astrid capsule: the minimal file
+  set, the `#[capsule]`/`#[astrid::tool]` macros, `Capsule.toml` + the bus ACL,
+  the build→install→call loop, and every footgun. Auto-invokes when you ask to
+  create or build a capsule, and pairs with the daemon's forge tools
+  (`scaffold_capsule`, `validate_manifest`, `capsule_doctor`, …) when the forge
+  capsule is loaded.
 - **Astrid identity output-style** — *Astrid agent*: frames Claude as a
   capability-scoped, audited agent acting for a principal (coding instructions
   preserved). Enable via `/output-style`.
