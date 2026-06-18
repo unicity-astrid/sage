@@ -18,9 +18,16 @@ the same `astrid mcp serve` surface.
   **ephemeral** mode: it self-cleans ~30s after the last client disconnects, so
   it lives exactly as long as the editor. An already-running daemon (persistent
   or shared with another session) is reused untouched.
+- **Runtime bootstrapper** (`bin/astrid-install`) — installs the Astrid runtime
+  (`astrid` + `astrid-daemon`) via Homebrew, or a prebuilt release binary into
+  `~/.astrid/bin`, so the runtime is not a manual prerequisite. Invoked
+  *explicitly* — by you, or by Claude when the SessionStart doctor flags Astrid
+  missing — never silently at boot (the MCP server has no TTY and owns stdout for
+  JSON-RPC, so it can't prompt or install behind your back).
 - **SessionStart doctor** (`hooks/hooks.json` → `bin/astrid-doctor`) — at
   session start, injects who you are (principal), what governs you, and the
-  daemon/broker readiness state into context, with the exact fix for any gap.
+  daemon/broker readiness state into context, with the exact fix for any gap
+  (including offering to run the bootstrapper when Astrid isn't installed).
 - **Astrid HUD status line** (`bin/astrid-statusline`) — overlays your principal
   and daemon state onto Claude Code's bottom bar (see *HUD* below).
 - **`/astrid:*` commands** — `/astrid:whoami`, `/astrid:status`,
@@ -38,11 +45,12 @@ the same `astrid mcp serve` surface.
 
 ## Prerequisites
 
-- The `astrid` CLI installed and on `PATH` (or at `~/.astrid/bin/astrid`),
-  **built from a revision that has `astrid mcp serve`**. The plugin can't
-  bootstrap the runtime itself — it wires Claude Code to an Astrid that already
-  exists. (`astrid-daemon` must sit next to `astrid`, or on `PATH`, for the
-  ephemeral boot.)
+- The **Astrid runtime** (`astrid` + `astrid-daemon`) on `PATH` or at
+  `~/.astrid/bin/`, **from a revision that has `astrid mcp serve`**. Don't have
+  it? You no longer have to seek it out: the plugin ships `bin/astrid-install`
+  (Homebrew, or a prebuilt release binary) and the SessionStart doctor offers to
+  run it for you when it's missing — so the runtime is not a hard prerequisite.
+  (Or install it yourself: `brew install unicity-astrid/tap/astrid`.)
 - The **sage-mcp broker** capsule loaded in the daemon (it answers
   `astrid.v1.request.mcp.*`). Without it, the server connects but lists no
   tools. `/astrid:doctor` tells you if it's missing.

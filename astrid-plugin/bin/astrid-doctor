@@ -55,10 +55,17 @@ emit() {
   fi
 }
 
-# astrid not installed at all — actionable, non-fatal.
+# astrid not installed — actionable, non-fatal. Surface the plugin's installer
+# so the agent can offer to run it in-conversation. This IS the consent surface:
+# bin/astrid-up can't install at MCP-server boot (no TTY, stdout is JSON-RPC), so
+# the human sees the install proposed and run here, deliberately.
 if [ ! -x "$ASTRID" ]; then
-  emit "Astrid is not installed (no 'astrid' binary on PATH or at ~/.astrid/bin/astrid).
-Install the Astrid runtime, then restart this session. The Astrid plugin can't bootstrap the runtime itself — it only wires Claude Code to an Astrid that already exists."
+  INSTALLER="$(dirname "$0")/astrid-install"
+  emit "Astrid is not installed (no 'astrid' binary on PATH or at ~/.astrid/bin/astrid), so this session has no Astrid tools yet.
+Fix: run the plugin's bootstrapper, which installs the Astrid runtime (astrid + astrid-daemon) via Homebrew or a prebuilt release binary, then start a new session:
+    $INSTALLER
+(Manual alternative: brew install unicity-astrid/tap/astrid)
+The user can run that, or you may offer to run the installer for them."
   exit 0
 fi
 

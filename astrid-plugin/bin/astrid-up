@@ -30,7 +30,21 @@ log() { printf 'astrid-up: %s\n' "$*" >&2; }
 ASTRID="$(command -v astrid 2>/dev/null || true)"
 [ -n "$ASTRID" ] || ASTRID="$HOME/.astrid/bin/astrid"
 if [ ! -x "$ASTRID" ]; then
-  log "cannot find the 'astrid' binary (not on PATH, not at $HOME/.astrid/bin/astrid). Install Astrid first."
+  # Astrid isn't installed. We deliberately do NOT install it from here: this
+  # process IS the MCP stdio server (no TTY, stdout is the JSON-RPC transport),
+  # so prompting for consent is impossible and a long install would wedge MCP
+  # startup or corrupt the protocol framing. Point at the explicit bootstrapper
+  # instead — the SessionStart doctor surfaces the same, so Claude can offer to
+  # run it in-conversation, which is where install consent belongs.
+  INSTALLER="$(dirname "$0")/astrid-install"
+  log "the 'astrid' runtime is not installed (no binary on PATH or at $HOME/.astrid/bin/astrid)."
+  if [ -x "$INSTALLER" ]; then
+    log "install it with this plugin's bootstrapper, then start a new session:"
+    log "    $INSTALLER"
+    log "  (or: brew install unicity-astrid/tap/astrid)"
+  else
+    log "install it (brew install unicity-astrid/tap/astrid), then start a new session."
+  fi
   exit 127
 fi
 
