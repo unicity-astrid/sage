@@ -37,11 +37,12 @@ the same `astrid mcp serve` surface.
   capability-scoped, audited agent acting for a principal (coding instructions
   preserved). Enable via `/output-style`.
 - **`userConfig.principal`** — the Astrid principal this session acts as.
-  Defaults to `claude`, a least-authority agent (built-in `agent` group:
-  self-scoped only, **not** the admin `default`), auto-provisioned on first
-  launch and decoupled from your operator CLI context (which stays `default`).
-  Set to `default` to run with admin authority, or any name to run as that
-  scoped agent; leave blank to use the active CLI principal.
+  Defaults to `claude-code`, a least-authority agent in the custom `claude`
+  family group (self-scoped baseline `self:*,delegate:self:*`, **not** the admin
+  `default`), auto-provisioned on first launch and decoupled from your operator
+  CLI context (which stays `default`). Set to `default` to run with admin
+  authority, or any name to run as that scoped agent; clearing it falls back to
+  the least-authority `claude-code` — never the admin `default`.
 
 ## Prerequisites
 
@@ -110,8 +111,11 @@ set to the CLI uplink's id, calls are denied (fail-closed). Set it once when
 installing/configuring the sage-mcp capsule. (Single-tenant: you the operator
 are admin via `default`, so authorizing your own session's ingress is a
 self-stamp — fine on your own machine. The session itself runs as the scoped
-`claude-code` principal; until per-connection auth lands that principal stamp is
-also a soft self-stamp, so the scoping is an honest default, not a hard floor.)
+`claude-code` principal, and per-connection auth has since landed: `agent create`
+mints a per-principal ed25519 keypair and `astrid mcp serve` signs the socket
+handshake with it, so the daemon cryptographically binds the connection to that
+principal — the scoping is now an enforced floor, not just an honest default. A
+connection that can't sign is stamped the no-capability `anonymous` (fail-closed).)
 `/astrid:doctor` flags this if your calls come back denied.
 
 ## Not yet: native-action governance on the bus
