@@ -162,11 +162,14 @@ fi
 # refuses to re-create it regardless) — so opting a session into it is a
 # deliberate operator choice, not something this wrapper does.
 #
-# NOTE (soft floor): the local socket self-stamps the principal — there is no
-# per-connection auth yet — so this scoping is an honest default, not a hard
-# boundary against a hostile in-process actor. The hard floor lands with
-# per-connection principal auth (tracked separately). It is still strictly
-# better than serving as admin: every well-behaved path is now least-authority.
+# NOTE (hard floor): per-connection principal auth has LANDED. `agent create`
+# mints a per-principal ed25519 keypair (keys/<p>.key in system custody + a
+# registered public key on the profile) and `astrid mcp serve` signs the socket
+# handshake challenge with it, so the daemon CRYPTOGRAPHICALLY binds this
+# connection to PRINCIPAL. A connection that cannot sign is stamped the
+# no-capability `anonymous` (fail-closed: a bad signature fails the handshake,
+# never falls back to unauthenticated). The scoping below is therefore an
+# enforced boundary, not just an honest default.
 if [ -n "$PRINCIPAL" ] && [ "$PRINCIPAL" != "default" ]; then
   # Ensure the `claude` family group exists before placing the principal in it.
   # CREATE-IF-ABSENT, never reconcile: we only `group create` when `group show`
@@ -207,7 +210,28 @@ if [ -n "$PRINCIPAL" ] && [ "$PRINCIPAL" != "default" ]; then
   else
     case "$create_out" in
       *"already exists"*)
-        : ;; # expected steady state — the principal was provisioned earlier
+        # The principal was provisioned earlier — the EXPECTED steady state. But
+        # a principal created BEFORE per-connection auth landed is keyless, and
+        # the shaped create above can NEVER heal it: any profile-shaping input
+        # (`--group`, `--inherit-from`) makes `agent create` keep the hard
+        # "already exists" error instead of backfilling. The kernel backfills a
+        # missing keypair ONLY on a BARE re-create (no shaping inputs), so make
+        # that bare call now. Idempotent + security-positive: a keyless upgrader
+        # gains its keypair (moving from a `anonymous`-stamped connection to its
+        # own scoped identity); an already-keyed principal just re-reports
+        # "already exists" (benign — the steady state on every later launch).
+        if heal_out="$("$ASTRID" agent create "$PRINCIPAL" --yes 2>&1)"; then
+          log "backfilled the missing keypair for existing principal '$PRINCIPAL'."
+        else
+          case "$heal_out" in
+            *"already exists"*) : ;; # already keyed — nothing to heal
+            *)
+              log "WARNING: keypair backfill for '$PRINCIPAL' did not complete:"
+              log "  ${heal_out:-<no output>}"
+              log "  the session may be stamped 'anonymous' until '$PRINCIPAL' has a keypair." ;;
+          esac
+        fi
+        ;;
       *)
         log "WARNING: failed to provision scoped principal '$PRINCIPAL':"
         log "  ${create_out:-<no output>}"
