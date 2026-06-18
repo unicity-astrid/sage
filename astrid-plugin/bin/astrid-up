@@ -88,19 +88,29 @@ fi
 # `${user_config.principal}` arg from .mcp.json: a configured value arrives as
 # `--principal <name>`; a blank one (operator cleared it) collapses to a lone
 # `--principal` with no value.
+# A cleared principal defaults to this least-authority family identity (see the
+# blank-principal handling below), NOT the admin `default`.
+LEAST_AUTHORITY_PRINCIPAL="claude-code"
 PRINCIPAL=""
 [ "${1:-}" = "--principal" ] && PRINCIPAL="${2:-}"
 
-# Blank principal: drop the dangling flag so `astrid mcp serve` resolves the
-# active CLI principal itself (context::resolve_agent → active agent context,
-# else `default`). Claude Code expands a blank `${user_config.principal}` and
-# DROPS the empty value, so the server is invoked as `astrid-up --principal`
-# (one arg), not `--principal ""` (two). A blind `shift 2` then over-shifts
-# and aborts under `set -eu`, killing the MCP server — so drop the flag, and
-# the empty value only if it was actually passed.
+# Blank principal: the operator cleared `${user_config.principal}`, which Claude
+# Code collapses to a lone `--principal` with no value. Do NOT fall through to
+# `astrid mcp serve`'s bare resolution (context::resolve_agent → active agent
+# context, else `default`): `default` is the ADMIN bootstrap identity, so a
+# cleared principal would silently serve the governed Claude with admin
+# authority — a privilege footgun. Default a cleared principal to the
+# least-authority family identity instead, and re-inject it as an explicit
+# `--principal` so the provisioning + exec below act as it; an operator who
+# deliberately wants admin passes `--principal default`. (Claude Code DROPS the
+# empty value, so the server is invoked as `astrid-up --principal` (one arg),
+# not `--principal ""` (two); a blind `shift 2` would over-shift and abort under
+# `set -eu`.)
 if [ "${1:-}" = "--principal" ] && [ -z "$PRINCIPAL" ]; then
   shift
   [ "$#" -gt 0 ] && shift
+  PRINCIPAL="$LEAST_AUTHORITY_PRINCIPAL"
+  set -- --principal "$PRINCIPAL" "$@"
 fi
 
 # Publish the resolved session principal for the read-only display surfaces
