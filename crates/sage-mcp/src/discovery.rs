@@ -186,6 +186,84 @@ pub(crate) fn collect_tool_descriptors(payload: serde_json::Value) {
     publish_tools_list(&merged);
 }
 
+/// Handle the kernel's `astrid.v1.capsules_loaded` signal.
+///
+/// The kernel includes each loaded capsule's installed `meta.json` (opaque) in
+/// the payload under `capsules[].meta`. When EVERY loaded capsule has a
+/// **captured** tool surface (`meta.tools` present — whether `[..]` or `[]`),
+/// the broker rebuilds its cache purely from that static set: deterministic, no
+/// describe fan-out, so the first `tools/list` after boot is already complete
+/// (this is where the cold-start fan-out race dies). If ANY capsule's surface
+/// is uncaptured (built before tool-baking, or its `meta` could not be read),
+/// the static set would be incomplete, so we fall back to invalidating the
+/// cache and let the next `tools/list` re-discover via the fan-out. As the
+/// fleet rebuilds with baked tools it tips into the deterministic path
+/// automatically, with no missing-tool window in between.
+pub(crate) fn on_capsules_loaded(payload: serde_json::Value) {
+    match static_tools_from_payload(&payload) {
+        Some(descriptors) => {
+            // Authoritative, complete surface — replace the cache and publish
+            // so the agent-runner view refreshes too (the broker shim
+            // separately re-fetches `tools/list` on this same signal).
+            let count = descriptors.len();
+            let snapshot = cache::replace(descriptors).as_vec();
+            log::info(format!(
+                "sage-mcp: tool cache rebuilt from static capsule metadata ({count} tools); describe fan-out skipped"
+            ));
+            publish_tools_list(&snapshot);
+        }
+        None => {
+            // At least one uncaptured surface — discover at runtime.
+            log::info(
+                "sage-mcp: capsule-set change includes an uncaptured tool surface; cache invalidated for fan-out rediscovery",
+            );
+            cache::invalidate();
+        }
+    }
+}
+
+/// Assemble the union of every loaded capsule's build-captured tool descriptors
+/// from a `capsules_loaded` payload — but only if EVERY capsule's surface is
+/// captured.
+///
+/// Returns `None` (caller falls back to the fan-out) when the payload predates
+/// the enriched-metadata kernel (no `capsules` array), or when any capsule's
+/// `meta` is missing / `null` (the kernel could not read it) or carries no
+/// `tools` array (a capsule built before tool-baking). A capsule with
+/// `tools: []` is authoritatively tool-less — it contributes nothing without
+/// disqualifying the static path.
+fn static_tools_from_payload(payload: &serde_json::Value) -> Option<Vec<McpToolDescriptor>> {
+    let capsules = payload.get("capsules")?.as_array()?;
+    let mut all = Vec::new();
+    for capsule in capsules {
+        // `meta` absent / null => the kernel could not read this capsule's
+        // `meta.json` => unknown surface => disqualify the static path.
+        let meta = capsule.get("meta").filter(|m| !m.is_null())?;
+        // `tools` absent / non-array => not captured => unknown.
+        let tools = meta.get("tools")?.as_array()?;
+        for tool in tools {
+            let Some(name) = tool.get("name").and_then(serde_json::Value::as_str) else {
+                continue;
+            };
+            all.push(McpToolDescriptor {
+                name: name.to_string(),
+                title: None,
+                description: tool
+                    .get("description")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                input_schema: tool
+                    .get("input_schema")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null),
+                capabilities: None,
+            });
+        }
+    }
+    Some(all)
+}
+
 /// Subscribe-before-publish fan-out. Mirrors the registry capsule
 /// pattern: open the subscription, fire the empty `{}` request, drain
 /// up to `DISCOVERY_TIMEOUT_MS` in `DISCOVERY_SLICE_MS` slices.
@@ -440,7 +518,78 @@ pub(crate) fn wall_ms() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+
     use super::*;
+
+    #[test]
+    fn static_tools_all_captured_unions_descriptors() {
+        // Two capsules, both captured: one with a tool, one authoritatively
+        // tool-less (`tools: []`). The union is the single tool; the empty
+        // capsule does not disqualify the static path.
+        let payload = json!({
+            "status": "ready",
+            "capsules": [
+                { "name": "fs", "meta": { "tools": [
+                    { "name": "read_file", "description": "Read a file",
+                      "input_schema": { "type": "object" } }
+                ] } },
+                { "name": "cli", "meta": { "tools": [] } },
+            ],
+        });
+        let tools = static_tools_from_payload(&payload).expect("all captured -> Some");
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].name, "read_file");
+        assert_eq!(tools[0].description, "Read a file");
+        assert_eq!(tools[0].input_schema, json!({ "type": "object" }));
+    }
+
+    #[test]
+    fn static_tools_any_uncaptured_is_none() {
+        // One captured, one with no `tools` key (built before tool-baking).
+        let payload = json!({
+            "status": "ready",
+            "capsules": [
+                { "name": "fs", "meta": { "tools": [ { "name": "read_file" } ] } },
+                { "name": "legacy", "meta": { "version": "0.1.0" } },
+            ],
+        });
+        assert!(static_tools_from_payload(&payload).is_none());
+    }
+
+    #[test]
+    fn static_tools_null_meta_is_none() {
+        // The kernel could not read this capsule's meta.json.
+        let payload = json!({
+            "status": "ready",
+            "capsules": [ { "name": "broken", "meta": serde_json::Value::Null } ],
+        });
+        assert!(static_tools_from_payload(&payload).is_none());
+    }
+
+    #[test]
+    fn static_tools_null_tools_is_none() {
+        // Explicit `tools: null` is the wire form of `None` (uncaptured).
+        let payload = json!({
+            "status": "ready",
+            "capsules": [ { "name": "x", "meta": { "tools": serde_json::Value::Null } } ],
+        });
+        assert!(static_tools_from_payload(&payload).is_none());
+    }
+
+    #[test]
+    fn static_tools_legacy_payload_without_capsules_is_none() {
+        // A pre-enrichment kernel publishes a bare `{status:"ready"}`.
+        let payload = json!({ "status": "ready" });
+        assert!(static_tools_from_payload(&payload).is_none());
+    }
+
+    #[test]
+    fn static_tools_no_capsules_loaded_is_empty_some() {
+        // An empty (but present) capsules array is "all captured, zero tools".
+        let payload = json!({ "status": "ready", "capsules": [] });
+        assert_eq!(static_tools_from_payload(&payload), Some(Vec::new()));
+    }
 
     fn desc(name: &str) -> McpToolDescriptor {
         McpToolDescriptor {
