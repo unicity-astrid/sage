@@ -49,6 +49,13 @@ policy_rules = { type = "string", default = "", request = "Per-principal policy 
 [subscribe]
 "sage.v1.tools.describe" = { wit = "opaque", handler = "describe_tools" }
 "tool.v1.response.describe.*" = { wit = "@unicity-astrid/wit/tool/describe-response", handler = "collect_tool_descriptors" }
+# Capsule-set change signal. The kernel publishes `astrid.v1.capsules_loaded`
+# whenever the loaded-capsule set changes (install / live upgrade / live
+# remove). The descriptor-cache merge path above only ADDS, so a removed or
+# upgraded capsule's tools would linger until the TTL; `handle_capsules_changed`
+# invalidates the cache so the next `tools/list` re-discovers the live surface.
+# Exact (segment-arity-fixed) topic; the payload is a bare ready-signal.
+"astrid.v1.capsules_loaded" = { wit = "opaque", handler = "handle_capsules_changed" }
 # Broker front door: the sanitized `astrid.v1.*` MCP surface for an MCP
 # client behind a shim/proxy (`astrid mcp serve`). The shim never sees
 # `tool.v1.*`. Both are exact (segment-arity-fixed) topics — the proxy
