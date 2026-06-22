@@ -177,6 +177,35 @@ pub(crate) fn replace(snapshot: Vec<McpToolDescriptor>) -> CacheState {
     }
 }
 
+/// Force the next `tools/list` to re-discover by emptying the cached
+/// descriptor map.
+///
+/// Called when the loaded-capsule set changes — the kernel's
+/// `astrid.v1.capsules_loaded` signal (install / live upgrade / live remove).
+/// The event-driven merge path ([`upsert`], via `collect_tool_descriptors`)
+/// only ever ADDS descriptors, so a removed or upgraded capsule's stale tools
+/// would otherwise linger in the cache (callable, erroring) until the TTL
+/// expires. An empty cache is never [`CacheState::is_fresh`] (the cold-start
+/// guard), so the next [`super::discovery::collect_snapshot`] re-runs the
+/// describe fan-out — a departed capsule no longer responds and its tools drop
+/// out, while a freshly added one is picked up.
+///
+/// Best-effort: a failed write just leaves the prior cache to self-heal at the
+/// TTL. This empties only the `tools/list` DESCRIPTOR cache — `tools/call`
+/// routing never reads it — so an emptied cache cannot break a concurrent tool
+/// call. The write is intentionally non-CAS: by the time the kernel publishes
+/// `capsules_loaded` the registry change has already happened, so any fan-out
+/// that runs after this invalidation observes the new set.
+pub(crate) fn invalidate() {
+    let Ok(bytes) = serde_json::to_vec(&CacheState::default()) else {
+        log::warn("sage-mcp: failed to serialize empty tool cache (invalidate)");
+        return;
+    };
+    if let Err(e) = kv::set_bytes(CACHE_KEY, &bytes) {
+        log::warn(format!("sage-mcp: tool cache invalidate failed: {e}"));
+    }
+}
+
 /// Wall-clock millis. The host clock is monotonic enough at the
 /// 60-second TTL granularity we care about.
 fn now_ms() -> u64 {
