@@ -126,21 +126,24 @@ impl SageMcp {
         Ok(())
     }
 
-    /// `astrid.v1.capsules_loaded` — invalidate the tool cache on a
-    /// capsule-set change.
+    /// `astrid.v1.capsules_loaded` — rebuild the tool cache from the kernel's
+    /// static metadata, or fall back to a fan-out, on a capsule-set change.
     ///
     /// The kernel publishes this whenever the loaded-capsule set changes
-    /// (install / live upgrade / live remove). The descriptor cache is keyed by
-    /// tool name and the event-path merge ([`Self::collect_tool_descriptors`])
-    /// only ever ADDS, so a removed or upgraded capsule's stale tools would
-    /// otherwise linger until the TTL. Emptying the cache forces the next
-    /// `tools/list` to re-derive the surface from a fresh fan-out, where a
-    /// departed capsule self-excludes — and the `astrid mcp serve` shim re-fetches
-    /// `tools/list` on this same signal, so the client sees the change live. The
-    /// payload is a bare ready-signal and is ignored.
+    /// (install / live upgrade / live remove) and includes each loaded capsule's
+    /// installed `meta.json` (opaque) in the payload. When EVERY loaded capsule
+    /// has a build-captured tool surface, the broker rebuilds its cache purely
+    /// from that static set — deterministic, no describe fan-out, so the first
+    /// `tools/list` after boot is already complete (killing the cold-start
+    /// fan-out race). If any capsule's surface is uncaptured (built before
+    /// tool-baking, or `meta` unreadable), it invalidates the cache and the next
+    /// `tools/list` re-discovers via the fan-out — where a departed capsule
+    /// self-excludes. Either way the `astrid mcp serve` shim re-fetches
+    /// `tools/list` on this same signal, so the client sees the change live. See
+    /// [`discovery::on_capsules_loaded`].
     #[astrid::interceptor("handle_capsules_changed")]
-    pub fn handle_capsules_changed(&self, _payload: serde_json::Value) -> Result<(), SysError> {
-        cache::invalidate();
+    pub fn handle_capsules_changed(&self, payload: serde_json::Value) -> Result<(), SysError> {
+        discovery::on_capsules_loaded(payload);
         Ok(())
     }
 
