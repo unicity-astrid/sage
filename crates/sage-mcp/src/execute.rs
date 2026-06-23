@@ -469,8 +469,14 @@ fn marker_is_fresh(value: &[u8]) -> bool {
 ///
 /// Reads as NOT fresh — fail toward re-prompting (surface a fresh consent
 /// prompt), never toward a stuck marker — when: the value does not parse; the
-/// stored stamp is `0` (the mark-time clock was unavailable); or `now` is `0`
-/// (the clock is unavailable now).
+/// stored stamp is `0` (the mark-time clock was unavailable); `now` is `0` (the
+/// clock is unavailable now); or the stamp is in the FUTURE relative to `now`
+/// (`written > now`). A future stamp means the wall clock stepped backward (NTP
+/// correction) or the stored value is corrupt/forged; reading it as fresh would
+/// suppress prompts far beyond the TTL (until the clock caught back up), which
+/// defeats the self-heal, so it too fails open to a re-prompt. With those guards
+/// the freshness window is exactly `[written, written + TTL)` and `now - written`
+/// can never underflow.
 fn marker_is_fresh_at(value: &[u8], now: u64) -> bool {
     if now == 0 {
         return false;
@@ -482,10 +488,10 @@ fn marker_is_fresh_at(value: &[u8], now: u64) -> bool {
     else {
         return false;
     };
-    if written == 0 {
+    if written == 0 || written > now {
         return false;
     }
-    now.saturating_sub(written) < GRANT_PENDING_TTL_MS
+    now - written < GRANT_PENDING_TTL_MS
 }
 
 /// Returns whether a grant-consent prompt is already outstanding for
@@ -791,11 +797,14 @@ mod tests {
     }
 
     #[test]
-    fn marker_fresh_tolerates_backward_clock() {
-        // If the wall clock stepped backward since the mark (written > now),
-        // saturating_sub yields 0 (< TTL) → treated as fresh, not as an
-        // overflow-driven stale. A small backward step must not drop the dedup.
-        assert!(marker_is_fresh_at(
+    fn marker_future_stamp_is_stale() {
+        // A stamp dated in the FUTURE relative to `now` (the wall clock stepped
+        // backward, or the stored value is corrupt/forged) must read as STALE —
+        // fail open to a re-prompt — never as fresh. Reading it as fresh would
+        // suppress prompts until the clock caught back up (potentially far beyond
+        // the TTL), defeating the self-heal. The cost of failing open is at most
+        // one extra prompt, never indefinite suppression.
+        assert!(!marker_is_fresh_at(
             20_000_000u64.to_string().as_bytes(),
             10_000_000
         ));
