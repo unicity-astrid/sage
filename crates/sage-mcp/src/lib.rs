@@ -223,6 +223,32 @@ impl SageMcp {
         approval::handle_mcp_ingress_respond(payload)
     }
 
+    /// `astrid.v1.request.mcp.grant.respond` — capsule-grant consent bridge.
+    ///
+    /// When a `tool.call` is refused by the kernel access gate (the principal
+    /// has not granted the target capsule), [`Self::handle_mcp_call`] replies a
+    /// `grant_required` flag; the shim elicits the user's Grant/Deny and
+    /// forwards it here as `{ req_id, request_id, decision, capsule_id }`. This
+    /// maps the choice onto `astrid.v1.approval.response.<request_id>` — the SAME
+    /// envelope the approval flow uses, consumed verbatim by the kernel grant
+    /// handler, which persists the capsule grant on an approve — then acks the
+    /// shim on `astrid.v1.response.<req_id>` with
+    /// `{ kind:"grant.respond", req_id, granted }`.
+    ///
+    /// PUBLISH-THEN-ACK, NO result drain: grant-on-use mirrors the INGRESS flow
+    /// (gate → consent → re-send). The kernel DROPPED the original call, so
+    /// nothing is parked and no result will come — the shim re-sends the call on
+    /// `granted:true`. Unlike [`Self::handle_mcp_approval`] this handler never
+    /// subscribes-to-result or drains (draining would block then emit a spurious
+    /// error). State-mutating (an approve persists a grant), so it is
+    /// confused-deputy gated on the kernel-set `source_id` like
+    /// [`Self::handle_mcp_call`], and the dedup marker is consumed on approve
+    /// AND deny. See [`approval::handle_mcp_grant_respond`].
+    #[astrid::interceptor("handle_mcp_grant_respond")]
+    pub fn handle_mcp_grant_respond(&self, payload: serde_json::Value) -> Result<(), SysError> {
+        approval::handle_mcp_grant_respond(payload)
+    }
+
     /// `hook.v1.event.before_tool_call` — native-tool verdict responder.
     ///
     /// sage-mcp participates in the hook-bridge `ToolCallBefore` merge: it

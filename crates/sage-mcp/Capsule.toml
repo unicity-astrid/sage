@@ -80,6 +80,20 @@ policy_rules = { type = "string", default = "", request = "Per-principal policy 
 # message — never a body field) and acks on `astrid.v1.response.<req_id>`.
 # Exact (segment-arity-fixed) topic.
 "astrid.v1.request.mcp.ingress.respond" = { wit = "opaque", handler = "handle_mcp_ingress_respond" }
+# Capsule-grant consent bridge (broker side). When a `tool.call` is refused by
+# the kernel access gate (the principal has not granted the target capsule),
+# the broker replies a `grant_required` flag; the shim elicits the user's
+# Grant/Deny and forwards it here as `{ req_id, request_id, decision,
+# capsule_id }`. `handle_mcp_grant_respond` maps the choice onto
+# `astrid.v1.approval.response.<request_id>` (the SAME envelope the approval
+# flow uses, consumed verbatim by the kernel grant handler) and acks on
+# `astrid.v1.response.<req_id>`. PUBLISH-THEN-ACK, no result drain — the kernel
+# dropped the call (grant-on-use mirrors INGRESS: gate → consent → re-send).
+# State-mutating (an approve persists a grant), so it is confused-deputy gated
+# on the kernel-set `source_id`. Exact (segment-arity-fixed) topic. No new
+# publish ACL needed: the `astrid.v1.approval.response.*` decision channel and
+# the `astrid.v1.response.*` ack channel are already declared.
+"astrid.v1.request.mcp.grant.respond" = { wit = "opaque", handler = "handle_mcp_grant_respond" }
 # Dynamic-subscribe pattern: `execute::dispatch_with_approval` calls
 # `ipc::subscribe("astrid.v1.approval")` per broker tool call to observe a
 # capability-approval request published by the host while a gated tool is

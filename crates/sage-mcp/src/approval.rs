@@ -229,6 +229,74 @@ pub(crate) fn is_approval_required(value: &Value) -> bool {
             .is_some_and(|id| !id.is_empty())
 }
 
+/// Parsed `astrid.v1.approval` grant-gate-miss envelope
+/// (`IpcPayload::GrantRequired`, published by the kernel #1001 producer when
+/// the principal has not granted the target capsule).
+///
+/// `grant-on-use` mirrors the INGRESS flow (gate → consent → re-send), NOT
+/// capability-approval (park → resume): the kernel DROPPED the original
+/// `tool.call` at the access gate, so there is nothing parked and nothing to
+/// drain. The kernel grants the capsule when an APPROVE `approval_response`
+/// lands on `astrid.v1.approval.response.<request_id>` — the exact same
+/// response topic + envelope the approval flow uses, reused verbatim.
+///
+/// Only the correlation + display fields are deserialized. The `type`
+/// discriminator tag is dropped by struct-deserialize; [`is_grant_required`]
+/// gates on it explicitly so a sibling `IpcPayload` variant on the shared topic
+/// is not mistaken for a grant request.
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct GrantRequired {
+    /// Host-minted correlation id; echoed onto the response topic suffix
+    /// (`astrid.v1.approval.response.<request_id>`) so the kernel grant handler
+    /// resumes the exact gate miss.
+    pub(crate) request_id: String,
+    /// The principal the grant would be recorded for. Display only — the
+    /// kernel resolves the real principal from the approve it consumes; this is
+    /// never trusted as an identity.
+    #[serde(default)]
+    pub(crate) principal: String,
+    /// The capsule id the access gate refused. Carried to the shim for display
+    /// and used as the dedup key `(principal, capsule_id)`.
+    #[serde(default)]
+    pub(crate) capsule_id: String,
+}
+
+impl GrantRequired {
+    /// Shape the `grant_required` flag embedded in the broker `tool.call`
+    /// reply.
+    ///
+    /// Carries the correlation id, the (display-only) principal, the capsule id
+    /// the gate refused, plus the dispatch's `tool_name` + `call_id` — the same
+    /// routing tokens the shim already used for the `tool.call`, so it can
+    /// RE-SEND the original call on approve (grant-on-use re-sends; it does not
+    /// resume). No tool argument or secret is carried.
+    pub(crate) fn to_reply_flag(&self, tool_name: &str, call_id: &str) -> Value {
+        json!({
+            "request_id": self.request_id,
+            "capsule_id": clamp(&self.capsule_id),
+            "principal": clamp(&self.principal),
+            "tool_name": tool_name,
+            "call_id": call_id,
+        })
+    }
+}
+
+/// Decide whether a JSON value parsed from the `astrid.v1.approval` topic is a
+/// `GrantRequired` envelope.
+///
+/// The `IpcPayload` enum is `#[serde(tag = "type", rename_all = "snake_case")]`,
+/// so a genuine grant request carries `"type": "grant_required"`. Gate on the
+/// tag AND a non-empty `request_id` (a blank id can't be routed back). Other
+/// payloads sharing the topic — including the sibling `approval_required` — are
+/// skipped.
+pub(crate) fn is_grant_required(value: &Value) -> bool {
+    value.get("type").and_then(Value::as_str) == Some("grant_required")
+        && value
+            .get("request_id")
+            .and_then(Value::as_str)
+            .is_some_and(|id| !id.is_empty())
+}
+
 /// Inbound `astrid.v1.request.mcp.approval.respond` payload — the shim's
 /// elicited choice for an outstanding approval.
 ///
@@ -356,6 +424,27 @@ pub(crate) fn handle_mcp_approval(payload: Value) -> Result<(), SysError> {
 struct IngressRespond {
     req_id: String,
     accept: bool,
+}
+
+/// Inbound `astrid.v1.request.mcp.grant.respond` payload — the shim's elicited
+/// Grant/Deny decision for an outstanding capsule-grant prompt.
+///
+/// `req_id` is the proxy correlation token (the ack lands on
+/// `astrid.v1.response.<req_id>`); `request_id` is the kernel grant correlation
+/// id from the `grant_required` envelope (echoed onto
+/// `astrid.v1.approval.response.<request_id>`); `decision` is the user's choice,
+/// normalised to a host verb by [`normalize_decision`]. `capsule_id` is the
+/// grant target, used to clear the dedup marker on respond. There is
+/// DELIBERATELY no `tool_name` / `call_id`: grant-on-use does NOT drain a result
+/// (the kernel dropped the call), so there is no result topic to re-establish —
+/// unlike [`ApprovalRespond`]. Any other fields are ignored.
+#[derive(Debug, Deserialize)]
+struct GrantRespond {
+    req_id: String,
+    request_id: String,
+    decision: String,
+    #[serde(default)]
+    capsule_id: String,
 }
 
 /// Handle `astrid.v1.request.mcp.ingress.respond`.
@@ -511,6 +600,193 @@ fn ingress_ack(reply_topic: &str, req_id: &str, granted: bool) {
     if let Err(e) = ipc::publish_json(reply_topic, &reply) {
         log::warn(format!(
             "sage-mcp: broker ingress.respond: failed to ack {reply_topic}: {e}"
+        ));
+    }
+}
+
+/// Handle `astrid.v1.request.mcp.grant.respond`.
+///
+/// The shim elicited the user's Grant/Deny choice for a capsule the kernel
+/// access gate refused (in response to a `grant_required` flag a prior
+/// [`crate::broker::handle_mcp_call`] reply carried) and forwards it here as
+/// `{ req_id, request_id, decision, capsule_id }`. This maps the choice onto
+/// `astrid.v1.approval.response.<request_id>` — the SAME response topic and
+/// `approval_response` envelope the approval flow uses, consumed VERBATIM by
+/// the kernel grant handler (#1001), which persists the capsule grant on an
+/// APPROVE — then acks the shim on `astrid.v1.response.<req_id>` with
+/// `{ kind:"grant.respond", req_id, granted }`.
+///
+/// ## Publish-then-ack, NO result drain (the key divergence)
+///
+/// Unlike [`handle_mcp_approval`], this handler MUST NOT subscribe to
+/// `tool.v1.execute.*.result` and MUST NOT drain a result. grant-on-use mirrors
+/// the INGRESS flow: the kernel DROPPED the original `tool.call` at the access
+/// gate, so nothing is parked and no result will ever be published. Draining
+/// would block the full window then emit a spurious error. The shim RE-SENDS
+/// the original `tool.call` itself once it sees `granted:true`. Structurally
+/// this matches [`handle_mcp_ingress_respond`] (publish/record then ack), NOT
+/// [`handle_mcp_approval`] (publish then drain).
+///
+/// State-mutating (an APPROVE causes the kernel to persist a capsule grant), so
+/// it is confused-deputy gated identically to [`crate::broker::handle_mcp_call`]:
+/// the inbound message's kernel-set `source_id` must already be a trusted
+/// ingress ([`crate::execute::is_ingress_trusted`]) before any decision is
+/// published. A rejected request publishes a `deny` (when a `request_id` is
+/// routable) so the kernel gate miss retires cleanly and clears the dedup
+/// marker — fail secure.
+///
+/// The dedup marker for `(principal, capsule_id)` is consumed on BOTH approve
+/// and deny ([`crate::execute::take_grant_pending`]) so a declined prompt can
+/// never leave a marker that suppresses every future grant prompt for the pair.
+/// A payload so malformed it carries no `request_id` (and so no routable deny)
+/// — or no `capsule_id` to clear by — is logged and dropped; the kernel gate
+/// miss times out on its own schedule and any pending marker self-heals at
+/// [`crate::execute::GRANT_PENDING_TTL_MS`], so even that path cannot wedge the
+/// pair.
+pub(crate) fn handle_mcp_grant_respond(payload: Value) -> Result<(), SysError> {
+    let req: GrantRespond = match serde_json::from_value(payload) {
+        Ok(v) => v,
+        Err(e) => {
+            // No recoverable req_id — no channel to ack on, and no request_id
+            // to deny. The kernel grant gate retires on its own schedule, and a
+            // pending marker self-heals at GRANT_PENDING_TTL_MS, so dropping
+            // here cannot wedge the pair. Log and drop.
+            log::warn(format!(
+                "sage-mcp: broker grant.respond: malformed payload: {e}"
+            ));
+            return Ok(());
+        }
+    };
+
+    log::info(format!(
+        "sage-mcp: broker ingress method=grant.respond req_id={} request_id={} capsule_id={}",
+        req.req_id, req.request_id, req.capsule_id
+    ));
+
+    let reply_topic = crate::broker::reply_topic(&req.req_id);
+    let Some(response_topic) = response_topic(&req.request_id) else {
+        log::warn(format!(
+            "sage-mcp: broker grant.respond: rejecting unroutable request_id '{}'",
+            req.request_id
+        ));
+        // Clear any dedup marker so the next ungranted call can re-prompt — the
+        // decision was never published (bad request_id), so leaving the marker
+        // would wedge the pair. The caller principal scopes the KV; the suffix
+        // is the capsule id.
+        clear_grant_marker(&req.capsule_id);
+        // Ack the shim (when routable) so it does not hang; not granted.
+        if let Some(reply) = &reply_topic {
+            grant_ack(reply, &req.req_id, false);
+        }
+        return Ok(());
+    };
+
+    // Confused-deputy gate. An APPROVE here causes the kernel to persist a
+    // capsule grant — the most sensitive action on this path — so require the
+    // kernel-set `source_id` (NOT a body field) to be a trusted ingress. On any
+    // failure (no caller context, untrusted ingress) publish a `deny` so the
+    // kernel gate miss retires, clear the marker, and ack not-granted.
+    let source_id = match runtime::caller() {
+        Ok(ctx) => ctx.source_id,
+        Err(e) => {
+            log::warn(format!(
+                "sage-mcp: broker grant.respond: no caller context, denying request_id '{}': {e}",
+                req.request_id
+            ));
+            publish_decision(&response_topic, &req.request_id, DENY, None);
+            clear_grant_marker(&req.capsule_id);
+            if let Some(reply) = &reply_topic {
+                grant_ack(reply, &req.req_id, false);
+            }
+            return Ok(());
+        }
+    };
+    if !crate::execute::is_ingress_trusted(&source_id) {
+        log::warn(format!(
+            "sage-mcp: broker grant.respond: untrusted ingress source_id '{source_id}', \
+             denying request_id '{}'",
+            req.request_id
+        ));
+        publish_decision(&response_topic, &req.request_id, DENY, None);
+        clear_grant_marker(&req.capsule_id);
+        if let Some(reply) = &reply_topic {
+            grant_ack(reply, &req.req_id, false);
+        }
+        return Ok(());
+    }
+
+    // Normalise the shim's choice to exactly one host verb. Unknown / empty
+    // collapses to `deny` — fail secure: no string the shim sends grants a
+    // capsule unless it is exactly an approve verb.
+    let decision = normalize_decision(&req.decision);
+    let granted = is_approve_verb(decision);
+
+    // Publish the decision on the per-request response topic. The kernel grant
+    // handler consumes this `approval_response` verbatim and, on an approve,
+    // persists the capsule grant. NO result drain follows — the call was
+    // dropped at the gate; the shim re-sends it on `granted:true`.
+    publish_decision(&response_topic, &req.request_id, decision, None);
+
+    // Consume the dedup marker on BOTH approve and deny so it is single-use and
+    // can never stick. The grant itself is driven by the published decision, not
+    // this marker; clearing it here is what lets the next call re-prompt (and a
+    // TTL self-heal backstops the clear if this respond never arrives).
+    clear_grant_marker(&req.capsule_id);
+
+    if let Some(reply) = &reply_topic {
+        grant_ack(reply, &req.req_id, granted);
+    } else {
+        log::warn(format!(
+            "sage-mcp: broker grant.respond: decision published but req_id '{}' unroutable; \
+             no ack delivered",
+            req.req_id
+        ));
+    }
+    Ok(())
+}
+
+/// Whether a normalised host decision verb is one of the three APPROVE verbs
+/// (i.e. the kernel will GRANT). Anything else — `deny` — is not a grant. Used
+/// to report `granted` in the grant ack so the shim only re-sends the dropped
+/// `tool.call` when the capsule will now be granted.
+fn is_approve_verb(decision: &str) -> bool {
+    matches!(decision, APPROVE | APPROVE_SESSION | APPROVE_ALWAYS)
+}
+
+/// Consume the `(principal, capsule_id)` grant-pending dedup marker. The KV
+/// scope is per-principal (the caller's principal), so the capsule id is the
+/// key suffix; the principal argument is passed for intent only. Best-effort —
+/// a failure to clear just risks one extra suppressed prompt, never a spurious
+/// grant. Called on every respond outcome so the marker is single-use.
+///
+/// An empty `capsule_id` (a respond that omitted the field) makes this a no-op —
+/// there is no key to clear. That does not wedge the pair: the marker carries a
+/// write timestamp and self-heals at [`crate::execute::GRANT_PENDING_TTL_MS`],
+/// so a missing-`capsule_id` respond degrades to a slightly delayed re-prompt,
+/// never permanent suppression.
+fn clear_grant_marker(capsule_id: &str) {
+    let principal = runtime::caller()
+        .ok()
+        .and_then(|ctx| ctx.principal)
+        .unwrap_or_default();
+    let _ = crate::execute::take_grant_pending(&principal, capsule_id);
+}
+
+/// Ack a `grant.respond` to the shim on `astrid.v1.response.<req_id>`.
+///
+/// `granted` reports whether the kernel will grant the capsule (an approve
+/// verb), so the shim only RE-SENDS the dropped `tool.call` when the access
+/// gate will now pass. Mirrors [`ingress_ack`]'s shape with a `grant.respond`
+/// kind. Best-effort: a publish failure is logged, not retried.
+fn grant_ack(reply_topic: &str, req_id: &str, granted: bool) {
+    let reply = json!({
+        "kind": "grant.respond",
+        "req_id": req_id,
+        "granted": granted,
+    });
+    if let Err(e) = ipc::publish_json(reply_topic, &reply) {
+        log::warn(format!(
+            "sage-mcp: broker grant.respond: failed to ack {reply_topic}: {e}"
         ));
     }
 }
@@ -915,5 +1191,152 @@ mod tests {
         });
         let parsed: ApprovalRespond = serde_json::from_value(v).unwrap();
         assert_eq!(parsed.reason.as_deref(), Some("user declined"));
+    }
+
+    // ------------------------------------------------------------------
+    // grant-on-use (grant_required signal + grant.respond bridge).
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn grant_required_parses_canonical_envelope() {
+        let v = json!({
+            "type": "grant_required",
+            "request_id": "0191f3a2b4c74d8e9f01234567890abc",
+            "principal": "alice",
+            "capsule_id": "fs",
+        });
+        assert!(is_grant_required(&v));
+        let req: GrantRequired = serde_json::from_value(v).unwrap();
+        assert_eq!(req.request_id, "0191f3a2b4c74d8e9f01234567890abc");
+        assert_eq!(req.principal, "alice");
+        assert_eq!(req.capsule_id, "fs");
+    }
+
+    #[test]
+    fn is_grant_required_rejects_other_payloads() {
+        // Wrong tag — the sibling approval_required must NOT be read as a grant.
+        assert!(!is_grant_required(&json!({
+            "type": "approval_required",
+            "request_id": "x",
+        })));
+        // Right tag, empty request_id (can't be routed back).
+        assert!(!is_grant_required(&json!({
+            "type": "grant_required",
+            "request_id": ""
+        })));
+        // No tag at all.
+        assert!(!is_grant_required(&json!({ "request_id": "x" })));
+    }
+
+    #[test]
+    fn is_approval_required_rejects_grant_required() {
+        // Symmetry: the grant envelope must NOT be read as an approval, so the
+        // combined poll classifies each signal to exactly one outcome.
+        assert!(!is_approval_required(&json!({
+            "type": "grant_required",
+            "request_id": "x",
+            "capsule_id": "fs",
+        })));
+    }
+
+    #[test]
+    fn grant_reply_flag_carries_display_and_routing_fields_only() {
+        let req = GrantRequired {
+            request_id: "rid".to_string(),
+            principal: "  alice  ".to_string(),
+            capsule_id: "fs".to_string(),
+        };
+        let flag = req.to_reply_flag("fs.read", "call-7");
+        assert_eq!(flag["request_id"], "rid");
+        // Trimmed display fields.
+        assert_eq!(flag["principal"], "alice");
+        assert_eq!(flag["capsule_id"], "fs");
+        // Routing tokens the shim echoes / re-sends with.
+        assert_eq!(flag["tool_name"], "fs.read");
+        assert_eq!(flag["call_id"], "call-7");
+        // No arguments / secret fields leak in.
+        assert!(flag.get("arguments").is_none());
+    }
+
+    #[test]
+    fn grant_respond_parses_minimum_shape() {
+        let v = json!({
+            "req_id": "r1",
+            "request_id": "rid",
+            "decision": "approve",
+            "capsule_id": "fs",
+        });
+        let parsed: GrantRespond = serde_json::from_value(v).unwrap();
+        assert_eq!(parsed.req_id, "r1");
+        assert_eq!(parsed.request_id, "rid");
+        assert_eq!(parsed.decision, "approve");
+        assert_eq!(parsed.capsule_id, "fs");
+    }
+
+    #[test]
+    fn grant_respond_requires_req_id_request_id_decision() {
+        // `req_id` (ack channel), `request_id` (decision topic), and `decision`
+        // are mandatory; only `capsule_id` defaults (used solely to clear the
+        // dedup marker — its absence degrades to a no-op clear, never a wrong
+        // decision). A payload missing any of the three is rejected.
+        assert!(
+            serde_json::from_value::<GrantRespond>(json!({
+                "request_id": "rid",
+                "decision": "approve",
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<GrantRespond>(json!({
+                "req_id": "r1",
+                "decision": "approve",
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<GrantRespond>(json!({
+                "req_id": "r1",
+                "request_id": "rid",
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn grant_respond_does_not_require_tool_name_or_call_id() {
+        // Divergence from ApprovalRespond: grant-on-use does NOT drain a result
+        // (the kernel dropped the call), so the wire shape carries no
+        // `tool_name` / `call_id`. A payload without them must still parse.
+        let v = json!({
+            "req_id": "r1",
+            "request_id": "rid",
+            "decision": "deny",
+        });
+        let parsed: GrantRespond = serde_json::from_value(v).unwrap();
+        assert_eq!(parsed.capsule_id, "");
+    }
+
+    #[test]
+    fn is_approve_verb_only_true_for_approve_verbs() {
+        // The grant ack's `granted` flag — true only when the kernel will grant
+        // (an approve verb), so the shim re-sends only on a real grant.
+        assert!(is_approve_verb(APPROVE));
+        assert!(is_approve_verb(APPROVE_SESSION));
+        assert!(is_approve_verb(APPROVE_ALWAYS));
+        assert!(!is_approve_verb(DENY));
+    }
+
+    #[test]
+    fn grant_respond_decision_normalizes_to_grant_or_deny() {
+        // End-to-end of the verb spine the handler uses: an approve verb → the
+        // kernel grants (granted:true); anything else → deny (granted:false),
+        // fail secure. No string the shim sends grants unless it is exactly an
+        // approve verb.
+        assert!(is_approve_verb(normalize_decision("approve")));
+        assert!(is_approve_verb(normalize_decision("  Approve_Always ")));
+        assert!(!is_approve_verb(normalize_decision("deny")));
+        assert!(!is_approve_verb(normalize_decision("")));
+        assert!(!is_approve_verb(normalize_decision("grant")));
+        assert!(!is_approve_verb(normalize_decision("approve; rm -rf /")));
     }
 }
