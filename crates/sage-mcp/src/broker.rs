@@ -482,7 +482,8 @@ pub(crate) fn handle_mcp_call(payload: Value) -> Result<(), SysError> {
                     "kind": "tool.call",
                     "req_id": req.req_id,
                     "content": mcp_content(Value::String(
-                        "sage-mcp: capsule access already pending approval".into(),
+                        "sage-mcp: a capsule-access grant prompt is already pending for this capsule"
+                            .into(),
                     )),
                     "isError": false,
                 })

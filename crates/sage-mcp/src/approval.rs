@@ -616,7 +616,7 @@ fn ingress_ack(reply_topic: &str, req_id: &str, granted: bool) {
 /// APPROVE — then acks the shim on `astrid.v1.response.<req_id>` with
 /// `{ kind:"grant.respond", req_id, granted }`.
 ///
-/// ## Publish-then-ack, NO result drain (the load-bearing divergence)
+/// ## Publish-then-ack, NO result drain (the key divergence)
 ///
 /// Unlike [`handle_mcp_approval`], this handler MUST NOT subscribe to
 /// `tool.v1.execute.*.result` and MUST NOT drain a result. grant-on-use mirrors
@@ -631,20 +631,26 @@ fn ingress_ack(reply_topic: &str, req_id: &str, granted: bool) {
 /// it is confused-deputy gated identically to [`crate::broker::handle_mcp_call`]:
 /// the inbound message's kernel-set `source_id` must already be a trusted
 /// ingress ([`crate::execute::is_ingress_trusted`]) before any decision is
-/// published. A rejected or malformed request publishes a `deny` (when a
-/// `request_id` is routable) so the kernel gate miss retires cleanly and the
-/// dedup marker is cleared — fail secure.
+/// published. A rejected request publishes a `deny` (when a `request_id` is
+/// routable) so the kernel gate miss retires cleanly and clears the dedup
+/// marker — fail secure.
 ///
 /// The dedup marker for `(principal, capsule_id)` is consumed on BOTH approve
 /// and deny ([`crate::execute::take_grant_pending`]) so a declined prompt can
 /// never leave a marker that suppresses every future grant prompt for the pair.
+/// A payload so malformed it carries no `request_id` (and so no routable deny)
+/// — or no `capsule_id` to clear by — is logged and dropped; the kernel gate
+/// miss times out on its own schedule and any pending marker self-heals at
+/// [`crate::execute::GRANT_PENDING_TTL_MS`], so even that path cannot wedge the
+/// pair.
 pub(crate) fn handle_mcp_grant_respond(payload: Value) -> Result<(), SysError> {
     let req: GrantRespond = match serde_json::from_value(payload) {
         Ok(v) => v,
         Err(e) => {
             // No recoverable req_id — no channel to ack on, and no request_id
-            // to deny. The kernel grant gate retires on its own schedule. Log
-            // and drop.
+            // to deny. The kernel grant gate retires on its own schedule, and a
+            // pending marker self-heals at GRANT_PENDING_TTL_MS, so dropping
+            // here cannot wedge the pair. Log and drop.
             log::warn(format!(
                 "sage-mcp: broker grant.respond: malformed payload: {e}"
             ));
@@ -723,7 +729,8 @@ pub(crate) fn handle_mcp_grant_respond(payload: Value) -> Result<(), SysError> {
 
     // Consume the dedup marker on BOTH approve and deny so it is single-use and
     // can never stick. The grant itself is driven by the published decision, not
-    // this marker; clearing is the load-bearing effect.
+    // this marker; clearing it here is what lets the next call re-prompt (and a
+    // TTL self-heal backstops the clear if this respond never arrives).
     clear_grant_marker(&req.capsule_id);
 
     if let Some(reply) = &reply_topic {
@@ -751,6 +758,12 @@ fn is_approve_verb(decision: &str) -> bool {
 /// key suffix; the principal argument is passed for intent only. Best-effort —
 /// a failure to clear just risks one extra suppressed prompt, never a spurious
 /// grant. Called on every respond outcome so the marker is single-use.
+///
+/// An empty `capsule_id` (a respond that omitted the field) makes this a no-op —
+/// there is no key to clear. That does not wedge the pair: the marker carries a
+/// write timestamp and self-heals at [`crate::execute::GRANT_PENDING_TTL_MS`],
+/// so a missing-`capsule_id` respond degrades to a slightly delayed re-prompt,
+/// never permanent suppression.
 fn clear_grant_marker(capsule_id: &str) {
     let principal = runtime::caller()
         .ok()
