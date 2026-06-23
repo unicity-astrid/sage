@@ -453,6 +453,66 @@ pub(crate) fn handle_mcp_call(payload: Value) -> Result<(), SysError> {
                 "approval_required": required.to_reply_flag(&req.name, &req.req_id),
             })
         }
+        execute::DispatchOutcome::GrantRequired(grant) => {
+            // The kernel access gate refused the call because `principal` has
+            // not granted the target capsule, and DROPPED the original
+            // `tool.call` (nothing is parked — grant-on-use mirrors INGRESS:
+            // gate → consent → re-send, NOT approval's park → resume). Surface
+            // a `grant_required` flag so the shim can elicit Grant/Deny and,
+            // on Grant, drive `astrid.v1.request.mcp.grant.respond` then
+            // RE-SEND this call.
+            //
+            // Dedup: if a grant prompt is already pending for this
+            // `(principal, capsule)` pair, reply a benign terminal result
+            // instead of a fresh elicit, so a flurry of ungranted calls for the
+            // same capsule does not spawn a stack of duplicate prompts. The
+            // marker is non-consumingly peeked here (it must survive to keep
+            // deduping every duplicate) and consumed only on the respond
+            // ([`crate::approval::handle_mcp_grant_respond`]).
+            if execute::grant_pending(&principal, &grant.capsule_id) {
+                log::info(format!(
+                    "sage-mcp: broker response method=tool.call req_id={} tool={} \
+                     outcome=grant_pending_dedup capsule={} elapsed_ms={}",
+                    req.req_id,
+                    req.name,
+                    grant.capsule_id,
+                    discovery::wall_ms().saturating_sub(started)
+                ));
+                json!({
+                    "kind": "tool.call",
+                    "req_id": req.req_id,
+                    "content": mcp_content(Value::String(
+                        "sage-mcp: capsule access already pending approval".into(),
+                    )),
+                    "isError": false,
+                })
+            } else {
+                // First prompt for this pair — record it pending, then surface
+                // the flag. `mark` is best-effort: a lost marker only risks a
+                // duplicate prompt, never a spurious grant.
+                execute::mark_grant_pending(&principal, &grant.capsule_id);
+                log::info(format!(
+                    "sage-mcp: broker response method=tool.call req_id={} tool={} \
+                     outcome=grant_required capsule={} elapsed_ms={}",
+                    req.req_id,
+                    req.name,
+                    grant.capsule_id,
+                    discovery::wall_ms().saturating_sub(started)
+                ));
+                json!({
+                    "kind": "tool.call",
+                    "req_id": req.req_id,
+                    // No tool result — the kernel dropped the call at the access
+                    // gate. The shim MUST elicit Grant/Deny and respond on
+                    // `astrid.v1.request.mcp.grant.respond`, then re-send on
+                    // Grant. `content` empty, `isError` false: a prompt-needed
+                    // state, not a failure.
+                    "content": mcp_content(Value::String(String::new())),
+                    "isError": false,
+                    "grant_required": grant.to_reply_flag(&req.name, &req.req_id),
+                })
+            }
+        }
         execute::DispatchOutcome::Failed(message) => {
             // A received request that could NOT be dispatched / drained (no
             // provider, not-subscribed, dispatch error, or response timeout)

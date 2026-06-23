@@ -25,7 +25,7 @@
 use astrid_sdk::prelude::*;
 use serde_json::{Value, json};
 
-use crate::approval::{self, ApprovalRequired};
+use crate::approval::{self, ApprovalRequired, GrantRequired};
 
 /// Per-call drain window for the `tool.v1.execute.<name>.result` reply.
 /// Bounded well under sage's 60 s `TOOL_CALL_DEADLINE` so the bridge
@@ -62,6 +62,14 @@ const INGRESS_TRUST_KEY_PREFIX: &str = "mcp.ingress.trust.";
 /// [`mark_ingress_pending`] / [`take_ingress_pending`].
 const INGRESS_PENDING_KEY_PREFIX: &str = "mcp.ingress.pending.";
 
+/// KV key prefix marking that the broker has an OUTSTANDING capsule-grant
+/// consent prompt for a `(principal, capsule_id)` pair — written when
+/// [`crate::broker::handle_mcp_call`] surfaces a `grant_required` flag and
+/// consumed by [`crate::approval::handle_mcp_grant_respond`]. See
+/// [`mark_grant_pending`] / [`take_grant_pending`]. KV is per-principal-scoped
+/// by the kernel, so the capsule id alone suffices within the keyspace.
+const GRANT_PENDING_KEY_PREFIX: &str = "mcp.grant.pending.";
+
 /// Outcome of a broker tool dispatch that watches for a mid-call approval.
 ///
 /// The capability-gated tool's host-side `request_approval` syscall
@@ -78,6 +86,16 @@ pub(crate) enum DispatchOutcome {
     /// relay this to the shim and, on the returned choice, publish the
     /// matching `astrid.v1.approval.response.<request_id>` decision.
     ApprovalRequired(ApprovalRequired),
+    /// The kernel access gate refused the call because the principal has not
+    /// granted the target capsule. The kernel DROPPED the original
+    /// `tool.call` (nothing is parked) and published a `grant_required`
+    /// signal; the broker must surface a `grant_required` flag so the shim
+    /// can elicit consent and, on approve, publish the
+    /// `astrid.v1.approval.response.<request_id>` decision the kernel grant
+    /// handler consumes — then RE-SEND the original call. This mirrors the
+    /// ingress gate → consent → re-send flow, NOT the approval park →
+    /// resume flow: there is no result to drain.
+    GrantRequired(GrantRequired),
     /// Dispatch failed before producing either (subscribe / publish error,
     /// drain timeout with no approval observed).
     Failed(String),
@@ -155,11 +173,24 @@ pub(crate) fn dispatch_with_approval(
     while remaining > 0 {
         let step = remaining.min(EXECUTE_SLICE_MS);
 
-        // Check the approval topic first (non-blocking) — an approval means
-        // the tool can make no further progress until a decision, so we
-        // must not keep blocking on the result topic.
-        if let Some(req) = poll_approval(&approval_sub) {
-            return DispatchOutcome::ApprovalRequired(req);
+        // Check the approval topic first (non-blocking). Both a capability
+        // approval AND a kernel grant-gate miss ride the same already-subscribed
+        // `astrid.v1.approval` topic, so ONE drain of the subscription must
+        // serve both: a `poll()` consumes its batch, so two separate polls
+        // would let the first discard a signal the second was looking for.
+        // [`poll_signal`] inspects each message once and prefers a
+        // `grant_required` (the kernel DROPPED the call — no result will ever
+        // come) over an `approval_required` (the tool is parked). Either way the
+        // result topic can make no further progress, so we must not keep
+        // blocking on it.
+        match poll_signal(&approval_sub) {
+            Some(DispatchOutcome::GrantRequired(grant)) => {
+                return DispatchOutcome::GrantRequired(grant);
+            }
+            Some(DispatchOutcome::ApprovalRequired(req)) => {
+                return DispatchOutcome::ApprovalRequired(req);
+            }
+            _ => {}
         }
 
         match result_sub.recv(step) {
@@ -176,10 +207,17 @@ pub(crate) fn dispatch_with_approval(
             }
         }
 
-        // One more approval check after the result slice — covers an
-        // approval that landed during the blocking `recv` above.
-        if let Some(req) = poll_approval(&approval_sub) {
-            return DispatchOutcome::ApprovalRequired(req);
+        // One more combined check after the result slice — covers a signal
+        // that landed during the blocking `recv` above. Same grant-first
+        // single-drain rationale as the pre-`recv` check.
+        match poll_signal(&approval_sub) {
+            Some(DispatchOutcome::GrantRequired(grant)) => {
+                return DispatchOutcome::GrantRequired(grant);
+            }
+            Some(DispatchOutcome::ApprovalRequired(req)) => {
+                return DispatchOutcome::ApprovalRequired(req);
+            }
+            _ => {}
         }
 
         remaining = remaining.saturating_sub(step);
@@ -191,37 +229,58 @@ pub(crate) fn dispatch_with_approval(
     ))
 }
 
-/// Non-blocking poll of the approval subscription. Returns the first
-/// well-formed [`ApprovalRequired`] envelope seen, or `None`.
+/// Non-blocking single-drain poll of the shared `astrid.v1.approval`
+/// subscription for EITHER signal the broker must surface, returning the
+/// matching [`DispatchOutcome`] variant or `None`.
+///
+/// Both an `approval_required` (a capability-gated tool parked on
+/// `request_approval`) and a `grant_required` (the kernel access gate refused
+/// and DROPPED the call) are published on this one topic. `sub.poll()`
+/// consumes its batch, so the two must be checked in a SINGLE pass — two
+/// separate polls could let the first discard a signal the second wanted.
+/// A `grant_required` is preferred when both appear in the batch: a dropped
+/// call has no result and nothing parked, so surfacing it promptly avoids
+/// burning the drain window. The variant is mapped here so the caller's match
+/// stays uniform; this never returns [`DispatchOutcome::Result`] /
+/// [`DispatchOutcome::Failed`].
 ///
 /// `astrid.v1.approval` is a single global broadcast topic carrying no
 /// `call_id` / `tool_name`. Correctness here rests on the engine serialising
 /// guest calls per capsule instance behind the store mutex: this dispatch
 /// holds that lock for its whole drain, so no other sage-mcp `handle_mcp_call`
-/// can be watching the topic concurrently. The only approval we can observe
+/// can be watching the topic concurrently. The only signal we can observe
 /// during our window is the one OUR OWN routed tool raised — see the
 /// "Concurrency / correlation" note in [`crate::approval`]. The decision is
 /// independently routed by `request_id` to the host's per-request topic, so
-/// the surfaced approval is always unblocked by exactly the tool that raised
-/// it.
+/// the surfaced signal is always tied to exactly the tool that raised it.
 ///
-/// Skips any payload on the shared topic that is not an `approval_required`
-/// envelope (other `IpcPayload` variants could in principle share the topic)
-/// and any that fails to deserialize.
-fn poll_approval(sub: &ipc::Subscription) -> Option<ApprovalRequired> {
+/// Skips any payload on the shared topic that is neither envelope (other
+/// `IpcPayload` variants could in principle share it) and any that fails to
+/// deserialize.
+fn poll_signal(sub: &ipc::Subscription) -> Option<DispatchOutcome> {
     let poll = sub.poll().ok()?;
+    let mut approval: Option<ApprovalRequired> = None;
     for msg in poll.messages {
         let Ok(value) = serde_json::from_str::<Value>(&msg.payload) else {
             continue;
         };
-        if !approval::is_approval_required(&value) {
-            continue;
+        // Grant wins: return the instant we see one, even if an approval was
+        // already buffered this batch.
+        if approval::is_grant_required(&value)
+            && let Ok(grant) = serde_json::from_value::<GrantRequired>(value.clone())
+        {
+            return Some(DispatchOutcome::GrantRequired(grant));
         }
-        if let Ok(req) = serde_json::from_value::<ApprovalRequired>(value) {
-            return Some(req);
+        // Remember the first well-formed approval but keep scanning for a
+        // grant later in the same batch.
+        if approval.is_none()
+            && approval::is_approval_required(&value)
+            && let Ok(req) = serde_json::from_value::<ApprovalRequired>(value)
+        {
+            approval = Some(req);
         }
     }
-    None
+    approval.map(DispatchOutcome::ApprovalRequired)
 }
 
 /// Match a `tool.v1.execute.<name>.result` payload against `call_id`,
@@ -329,6 +388,115 @@ pub(crate) fn take_ingress_pending(source_id: &str) -> bool {
         Err(e) => {
             log::warn(format!(
                 "sage-mcp: ingress pending read error for source_id '{source_id}', \
+                 failing closed: {e}"
+            ));
+            false
+        }
+    }
+}
+
+/// KV key marking an outstanding capsule-grant consent prompt for a
+/// `(principal, capsule_id)` pair. KV is per-principal-scoped by the kernel,
+/// so the capsule id alone disambiguates within the keyspace — the principal
+/// is implicit in the storage scope, not the key suffix. Same empty-suffix
+/// guard as [`ingress_pending_key`]: an empty `capsule_id` must never resolve
+/// to a routable key (it would collapse to the bare prefix and let one marker
+/// dedup every grant prompt for the principal). The `principal` is accepted
+/// for symmetry with the call sites and to keep the dedup key intent explicit,
+/// but is NOT stamped into the suffix (the KV scope already carries it).
+fn grant_pending_key(_principal: &str, capsule_id: &str) -> Option<String> {
+    if capsule_id.is_empty() {
+        return None;
+    }
+    Some(format!("{GRANT_PENDING_KEY_PREFIX}{capsule_id}"))
+}
+
+/// Record that the broker has surfaced a `grant_required` prompt for
+/// `(principal, capsule_id)`, so a duplicate ungranted call for the same pair
+/// while one is pending is suppressed instead of spawning a second prompt, and
+/// so [`take_grant_pending`] can clear it on respond.
+///
+/// Best-effort: a write failure is logged, not fatal. A lost marker just means
+/// a duplicate prompt could surface (one extra elicit), never a spurious grant
+/// — the grant itself is still gated on a human approve flowing through
+/// [`crate::approval::handle_mcp_grant_respond`].
+///
+/// The keyspace is bounded by the set of grantable capsules, and the marker is
+/// consumed by the paired respond (approve AND deny), so no TTL/sweep is
+/// needed.
+pub(crate) fn mark_grant_pending(principal: &str, capsule_id: &str) {
+    let Some(key) = grant_pending_key(principal, capsule_id) else {
+        log::warn("sage-mcp: empty capsule_id; not marking a grant consent prompt as pending");
+        return;
+    };
+    if let Err(e) = kv::set_bytes(&key, b"1") {
+        log::warn(format!(
+            "sage-mcp: failed to mark grant consent prompt pending for capsule_id \
+             '{capsule_id}': {e}"
+        ));
+    }
+}
+
+/// Returns whether a grant-consent prompt is already outstanding for
+/// `(principal, capsule_id)` WITHOUT consuming the marker.
+///
+/// Used at the broker's `grant_required` surface point: if a prompt is already
+/// pending for this pair, the broker replies a benign "already pending"
+/// terminal result instead of a fresh elicit (dedup). The marker is left in
+/// place — it is consumed only by [`take_grant_pending`] on the respond, so the
+/// dedup holds across every duplicate call until the user decides.
+///
+/// Fail-OPEN on a read error (returns `false` → the broker surfaces a fresh
+/// prompt): a transient KV read failure must never SUPPRESS a consent prompt,
+/// or an ungranted call could be silently swallowed with no way for the user to
+/// approve it. The worst case is a duplicate prompt, never a swallowed call.
+pub(crate) fn grant_pending(principal: &str, capsule_id: &str) -> bool {
+    let Some(key) = grant_pending_key(principal, capsule_id) else {
+        return false;
+    };
+    match kv::get_bytes_opt(&key) {
+        Ok(Some(_)) => true,
+        Ok(None) => false,
+        Err(e) => {
+            log::warn(format!(
+                "sage-mcp: grant pending read error for capsule_id '{capsule_id}', \
+                 surfacing a fresh prompt: {e}"
+            ));
+            false
+        }
+    }
+}
+
+/// Consume the outstanding grant-consent prompt marker for
+/// `(principal, capsule_id)`, returning whether one existed.
+///
+/// Called by [`crate::approval::handle_mcp_grant_respond`] on BOTH approve and
+/// deny so the marker is single-use and can never stick: a declined prompt must
+/// not leave a marker that suppresses every future grant prompt for the pair.
+/// The return value is informational (the grant itself is driven by the
+/// published decision, not this marker); clearing is the load-bearing effect.
+///
+/// Fail-closed shape mirrors [`take_ingress_pending`]: an empty `capsule_id`, a
+/// missing marker, or a read error all return `false`. A delete failure after a
+/// confirmed-present marker is logged but reported as consumed.
+pub(crate) fn take_grant_pending(principal: &str, capsule_id: &str) -> bool {
+    let Some(key) = grant_pending_key(principal, capsule_id) else {
+        return false;
+    };
+    match kv::get_bytes_opt(&key) {
+        Ok(Some(_)) => {
+            if let Err(e) = kv::delete(&key) {
+                log::warn(format!(
+                    "sage-mcp: failed to clear grant pending marker for capsule_id \
+                     '{capsule_id}': {e}"
+                ));
+            }
+            true
+        }
+        Ok(None) => false,
+        Err(e) => {
+            log::warn(format!(
+                "sage-mcp: grant pending read error for capsule_id '{capsule_id}', \
                  failing closed: {e}"
             ));
             false
@@ -472,5 +640,50 @@ mod tests {
         // to `false` via `ingress_trust_key` returning `None`. (The non-empty
         // path needs a live host and is exercised by integration, not here.)
         assert!(!is_ingress_trusted(""));
+    }
+
+    #[test]
+    fn grant_pending_key_applies_prefix_on_capsule_only() {
+        // The key suffix is the capsule id alone — the principal is implicit
+        // in the per-principal KV scope, never stamped into the suffix. Two
+        // different principals naturally get separate markers via the scope,
+        // so the same capsule id under each maps to the same suffix without
+        // colliding across principals.
+        let cap = "fs";
+        assert_eq!(
+            grant_pending_key("alice", cap).as_deref(),
+            Some("mcp.grant.pending.fs")
+        );
+        // The principal does not change the key — proves it is scope-implicit,
+        // not suffix-encoded.
+        assert_eq!(
+            grant_pending_key("bob", cap),
+            grant_pending_key("alice", cap)
+        );
+    }
+
+    #[test]
+    fn grant_pending_key_rejects_empty_capsule() {
+        // Mirror the ingress-pending guard: an empty capsule_id must not
+        // resolve to a routable key, or one marker would dedup every grant
+        // prompt for the principal.
+        assert_eq!(grant_pending_key("alice", ""), None);
+    }
+
+    #[test]
+    fn grant_pending_empty_capsule_is_not_pending() {
+        // No host KV call is reached for an empty capsule_id — it short-circuits
+        // to `false` via `grant_pending_key` returning `None`, so the broker
+        // surfaces a fresh prompt rather than spuriously deduping. (The
+        // non-empty path needs a live host and is exercised by integration.)
+        assert!(!grant_pending("alice", ""));
+    }
+
+    #[test]
+    fn take_grant_pending_empty_capsule_fails_closed() {
+        // No host KV call is reached for an empty capsule_id — short-circuits
+        // to `false` via `grant_pending_key` returning `None`. (The non-empty
+        // path needs a live host and is exercised by integration, not here.)
+        assert!(!take_grant_pending("alice", ""));
     }
 }
